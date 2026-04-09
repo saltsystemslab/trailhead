@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "builds": {
+    "release": {
+      "dir": "./build",
+      "configure_cmd": "/opt/homebrew/bin/cmake -B build -DCMAKE_BUILD_TYPE=Release",
+      "build_cmd": "/opt/homebrew/bin/cmake --build build -j8",
+      "rsync_dest": "user@hpc-node:/scratch/myproject"
+    }
+  },
+  "nodes": {
+    "h200": {
+      "partition": "gpu-interactive",
+      "gpu_type": "h200",
+      "cpus_per_task": 8,
+      "time": "02:00:00"
+    },
+    "rtx6000": {
+      "partition": "SaltSystemsLab",
+      "nodelist": "d4067",
+      "cpus_per_task": 8,
+      "time": "01:00:00"
+    }
+  },
+  "sbatch_defaults": {
+    "output_pattern": ".trailhead/slurm-%j.out",
+    "error_pattern": ".trailhead/slurm-%j.err",
+    "job_name_prefix": "th",
+    "preamble": [
+      "set -euo pipefail"
+    ],
+    "modules": []
+  },
+  "tests": [
+    {
+      "name": "example_test",
+      "label": "",
+      "cmd": "./build/example_test && echo done",
+      "workdir": ".",
+      "timeout_sec": 300,
+      "tags": [],
+      "node": "rtx6000",
+      "build": "release",
+      "target": "example_test"
+    },
+    {
+      "name": "example_test2",
+      "label": "",
+      "cmd": "./build/example_test",
+      "workdir": ".",
+      "timeout_sec": 300,
+      "tags": [],
+      "build": "release",
+      "target": "example_test"
+    },
+    {
+      "name": "header_test",
+      "label": "",
+      "cmd": "./build/example_header_test",
+      "workdir": ".",
+      "timeout_sec": 300,
+      "tags": [],
+      "build": "release",
+      "target": "example_header_test"
+    },
+    {
+      "name": "c_test",
+      "label": "",
+      "cmd": "./build/example_c_test",
+      "workdir": ".",
+      "timeout_sec": 300,
+      "tags": [],
+      "build": "release",
+      "target": "example_c_test"
+    }
+  ]
+}
