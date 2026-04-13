@@ -30,6 +30,7 @@ constexpr const char* BWHITE  = "\033[97m";
 // Cursor / screen control
 constexpr const char* CLEAR         = "\033[2J\033[H";
 constexpr const char* ERASE_DOWN    = "\033[J";   // erase from cursor to end of screen
+constexpr const char* ERASE_EOL     = "\033[K";   // erase from cursor to end of line
 constexpr const char* CLEAR_LINE    = "\033[2K\r";
 constexpr const char* CURSOR_HIDE   = "\033[?25l";
 constexpr const char* CURSOR_SHOW   = "\033[?25h";
