@@ -119,6 +119,8 @@ inline RunResult run(
         : (time_t)0;
 
     std::string out_buf, err_buf;
+    // Separate buffer for line-splitting — keeps out_buf (result.stdout_str) intact
+    std::string line_buf;
 
     auto drain = [&](int fd, std::string& buf, bool is_stdout) {
         char tmp[4096];
@@ -127,11 +129,11 @@ inline RunResult run(
             if (n <= 0) break;
             buf.append(tmp, n);
             if (is_stdout && on_stdout_line) {
-                // emit complete lines
+                line_buf.append(tmp, n);
                 size_t pos;
-                while ((pos = buf.find('\n')) != std::string::npos) {
-                    on_stdout_line(buf.substr(0, pos));
-                    buf.erase(0, pos + 1);
+                while ((pos = line_buf.find('\n')) != std::string::npos) {
+                    on_stdout_line(line_buf.substr(0, pos));
+                    line_buf.erase(0, pos + 1);
                 }
             }
         }
