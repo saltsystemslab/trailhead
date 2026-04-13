@@ -829,7 +829,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     std::string csv_path = (project_root.empty() ? "." : project_root) + "/trailhead_results.csv";
 
     std::ofstream csv(csv_path);
-    csv << "test_name,status,passed,failed,wall_ms,exit_code\n";
+    csv << "test_name,status,passed,failed,reported_ms,exit_code\n";
     int any_failed = 0;
     for (int i : filtered) {
         const auto& t = reg.tests[i];
@@ -841,8 +841,11 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         }
         std::string status = (r->failed > 0 || r->exit_code != 0) ? "FAIL" : "PASS";
         if (r->failed > 0 || r->exit_code != 0) any_failed = 1;
-        csv << t.name << "," << status << "," << r->passed << "," << r->failed
-            << "," << r->wall_ms << "," << r->exit_code << "\n";
+        double reported_ms = 0.0;
+        for (const auto& te : r->timings) reported_ms += te.elapsed_ms;
+        csv << std::fixed << std::setprecision(3)
+            << t.name << "," << status << "," << r->passed << "," << r->failed
+            << "," << reported_ms << "," << r->exit_code << "\n";
     }
     csv.close();
 
@@ -851,8 +854,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     std::cout << "\n";
     std::cout << std::left << std::setw(32) << "TEST" << std::setw(8) << "STATUS"
               << std::setw(8) << "PASS" << std::setw(8) << "FAIL"
-              << std::setw(10) << "WALL_MS" << "\n";
-    std::cout << std::string(66, '-') << "\n";
+              << std::setw(14) << "REPORTED_MS" << "\n";
+    std::cout << std::string(70, '-') << "\n";
     for (int i : filtered) {
         const auto& t = reg.tests[i];
         const TestResult* r = latest_result(final_idx, t.name);
@@ -861,11 +864,13 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             continue;
         }
         std::string status = (r->failed > 0 || r->exit_code != 0) ? "FAIL" : "PASS";
+        double reported_ms = 0.0;
+        for (const auto& te : r->timings) reported_ms += te.elapsed_ms;
         std::cout << std::left << std::setw(32) << t.name
                   << std::setw(8) << status
                   << std::setw(8) << r->passed
                   << std::setw(8) << r->failed
-                  << std::setw(10) << r->wall_ms << "\n";
+                  << std::fixed << std::setprecision(3) << reported_ms << "\n";
     }
     std::cout << "\n";
 
