@@ -27,23 +27,6 @@ target_include_directories(trailhead_reporter INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
-# ── Examples ───────────────────────────────────────────────────────────────
-option(TRAILHEAD_BUILD_EXAMPLES "Build example tests" ON)
-
-if(TRAILHEAD_BUILD_EXAMPLES)
-    # C++ reporter.hpp example
-    add_executable(example_test examples/example_test.cpp)
-    target_link_libraries(example_test PRIVATE trailhead_reporter)
-
-    # C++ trailhead.h stdout-marker example
-    add_executable(example_header_test examples/example_header_test.cpp)
-    target_link_libraries(example_header_test PRIVATE trailhead_reporter)
-
-    # Pure C trailhead.h example
-    enable_language(C)
-    add_executable(example_c_test examples/example_c_test.c)
-    target_include_directories(example_c_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-endif()
 
 # ── Install ────────────────────────────────────────────────────────────────
 install(TARGETS trailhead DESTINATION bin)

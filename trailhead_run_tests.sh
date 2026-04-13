@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ci_run.sh — Build trailhead and run all registered tests locally.
+# trailhead_run_tests.sh — Build trailhead and run all registered tests locally.
 #
 # Usage:
 #   ./ci_run.sh            # build + run all tests
@@ -21,7 +21,7 @@ if [[ $NO_BUILD -eq 0 ]]; then
     NCPU=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
     echo "==> Configuring..."
-    cmake -B build -DCMAKE_BUILD_TYPE=Release -S . -DTRAILHEAD_BUILD_EXAMPLES=ON
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -S .
 
     echo "==> Building (${NCPU} jobs)..."
     cmake --build build -j"$NCPU"

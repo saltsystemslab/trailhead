@@ -31,47 +31,5 @@
     ],
     "modules": []
   },
-  "tests": [
-    {
-      "name": "example_test",
-      "label": "",
-      "cmd": "./build/example_test && echo done",
-      "workdir": ".",
-      "timeout_sec": 300,
-      "tags": [],
-      "node": "rtx6000",
-      "build": "release",
-      "target": "example_test"
-    },
-    {
-      "name": "example_test2",
-      "label": "",
-      "cmd": "./build/example_test",
-      "workdir": ".",
-      "timeout_sec": 300,
-      "tags": [],
-      "build": "release",
-      "target": "example_test"
-    },
-    {
-      "name": "header_test",
-      "label": "",
-      "cmd": "./build/example_header_test",
-      "workdir": ".",
-      "timeout_sec": 300,
-      "tags": [],
-      "build": "release",
-      "target": "example_header_test"
-    },
-    {
-      "name": "c_test",
-      "label": "",
-      "cmd": "./build/example_c_test",
-      "workdir": ".",
-      "timeout_sec": 300,
-      "tags": [],
-      "build": "release",
-      "target": "example_c_test"
-    }
-  ]
+  "tests": []
 }
