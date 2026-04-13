@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <algorithm>
 #include <cstring>
 #include <cerrno>
 
