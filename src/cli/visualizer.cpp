@@ -188,33 +188,35 @@ static std::string test_row(const TestEntry& t, const TestResult* r,
 
 static void render_detail(const TestEntry& t, const TestResult& r) {
     using namespace ansi;
-    std::cout << CLEAR;
-    std::cout << BOLD << "TRAILHEAD" << RESET << " — " << CYAN << t.name << RESET;
-    if (!t.label.empty()) std::cout << "  " << DIM << t.label << RESET;
-    std::cout << "\n" << hline(TOTAL_WIDTH) << "\n\n";
+    std::ostringstream o;
+
+    o << CURSOR_HOME;
+    o << BOLD << "TRAILHEAD" << RESET << " — " << CYAN << t.name << RESET;
+    if (!t.label.empty()) o << "  " << DIM << t.label << RESET;
+    o << "\n" << hline(TOTAL_WIDTH) << "\n\n";
 
     RunStatus s = result_status(r);
-    std::cout << "  Status:   " << status_badge(s) << "\n";
-    std::cout << "  Host:     " << r.host << "\n";
-    std::cout << "  Run by:   " << r.run_by << "\n";
+    o << "  Status:   " << status_badge(s) << "\n";
+    o << "  Host:     " << r.host << "\n";
+    o << "  Run by:   " << r.run_by << "\n";
 
     // Format timestamps
     time_t started = (time_t)(r.started_at / 1000);
     char tbuf[32];
     struct tm* tm = localtime(&started);
     strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", tm);
-    std::cout << "  Started:  " << tbuf << "\n";
-    std::cout << "  Wall:     " << fs::format_duration_ms(r.wall_ms) << "\n";
-    std::cout << "  Pass:     " << color(BGREEN, std::to_string(r.passed))
-              << "   Fail: " << (r.failed > 0 ? color(BRED, std::to_string(r.failed)) : "0")
-              << "\n";
+    o << "  Started:  " << tbuf << "\n";
+    o << "  Wall:     " << fs::format_duration_ms(r.wall_ms) << "\n";
+    o << "  Pass:     " << color(BGREEN, std::to_string(r.passed))
+      << "   Fail: " << (r.failed > 0 ? color(BRED, std::to_string(r.failed)) : "0")
+      << "\n";
 
     if (!r.timings.empty()) {
-        std::cout << "\n  " << BOLD << "Timings:" << RESET << "\n";
+        o << "\n  " << BOLD << "Timings:" << RESET << "\n";
         for (const auto& te : r.timings) {
             std::ostringstream dur;
             dur << std::fixed << std::setprecision(1) << te.elapsed_ms << "ms";
-            std::cout << "    " << pad(te.label, 20) << " " << dur.str() << "\n";
+            o << "    " << pad(te.label, 20) << " " << dur.str() << "\n";
         }
     }
 
@@ -224,10 +226,10 @@ static void render_detail(const TestEntry& t, const TestResult& r) {
         for (const auto& [k, v] : r.metadata)
             if (k.empty() || k[0] != '_') any = true;
         if (any) {
-            std::cout << "\n  " << BOLD << "Metadata:" << RESET << "\n";
+            o << "\n  " << BOLD << "Metadata:" << RESET << "\n";
             for (const auto& [k, v] : r.metadata)
                 if (k.empty() || k[0] != '_')
-                    std::cout << "    " << k << ": " << v << "\n";
+                    o << "    " << k << ": " << v << "\n";
         }
     }
 
@@ -235,7 +237,6 @@ static void render_detail(const TestEntry& t, const TestResult& r) {
     {
         auto it = r.metadata.find("_sacct");
         if (it != r.metadata.end() && !it->second.empty()) {
-            // Parse: State|ExitCode|Reason
             std::string raw = it->second;
             std::string state, rest;
             auto p = raw.find('|');
@@ -243,32 +244,34 @@ static void render_detail(const TestEntry& t, const TestResult& r) {
             else { state = raw; }
             bool bad = (state != "COMPLETED");
             const char* sc = bad ? BRED : BGREEN;
-            std::cout << "\n  " << BOLD << "SLURM state:" << RESET
-                      << "  " << color(sc, state);
-            if (!rest.empty()) std::cout << "  " << DIM << rest << RESET;
-            std::cout << "\n";
+            o << "\n  " << BOLD << "SLURM state:" << RESET
+              << "  " << color(sc, state);
+            if (!rest.empty()) o << "  " << DIM << rest << RESET;
+            o << "\n";
         }
     }
 
-    // Output tail (last lines of slurm output — always stored for debugging)
+    // Output tail
     {
         auto it = r.metadata.find("_output_tail");
         if (it != r.metadata.end() && !it->second.empty()) {
             RunStatus s2 = result_status(r);
             const char* hdr_color = (s2 == RunStatus::Fail) ? BRED : GRAY;
-            std::cout << "\n  " << color(hdr_color, BOLD + std::string("Output:") + RESET) << "\n";
+            o << "\n  " << color(hdr_color, BOLD + std::string("Output:") + RESET) << "\n";
             std::istringstream ss(it->second);
             for (std::string ln; std::getline(ss, ln); )
-                std::cout << "    " << DIM << ln << RESET << "\n";
+                o << "    " << DIM << ln << RESET << "\n";
         }
     }
 
-    if (!t.node_profile.empty()) {
-        std::cout << "\n  " << BOLD << "Node profile:" << RESET << " " << t.node_profile << "\n";
-    }
+    if (!t.node_profile.empty())
+        o << "\n  " << BOLD << "Node profile:" << RESET << " " << t.node_profile << "\n";
 
-    std::cout << "\n" << hline(TOTAL_WIDTH) << "\n";
-    std::cout << DIM << "[b] back  [q] quit" << RESET << "\n";
+    o << "\n" << hline(TOTAL_WIDTH) << "\n";
+    o << DIM << "[b] back  [q] quit" << RESET << "\n";
+    o << ERASE_DOWN;
+
+    std::cout << o.str();
     std::cout.flush();
 }
 
@@ -656,46 +659,55 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         vis_tests = vis - (need_up ? 1 : 0) - (need_down ? 1 : 0);
         if (vis_tests < 1) vis_tests = 1;
 
-        std::cout << CLEAR;
-        std::cout << BOLD << "TRAILHEAD" << RESET
-                  << "  " << DIM << trailhead_dir << RESET
-                  << "  " << now_str();
+        // Buffer the entire frame and write it in one shot to minimise
+        // partial-frame flicker over high-latency connections (SSH).
+        std::ostringstream o;
+
+        // Move to top-left without clearing — old content is overwritten in place
+        o << CURSOR_HOME;
+        o << BOLD << "TRAILHEAD" << RESET
+          << "  " << DIM << trailhead_dir << RESET
+          << "  " << now_str();
         if (job_log && job_log->active > 0)
-            std::cout << "  " << color(BYELLOW, std::to_string(job_log->active.load())
-                                       + " job(s) running");
+            o << "  " << color(BYELLOW, std::to_string(job_log->active.load())
+                               + " job(s) running");
         if (!selected_hw.empty())
-            std::cout << "  " << color(CYAN, "hw:" + selected_hw);
-        std::cout << "\n";
-        std::cout << hline(TOTAL_WIDTH) << "\n";
-        std::cout << header_row() << "\n";
-        std::cout << hline(TOTAL_WIDTH) << "\n";
+            o << "  " << color(CYAN, "hw:" + selected_hw);
+        o << "\n";
+        o << hline(TOTAL_WIDTH) << "\n";
+        o << header_row() << "\n";
+        o << hline(TOTAL_WIDTH) << "\n";
 
         if (need_up)
-            std::cout << DIM << "  ↑ " << scroll << " more above" << RESET << "\n";
+            o << DIM << "  ↑ " << scroll << " more above" << RESET << "\n";
 
         int end = std::min(scroll + vis_tests, total);
         for (int i = scroll; i < end; ++i) {
             const auto& t = reg.tests[filtered[i]];
             const TestResult* r = latest_result(idx, t.name);
             std::string live = job_log ? job_log->get_live(t.name) : "";
-            std::cout << test_row(t, r, reg, i == selected, live) << "\n";
+            o << test_row(t, r, reg, i == selected, live) << "\n";
         }
 
         if (need_down)
-            std::cout << DIM << "  ↓ " << (total - end) << " more below" << RESET << "\n";
+            o << DIM << "  ↓ " << (total - end) << " more below" << RESET << "\n";
 
-        std::cout << hline(TOTAL_WIDTH) << "\n";
-        std::cout << DIM
-            << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [R] run all  [a] add  [e] edit  [d] delete  [h] hw"
-            << RESET << "\n";
+        o << hline(TOTAL_WIDTH) << "\n";
+        o << DIM
+          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [R] run all  [a] add  [e] edit  [d] delete  [h] hw"
+          << RESET << "\n";
 
         // Log panel — fixed at snapshot taken above
         if (!snap.empty()) {
-            std::cout << "\n";
+            o << "\n";
             for (const auto& line : snap)
-                std::cout << DIM << "  " << line << RESET << "\n";
+                o << DIM << "  " << line << RESET << "\n";
         }
 
+        // Erase everything below the current frame (handles shrinking content)
+        o << ERASE_DOWN;
+
+        std::cout << o.str();
         std::cout.flush();
     };
 
