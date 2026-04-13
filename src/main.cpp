@@ -2,6 +2,8 @@
 #include "core/result_store.hpp"
 #include "cli/visualizer.hpp"
 #include "cli/sbatch_gen.hpp"
+#include "cli/remote_run.hpp"
+#include "cli/local_run.hpp"
 #include "util/file_util.hpp"
 #include "util/process.hpp"
 #include "util/ansi.hpp"
@@ -12,6 +14,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
@@ -747,10 +750,10 @@ static int cmd_gen(int argc, char** argv) {
         std::cerr << "No tests registered.\n"; return 1;
     }
 
+    std::string sbatch_dir = opts.output_path.empty() ? (th_dir + "/sbatch") : opts.output_path;
+    trailhead::fs::mkdir_p(sbatch_dir);
     for (const auto& [name, content] : scripts) {
-        std::string out_path = opts.output_path.empty()
-            ? (th_dir + "/" + name)
-            : (opts.output_path + "/" + name);
+        std::string out_path = sbatch_dir + "/" + name;
 
         if (trailhead::fs::write_file_atomic(out_path, content)) {
             std::cout << trailhead::ansi::BGREEN << "Generated:" << trailhead::ansi::RESET
@@ -769,7 +772,149 @@ static int cmd_watch(int argc, char** argv) {
     std::string th_dir = require_trailhead();
     auto reg = load_reg(th_dir);
     int interval = args.get_int("interval", 1000);
-    return trailhead::run_watch(th_dir, reg, interval);
+
+    // Determine project root (parent of .trailhead/)
+    auto root_opt = trailhead::fs::find_trailhead_root();
+    std::string project_root = root_opt ? *root_opt : ".";
+
+    // Check whether any build config has an rsync_dest configured
+    std::optional<trailhead::RemoteDest> remote_dest;
+    for (const auto& [bname, bc] : reg.builds) {
+        if (!bc.rsync_dest.empty()) {
+            auto d = trailhead::parse_rsync_dest(bc.rsync_dest);
+            if (d) { remote_dest = d; break; }
+        }
+    }
+
+    std::function<void(const std::string&, const std::string&)> run_fn;
+
+    auto job_log = std::make_shared<trailhead::JobLog>();
+
+    // Local runner — available whenever a GPU is present, regardless of remote config
+    std::shared_ptr<trailhead::LocalRunner> local_runner;
+    if (trailhead::has_local_gpu())
+        local_runner = std::make_shared<trailhead::LocalRunner>(th_dir, project_root, job_log);
+
+    // Split multi-line log messages into separate entries so the log panel renders them correctly
+    auto make_log_fn = [job_log](const std::string& tname) {
+        return [job_log, tname](const std::string& msg) {
+            std::istringstream ss(msg);
+            std::string line;
+            while (std::getline(ss, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty())
+                    job_log->push("[" + tname + "] " + line);
+            }
+        };
+    };
+
+    if (remote_dest) {
+        // Query SLURM for the per-user job limit on the partitions in use
+        std::vector<std::string> partitions;
+        for (const auto& [nname, node] : reg.nodes)
+            if (!node.partition.empty()) partitions.push_back(node.partition);
+        int max_concurrent = trailhead::query_slurm_job_limit(remote_dest->remote, partitions);
+        job_log->push("[trailhead] SLURM max concurrent jobs: " + std::to_string(max_concurrent));
+
+        // Remote mode: BatchSubmitter batches rapid presses, rsyncs once, sbatches serially
+        auto submitter = std::make_shared<trailhead::BatchSubmitter>(
+            reg, th_dir, project_root, *remote_dest, job_log, max_concurrent);
+
+        run_fn = [&reg = reg, job_log, make_log_fn, submitter, local_runner](
+                const std::string& name, const std::string& node_name) {
+            const trailhead::TestEntry* test = nullptr;
+            for (const auto& t : reg.tests)
+                if (t.name == name) { test = &t; break; }
+            if (!test) { job_log->push("test not found: " + name); return; }
+
+            std::string tname = test->name;
+            if (node_name == "local") {
+                if (!local_runner) { job_log->push("local GPU not available"); return; }
+                local_runner->enqueue(*test,
+                    make_log_fn(tname),
+                    [job_log, tname](const std::string& status) {
+                        job_log->set_live(tname, status);
+                    });
+            } else {
+                submitter->enqueue(*test, node_name,
+                    make_log_fn(tname),
+                    [job_log, tname](const std::string& status) {
+                        job_log->set_live(tname, status);
+                    });
+            }
+        };
+    } else {
+        // No remote configured — local runner only
+        run_fn = [&reg = reg, job_log, make_log_fn, local_runner](
+                const std::string& name, const std::string& node_name) {
+            const trailhead::TestEntry* test = nullptr;
+            for (const auto& t : reg.tests)
+                if (t.name == name) { test = &t; break; }
+            if (!test) { job_log->push("test not found: " + name); return; }
+
+            std::string tname = test->name;
+            if (node_name == "local") {
+                if (!local_runner) { job_log->push("local GPU not available"); return; }
+                local_runner->enqueue(*test,
+                    make_log_fn(tname),
+                    [job_log, tname](const std::string& status) {
+                        job_log->set_live(tname, status);
+                    });
+            } else {
+                job_log->push("no remote configured for node: " + node_name);
+            }
+        };
+    }
+
+    // Resume any jobs that were in-flight when watch was last closed
+    if (remote_dest) {
+        auto pending = trailhead::load_pending_jobs(th_dir);
+        for (const auto& pj : pending) {
+            // Find the matching test entry
+            const trailhead::TestEntry* test = nullptr;
+            for (const auto& t : reg.tests)
+                if (t.name == pj.name) { test = &t; break; }
+            if (!test) {
+                // Test no longer registered — clean up stale pending file
+                trailhead::clear_pending_job(th_dir, pj.name);
+                continue;
+            }
+
+            job_log->active++;
+            auto entry   = std::make_shared<trailhead::TestEntry>(*test);
+            auto pending_copy = std::make_shared<trailhead::PendingJob>(pj);
+            std::thread([entry, pending_copy, reg, th_dir, job_log, make_log_fn]() {
+                std::string tname = entry->name;
+                job_log->push("[" + tname + "] resuming job " + pending_copy->job_id);
+                trailhead::resume_job(*pending_copy, *entry, reg, th_dir,
+                    make_log_fn(tname),
+                    [job_log, tname](const std::string& status) {
+                        job_log->set_live(tname, status);
+                    });
+                job_log->active--;
+            }).detach();
+        }
+    }
+
+    // Re-enqueue submissions that were waiting (QUEUED/RSYNC) when watch last closed
+    if (remote_dest) {
+        auto queued = trailhead::load_queued_submissions(th_dir);
+        for (const auto& qs : queued) {
+            // Check the test still exists
+            bool found = false;
+            for (const auto& t : reg.tests)
+                if (t.name == qs.name) { found = true; break; }
+            if (!found) {
+                trailhead::clear_queued_submission(th_dir, qs.name);
+                continue;
+            }
+            job_log->push("[" + qs.name + "] re-queuing from previous session");
+            run_fn(qs.name, qs.node_name);
+        }
+    }
+
+    bool auto_run = args.flag("run-all");
+    return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, project_root, auto_run);
 }
 
 // ── Subcommand: show ──────────────────────────────────────────────────────

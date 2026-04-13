@@ -145,6 +145,37 @@ inline void parse_trailhead_output(
     if (remaining_stdout) *remaining_stdout = remaining;
 }
 
+// ── Save ──────────────────────────────────────────────────────────────────
+
+inline void save_result(const std::string& results_dir, const TestResult& res) {
+    std::string path = results_dir + "/" + res.name + "_"
+                     + std::to_string(res.started_at) + ".json";
+    JsonObject obj;
+    obj.push_back({"version",    JsonValue((int64_t)1)});
+    obj.push_back({"name",       res.name});
+    obj.push_back({"host",       res.host});
+    obj.push_back({"run_by",     res.run_by});
+    obj.push_back({"started_at", JsonValue(res.started_at)});
+    obj.push_back({"ended_at",   JsonValue(res.ended_at)});
+    obj.push_back({"wall_ms",    JsonValue(res.wall_ms)});
+    obj.push_back({"exit_code",  JsonValue((int64_t)res.exit_code)});
+    obj.push_back({"passed",     JsonValue((int64_t)res.passed)});
+    obj.push_back({"failed",     JsonValue((int64_t)res.failed)});
+    JsonArray timings_arr;
+    for (const auto& te : res.timings) {
+        JsonObject te_obj;
+        te_obj.push_back({"label",      te.label});
+        te_obj.push_back({"elapsed_ms", JsonValue(te.elapsed_ms)});
+        timings_arr.push_back(JsonValue(std::move(te_obj)));
+    }
+    obj.push_back({"timings", JsonValue(std::move(timings_arr))});
+    JsonObject meta_obj;
+    for (const auto& [k, v] : res.metadata)
+        meta_obj.push_back({k, JsonValue(v)});
+    obj.push_back({"metadata", JsonValue(std::move(meta_obj))});
+    fs::write_file_atomic(path, json_emit(JsonValue(std::move(obj))));
+}
+
 // ── Index ─────────────────────────────────────────────────────────────────
 
 // Index: test name → list of results sorted oldest→newest

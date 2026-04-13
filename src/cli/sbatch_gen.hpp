@@ -21,4 +21,11 @@ bool write_sbatch(const std::string& trailhead_dir,
                   const Registry& reg,
                   const SbatchOptions& opts);
 
+// Generate a single test's sbatch script for a specific node,
+// overriding test.node_profile with node_name.
+std::string generate_test_script(const TestEntry& test,
+                                  const std::string& node_name,
+                                  const Registry& reg,
+                                  const SbatchOptions& opts);
+
 } // namespace trailhead

@@ -1,0 +1,147 @@
+#include "local_run.hpp"
+#include "../core/result_store.hpp"
+#include "../util/file_util.hpp"
+#include "../util/ansi.hpp"
+#include "../util/process.hpp"
+#include <sstream>
+#include <deque>
+#include <chrono>
+
+namespace trailhead {
+
+bool has_local_gpu() {
+    // nvidia-smi -L lists one line per GPU; non-empty output = GPU present
+    auto r = proc::run("nvidia-smi -L", {}, {}, 5, "", nullptr, false);
+    return r.exit_code == 0 && !r.stdout_str.empty();
+}
+
+// ── LocalRunner ───────────────────────────────────────────────────────────
+
+LocalRunner::LocalRunner(std::string th_dir, std::string project_root,
+                         std::shared_ptr<JobLog> job_log)
+    : th_dir_(std::move(th_dir))
+    , project_root_(std::move(project_root))
+    , job_log_(std::move(job_log))
+    , worker_([this] { worker_loop(); })
+{}
+
+LocalRunner::~LocalRunner() {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        stopped_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
+
+void LocalRunner::enqueue(const TestEntry& test,
+                           std::function<void(const std::string&)> log_fn,
+                           std::function<void(const std::string&)> status_fn)
+{
+    job_log_->active++;
+    if (status_fn) status_fn("QUEUED");
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        queue_.push_back({test, std::move(log_fn), std::move(status_fn)});
+    }
+    cv_.notify_one();
+}
+
+void LocalRunner::worker_loop() {
+    while (true) {
+        Task task;
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait(lk, [&] { return stopped_ || !queue_.empty(); });
+            if (stopped_ && queue_.empty()) break;
+            task = std::move(queue_.front());
+            queue_.pop_front();
+        }
+        run_task(task);
+    }
+}
+
+void LocalRunner::run_task(Task& task) {
+    const TestEntry& t = task.test;
+    auto& log        = task.log_fn;
+    auto& set_status = task.status_fn;
+
+    if (set_status) set_status("RUNNING");
+    if (log) log("running locally");
+
+    int64_t t_start = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // Resolve working directory: project_root / workdir
+    std::string workdir = project_root_;
+    if (!t.workdir.empty() && t.workdir != ".")
+        workdir = project_root_ + "/" + t.workdir;
+
+    // Stream stdout lines to the log panel live
+    auto on_line = [&](const std::string& line) {
+        if (log && !line.empty()) log(line);
+    };
+
+    auto r = proc::run(t.cmd, {}, {}, t.timeout_sec, workdir, on_line, /*use_shell=*/true);
+
+    int64_t t_end = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // Parse TRAILHEAD: markers from captured stdout
+    TestResult res;
+    res.name       = t.name;
+    res.started_at = t_start;
+    res.ended_at   = t_end;
+    res.wall_ms    = t_end - t_start;
+    res.exit_code  = r.exit_code;
+    res.run_by     = "local";
+    res.host       = "localhost";
+
+    parse_trailhead_output(r.stdout_str, res);
+
+    // If no markers, fall back to exit code
+    if (res.passed + res.failed == 0 && res.timings.empty()) {
+        if (r.exit_code == 0) res.passed = 1;
+        else                  res.failed = 1;
+    }
+
+    if (r.timed_out) {
+        res.failed = 1;
+        res.metadata["_output_tail"] = "timed out after " + std::to_string(t.timeout_sec) + "s";
+    } else {
+        // Store last 30 lines of combined output for detail view
+        std::string combined = r.stdout_str;
+        if (!r.stderr_str.empty()) combined += "\n--- stderr ---\n" + r.stderr_str;
+        std::deque<std::string> lines;
+        std::istringstream ss(combined);
+        std::string ln;
+        while (std::getline(ss, ln)) {
+            lines.push_back(ln);
+            if ((int)lines.size() > 30) lines.pop_front();
+        }
+        std::string tail;
+        for (const auto& l : lines) { tail += l; tail += "\n"; }
+        if (!tail.empty()) res.metadata["_output_tail"] = tail;
+    }
+
+    std::string results_dir = th_dir_ + "/results";
+    fs::mkdir_p(results_dir);
+    save_result(results_dir, res);
+
+    // Log outcome
+    std::string badge = res.failed > 0
+        ? ansi::color(ansi::BRED,   " FAIL ")
+        : ansi::color(ansi::BGREEN, " PASS ");
+    if (log) {
+        log(badge + "  pass=" + std::to_string(res.passed)
+            + "  fail=" + std::to_string(res.failed)
+            + "  wall=" + fs::format_duration_ms(res.wall_ms));
+        for (const auto& te : res.timings)
+            log("  " + te.label + " = " + std::to_string((int)te.elapsed_ms) + "ms");
+    }
+
+    if (set_status) set_status("");
+    job_log_->active--;
+}
+
+} // namespace trailhead

@@ -10,6 +10,8 @@ add_executable(trailhead
     src/core/registry.cpp
     src/cli/visualizer.cpp
     src/cli/sbatch_gen.cpp
+    src/cli/remote_run.cpp
+    src/cli/local_run.cpp
 )
 
 target_include_directories(trailhead PRIVATE
