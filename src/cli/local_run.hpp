@@ -19,7 +19,7 @@ bool has_local_gpu();
 class LocalRunner {
 public:
     LocalRunner(std::string th_dir, std::string project_root,
-                std::shared_ptr<JobLog> job_log);
+                std::shared_ptr<JobLog> job_log, Registry reg);
     ~LocalRunner();
 
     // Thread-safe. Increments job_log->active and sets initial status.
@@ -40,6 +40,7 @@ private:
     std::string             th_dir_;
     std::string             project_root_;
     std::shared_ptr<JobLog> job_log_;
+    Registry                reg_;
 
     std::mutex              mtx_;
     std::condition_variable cv_;

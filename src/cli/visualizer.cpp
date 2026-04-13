@@ -9,6 +9,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <unordered_set>
 #include <ctime>
 #include <cstring>
 #include <cstdlib>
@@ -598,13 +599,20 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     // Rebuild the filtered list and update total. Call after hardware change or test add/delete.
     auto rebuild_filtered = [&]() {
         filtered.clear();
+        std::unordered_set<std::string> seen_targets; // for local dedup
         for (int i = 0; i < (int)reg.tests.size(); ++i) {
             const auto& t = reg.tests[i];
-            // "local" runs all tests regardless of node_profile assignment.
-            // Otherwise show if: no hw selected, or test has no node_profile, or profile matches hw.
-            if (selected_hw == "local" || selected_hw.empty() ||
-                t.node_profile.empty() || t.node_profile == selected_hw)
+            if (selected_hw == "local") {
+                // Local runs each unique cmake target once — skip node-specific duplicates.
+                if (!t.target.empty()) {
+                    if (seen_targets.count(t.target)) continue;
+                    seen_targets.insert(t.target);
+                }
                 filtered.push_back(i);
+            } else if (selected_hw.empty() || t.node_profile.empty() ||
+                       t.node_profile == selected_hw) {
+                filtered.push_back(i);
+            }
         }
         total = (int)filtered.size();
         if (selected >= total) selected = std::max(0, total - 1);

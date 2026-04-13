@@ -793,7 +793,7 @@ static int cmd_watch(int argc, char** argv) {
     // Local runner — available whenever a GPU is present, regardless of remote config
     std::shared_ptr<trailhead::LocalRunner> local_runner;
     if (trailhead::has_local_gpu())
-        local_runner = std::make_shared<trailhead::LocalRunner>(th_dir, project_root, job_log);
+        local_runner = std::make_shared<trailhead::LocalRunner>(th_dir, project_root, job_log, reg);
 
     // Split multi-line log messages into separate entries so the log panel renders them correctly
     auto make_log_fn = [job_log](const std::string& tname) {

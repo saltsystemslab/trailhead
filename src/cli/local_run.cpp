@@ -18,10 +18,11 @@ bool has_local_gpu() {
 // ── LocalRunner ───────────────────────────────────────────────────────────
 
 LocalRunner::LocalRunner(std::string th_dir, std::string project_root,
-                         std::shared_ptr<JobLog> job_log)
+                         std::shared_ptr<JobLog> job_log, Registry reg)
     : th_dir_(std::move(th_dir))
     , project_root_(std::move(project_root))
     , job_log_(std::move(job_log))
+    , reg_(std::move(reg))
     , worker_([this] { worker_loop(); })
 {}
 
@@ -68,6 +69,65 @@ void LocalRunner::run_task(Task& task) {
 
     if (set_status) set_status("RUNNING");
     if (log) log("running locally");
+
+    // Per-test cmake configure (once) + target build
+    if (!t.build_name.empty() && !t.target.empty()) {
+        auto it = reg_.builds.find(t.build_name);
+        if (it != reg_.builds.end()) {
+            const auto& bc = it->second;
+            std::string build_dir = bc.dir.empty() ? "build" : bc.dir;
+
+            // Configure if build dir doesn't exist yet (auto-detects local GPU arch)
+            if (!bc.configure_cmd.empty() && !fs::is_dir(project_root_ + "/" + build_dir)) {
+                if (log) log("configuring: " + bc.configure_cmd);
+                auto cr = proc::run(bc.configure_cmd, {}, {}, 300, project_root_, nullptr, true);
+                if (cr.exit_code != 0) {
+                    if (log) {
+                        if (!cr.stdout_str.empty()) log(cr.stdout_str);
+                        if (!cr.stderr_str.empty()) log(cr.stderr_str);
+                        log("configure failed (exit=" + std::to_string(cr.exit_code) + ")");
+                    }
+                    TestResult res;
+                    res.name      = t.name;
+                    res.failed    = 1;
+                    res.exit_code = cr.exit_code;
+                    res.run_by    = "local";
+                    res.host      = "localhost";
+                    res.metadata["_output_tail"] = cr.stdout_str + "\n" + cr.stderr_str;
+                    std::string results_dir = th_dir_ + "/results";
+                    fs::mkdir_p(results_dir);
+                    save_result(results_dir, res);
+                    if (set_status) set_status("");
+                    job_log_->active--;
+                    return;
+                }
+            }
+
+            std::string build_cmd = "cmake --build " + build_dir + " --target " + t.target;
+            if (log) log("building: " + build_cmd);
+            auto br = proc::run(build_cmd, {}, {}, 300, project_root_, nullptr, true);
+            if (br.exit_code != 0) {
+                if (log) {
+                    if (!br.stdout_str.empty()) log(br.stdout_str);
+                    if (!br.stderr_str.empty()) log(br.stderr_str);
+                    log("build failed (exit=" + std::to_string(br.exit_code) + ")");
+                }
+                TestResult res;
+                res.name      = t.name;
+                res.failed    = 1;
+                res.exit_code = br.exit_code;
+                res.run_by    = "local";
+                res.host      = "localhost";
+                res.metadata["_output_tail"] = br.stdout_str + "\n" + br.stderr_str;
+                std::string results_dir = th_dir_ + "/results";
+                fs::mkdir_p(results_dir);
+                save_result(results_dir, res);
+                if (set_status) set_status("");
+                job_log_->active--;
+                return;
+            }
+        }
+    }
 
     int64_t t_start = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
