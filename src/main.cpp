@@ -802,8 +802,10 @@ static int cmd_watch(int argc, char** argv) {
             std::string line;
             while (std::getline(ss, line)) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (!line.empty())
+                if (!line.empty()) {
                     job_log->push("[" + tname + "] " + line);
+                    job_log->push_live_output(tname, line);
+                }
             }
         };
     };
@@ -828,6 +830,7 @@ static int cmd_watch(int argc, char** argv) {
             if (!test) { job_log->push("test not found: " + name); return; }
 
             std::string tname = test->name;
+            job_log->clear_live_output(tname);
             if (node_name == "local") {
                 if (!local_runner) { job_log->push("local GPU not available"); return; }
                 local_runner->enqueue(*test,
@@ -853,6 +856,7 @@ static int cmd_watch(int argc, char** argv) {
             if (!test) { job_log->push("test not found: " + name); return; }
 
             std::string tname = test->name;
+            job_log->clear_live_output(tname);
             if (node_name == "local") {
                 if (!local_runner) { job_log->push("local GPU not available"); return; }
                 local_runner->enqueue(*test,

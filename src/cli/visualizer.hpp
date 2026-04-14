@@ -8,6 +8,7 @@
 #include <deque>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <atomic>
 
 namespace trailhead {
@@ -19,7 +20,9 @@ struct JobLog {
     std::deque<std::string> lines;
     std::atomic<int> active{0};
     std::map<std::string, std::string> live; // test name → in-flight status
+    std::unordered_map<std::string, std::vector<std::string>> live_output; // test name → recent lines
     static constexpr int MAX_LINES = 5;
+    static constexpr int MAX_LIVE_OUTPUT = 500; // rolling window per test
 
     void push(const std::string& line) {
         std::lock_guard<std::mutex> g(mtx);
@@ -31,6 +34,27 @@ struct JobLog {
         std::lock_guard<std::mutex> g(mtx);
         if (status.empty()) live.erase(name);
         else live[name] = status;
+    }
+
+    // Append a line to the per-test live output buffer (called from log_fn during run).
+    void push_live_output(const std::string& name, const std::string& line) {
+        std::lock_guard<std::mutex> g(mtx);
+        auto& buf = live_output[name];
+        buf.push_back(line);
+        if ((int)buf.size() > MAX_LIVE_OUTPUT)
+            buf.erase(buf.begin());
+    }
+
+    // Clear the per-test live output (called before starting a new run).
+    void clear_live_output(const std::string& name) {
+        std::lock_guard<std::mutex> g(mtx);
+        live_output.erase(name);
+    }
+
+    std::vector<std::string> get_live_output(const std::string& name) const {
+        std::lock_guard<std::mutex> g(mtx);
+        auto it = live_output.find(name);
+        return it != live_output.end() ? it->second : std::vector<std::string>{};
     }
 
     std::string get_live(const std::string& name) const {

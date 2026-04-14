@@ -193,7 +193,8 @@ static int term_rows();
 // ── Detail view ───────────────────────────────────────────────────────────
 
 static void render_detail(const TestEntry& t, const TestResult* r,
-                           int& detail_scroll, const std::string& live_status) {
+                           int& detail_scroll, const std::string& live_status,
+                           const std::vector<std::string>& live_output = {}) {
     using namespace ansi;
     std::ostringstream o;
     int rows_written = 0;
@@ -383,35 +384,51 @@ static void render_detail(const TestEntry& t, const TestResult* r,
     }
 
     // ── Scrollable output ─────────────────────────────────────────────────
-    if (r) {
-        auto oit = r->metadata.find("_output_tail");
-        if (oit != r->metadata.end() && !oit->second.empty()) {
-            std::vector<std::string> out_lines;
-            {
+    // When the test is queued/running, show the live streaming output.
+    // When done, show the saved output tail from the result.
+    {
+        bool is_live = !live_status.empty();
+        std::vector<std::string> out_lines;
+
+        if (is_live) {
+            out_lines = live_output; // may be empty while still QUEUED
+        } else if (r) {
+            auto oit = r->metadata.find("_output_tail");
+            if (oit != r->metadata.end() && !oit->second.empty()) {
                 std::istringstream ss(oit->second);
                 for (std::string l; std::getline(ss, l); )
                     out_lines.push_back(l);
             }
+        }
+
+        if (!out_lines.empty() || is_live) {
             int total_out = (int)out_lines.size();
 
-            // Rows available for output: terminal height minus everything above + footer (hline+keys)
-            // +1 blank + 1 "Output" header = 2 overhead before lines
+            // Rows available: terminal height minus header rows + footer (hline+keys)
+            // +1 blank + 1 "Output" header = 2 overhead
             static constexpr int FOOTER_ROWS = 2;
             int avail = std::max(3, term_rows() - rows_written - 2 - FOOTER_ROWS);
 
-            // Clamp scroll
-            int max_scroll = std::max(0, total_out - avail);
-            if (detail_scroll > max_scroll) detail_scroll = max_scroll;
-            if (detail_scroll < 0)         detail_scroll = 0;
+            // When showing live output, auto-scroll to the bottom so new lines are visible.
+            // When showing saved output, respect the user's scroll position.
+            if (is_live)
+                detail_scroll = std::max(0, total_out - avail);
+            else {
+                int max_scroll = std::max(0, total_out - avail);
+                if (detail_scroll > max_scroll) detail_scroll = max_scroll;
+                if (detail_scroll < 0)          detail_scroll = 0;
+            }
 
-            RunStatus s2 = r ? result_status(*r) : RunStatus::Unknown;
-            const char* hdr_color = (s2 == RunStatus::Fail) ? BRED : GRAY;
+            const char* hdr_color = is_live ? BYELLOW
+                : (r && r->failed > 0 ? BRED : GRAY);
 
             ln();
             {
                 std::ostringstream oh;
                 oh << "  " << color(hdr_color, std::string(BOLD) + "Output" + RESET);
-                if (total_out > avail)
+                if (is_live)
+                    oh << "  " << std::string(DIM) << "(live)" << RESET;
+                else if (total_out > avail)
                     oh << std::string(DIM) << " [" << (detail_scroll + 1)
                        << "\xe2\x80\x93"  // en-dash
                        << std::min(detail_scroll + avail, total_out)
@@ -419,18 +436,22 @@ static void render_detail(const TestEntry& t, const TestResult* r,
                 ln(oh.str());
             }
 
-            if (detail_scroll > 0)
-                ln("    " + std::string(DIM) + "\xe2\x86\x91 " // ↑
-                   + std::to_string(detail_scroll) + " lines above" + RESET);
+            if (out_lines.empty()) {
+                ln("    " + std::string(DIM) + "(waiting for output...)" + RESET);
+            } else {
+                if (!is_live && detail_scroll > 0)
+                    ln("    " + std::string(DIM) + "\xe2\x86\x91 " // ↑
+                       + std::to_string(detail_scroll) + " lines above" + RESET);
 
-            int vis_end = std::min(detail_scroll + avail, total_out);
-            for (int i = detail_scroll; i < vis_end; ++i)
-                ln("    " + std::string(DIM) + out_lines[i] + RESET);
+                int vis_end = std::min(detail_scroll + avail, total_out);
+                for (int i = detail_scroll; i < vis_end; ++i)
+                    ln("    " + std::string(DIM) + out_lines[i] + RESET);
 
-            int below = total_out - vis_end;
-            if (below > 0)
-                ln("    " + std::string(DIM) + "\xe2\x86\x93 " // ↓
-                   + std::to_string(below) + " lines below" + RESET);
+                int below = total_out - vis_end;
+                if (!is_live && below > 0)
+                    ln("    " + std::string(DIM) + "\xe2\x86\x93 " // ↓
+                       + std::to_string(below) + " lines below" + RESET);
+            }
         }
     }
 
@@ -766,10 +787,11 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         selected_hw = wizard_select_hardware(reg);
     }
 
-    int selected     = 0;
-    int scroll       = 0;
-    bool detail_mode = false;
+    int selected      = 0;
+    int scroll        = 0;
+    bool detail_mode  = false;
     int detail_scroll = 0;  // scroll offset for detail view output
+    int detail_ticks  = 0;  // ticks since last detail re-render
     int total = 0;
     std::vector<int> filtered; // indices into reg.tests, filtered by selected_hw
 
@@ -958,10 +980,12 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 if (total > 0) {
                     detail_mode = true;
                     detail_scroll = 0;
+                    detail_ticks  = 0;
                     const auto& t = reg.tests[filtered[selected]];
                     const TestResult* r = latest_result(idx, t.name);
                     std::string live = job_log ? job_log->get_live(t.name) : "";
-                    render_detail(t, r, detail_scroll, live);
+                    auto live_out = job_log ? job_log->get_live_output(t.name) : std::vector<std::string>{};
+                    render_detail(t, r, detail_scroll, live, live_out);
                     // don't set redraw — detail was just rendered
                 }
             }
@@ -985,14 +1009,23 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             } else if (key == 'q' || key == 'Q') {
                 break;
             } else {
-                if (key == 'j' || key == 1001 /*down*/) ++detail_scroll;
-                else if (key == 'k' || key == 1000 /*up*/) detail_scroll = std::max(0, detail_scroll - 1);
-                // Refresh detail (also runs on timer tick to reflect live status)
-                idx = load_all_results(results_dir);
-                const auto& t = reg.tests[filtered[selected]];
-                const TestResult* r = latest_result(idx, t.name);
-                std::string live = job_log ? job_log->get_live(t.name) : "";
-                render_detail(t, r, detail_scroll, live);
+                bool detail_redraw = false;
+                if (key == 'j' || key == 1001 /*down*/) { ++detail_scroll; detail_redraw = true; }
+                else if (key == 'k' || key == 1000 /*up*/) { detail_scroll = std::max(0, detail_scroll - 1); detail_redraw = true; }
+                else if (key != -1) { detail_redraw = true; } // any other key press
+
+                // Also re-render on the same timer interval as the main view
+                ++detail_ticks;
+                if (detail_ticks >= refresh_every) { detail_ticks = 0; detail_redraw = true; }
+
+                if (detail_redraw) {
+                    idx = load_all_results(results_dir);
+                    const auto& t = reg.tests[filtered[selected]];
+                    const TestResult* r = latest_result(idx, t.name);
+                    std::string live = job_log ? job_log->get_live(t.name) : "";
+                    auto live_out = job_log ? job_log->get_live_output(t.name) : std::vector<std::string>{};
+                    render_detail(t, r, detail_scroll, live, live_out);
+                }
             }
         }
     }
