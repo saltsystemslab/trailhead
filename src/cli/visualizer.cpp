@@ -36,6 +36,8 @@ static void enter_raw_mode() {
     raw.c_cc[VMIN]  = 0;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    std::cout << ansi::CURSOR_HIDE;
+    std::cout.flush();
     s_raw_mode = true;
 }
 
@@ -43,6 +45,7 @@ static void restore_terminal() {
     if (s_raw_mode) {
         tcsetattr(STDIN_FILENO, TCSANOW, &s_orig_term);
         std::cout << ansi::CURSOR_SHOW;
+        std::cout.flush();
         s_raw_mode = false;
     }
 }
@@ -184,91 +187,257 @@ static std::string test_row(const TestEntry& t, const TestResult* r,
     return row.str();
 }
 
+// Forward declaration (defined after render_detail)
+static int term_rows();
+
 // ── Detail view ───────────────────────────────────────────────────────────
 
-static void render_detail(const TestEntry& t, const TestResult& r) {
+static void render_detail(const TestEntry& t, const TestResult* r,
+                           int& detail_scroll, const std::string& live_status) {
     using namespace ansi;
     std::ostringstream o;
+    int rows_written = 0;
+
+    // Helper: append a line and count it
+    auto ln = [&](const std::string& s = "") {
+        o << s << "\n";
+        ++rows_written;
+    };
 
     o << CURSOR_HOME;
-    o << BOLD << "TRAILHEAD" << RESET << " — " << CYAN << t.name << RESET;
-    if (!t.label.empty()) o << "  " << DIM << t.label << RESET;
-    o << "\n" << hline(TOTAL_WIDTH) << "\n\n";
 
-    RunStatus s = result_status(r);
-    o << "  Status:   " << status_badge(s) << "\n";
-    o << "  Host:     " << r.host << "\n";
-    o << "  Run by:   " << r.run_by << "\n";
+    // ── Header ───────────────────────────────────────────────────────────────
+    {
+        std::ostringstream h;
+        h << BOLD << "TRAILHEAD" << RESET << " — " << CYAN << t.name << RESET;
+        if (!t.label.empty()) h << "  " << DIM << t.label << RESET;
+        ln(h.str());
+    }
+    ln(hline(TOTAL_WIDTH));
 
-    // Format timestamps
-    time_t started = (time_t)(r.started_at / 1000);
-    char tbuf[32];
-    struct tm* tm = localtime(&started);
-    strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", tm);
-    o << "  Started:  " << tbuf << "\n";
-    o << "  Wall:     " << fs::format_duration_ms(r.wall_ms) << "\n";
-    o << "  Pass:     " << color(BGREEN, std::to_string(r.passed))
-      << "   Fail: " << (r.failed > 0 ? color(BRED, std::to_string(r.failed)) : "0")
-      << "\n";
-
-    if (!r.timings.empty()) {
-        o << "\n  " << BOLD << "Timings:" << RESET << "\n";
-        for (const auto& te : r.timings) {
-            std::ostringstream dur;
-            dur << std::fixed << std::setprecision(1) << te.elapsed_ms << "ms";
-            o << "    " << pad(te.label, 20) << " " << dur.str() << "\n";
-        }
+    // ── Status / metadata ─────────────────────────────────────────────────
+    if (!live_status.empty()) {
+        ln("  Status:   " + status_badge(RunStatus::Running) + "  "
+           + std::string(DIM) + live_status + RESET);
+    } else if (r) {
+        ln("  Status:   " + status_badge(result_status(*r)));
+    } else {
+        ln("  Status:   " + status_badge(RunStatus::Unknown));
     }
 
-    // Metadata — exclude internal keys shown elsewhere
-    {
-        bool any = false;
-        for (const auto& [k, v] : r.metadata)
-            if (k.empty() || k[0] != '_') any = true;
-        if (any) {
-            o << "\n  " << BOLD << "Metadata:" << RESET << "\n";
-            for (const auto& [k, v] : r.metadata)
-                if (k.empty() || k[0] != '_')
-                    o << "    " << k << ": " << v << "\n";
-        }
-    }
+    if (r) {
+        ln("  Host:     " + r->host);
+        ln("  Run by:   " + r->run_by);
 
-    // SLURM terminal state from sacct (shown on non-COMPLETED jobs)
-    {
-        auto it = r.metadata.find("_sacct");
-        if (it != r.metadata.end() && !it->second.empty()) {
-            std::string raw = it->second;
-            std::string state, rest;
-            auto p = raw.find('|');
-            if (p != std::string::npos) { state = raw.substr(0, p); rest = raw.substr(p+1); }
-            else { state = raw; }
-            bool bad = (state != "COMPLETED");
-            const char* sc = bad ? BRED : BGREEN;
-            o << "\n  " << BOLD << "SLURM state:" << RESET
-              << "  " << color(sc, state);
-            if (!rest.empty()) o << "  " << DIM << rest << RESET;
-            o << "\n";
+        if (r->started_at > 0) {
+            time_t started = (time_t)(r->started_at / 1000);
+            char tbuf[32];
+            struct tm* tm_p = localtime(&started);
+            strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", tm_p);
+            ln("  Started:  " + std::string(tbuf));
         }
-    }
-
-    // Output tail
-    {
-        auto it = r.metadata.find("_output_tail");
-        if (it != r.metadata.end() && !it->second.empty()) {
-            RunStatus s2 = result_status(r);
-            const char* hdr_color = (s2 == RunStatus::Fail) ? BRED : GRAY;
-            o << "\n  " << color(hdr_color, BOLD + std::string("Output:") + RESET) << "\n";
-            std::istringstream ss(it->second);
-            for (std::string ln; std::getline(ss, ln); )
-                o << "    " << DIM << ln << RESET << "\n";
+        ln("  Wall:     " + fs::format_duration_ms(r->wall_ms));
+        {
+            std::ostringstream ps;
+            ps << "  Pass:     " << color(BGREEN, std::to_string(r->passed))
+               << "   Fail: " << (r->failed > 0 ? color(BRED, std::to_string(r->failed)) : "0");
+            ln(ps.str());
         }
     }
 
     if (!t.node_profile.empty())
-        o << "\n  " << BOLD << "Node profile:" << RESET << " " << t.node_profile << "\n";
+        ln("  Node:     " + t.node_profile);
 
-    o << "\n" << hline(TOTAL_WIDTH) << "\n";
-    o << DIM << "[b] back  [q] quit" << RESET << "\n";
+    // ── Pipeline ──────────────────────────────────────────────────────────
+    {
+        struct Phase {
+            std::string label;
+            double ms = 0;
+            enum State { Done, Running, Pending } state = Pending;
+            bool failed = false;
+        };
+        std::vector<Phase> phases;
+
+        if (r) {
+            for (const auto& te : r->timings) {
+                Phase p; p.label = te.label; p.ms = te.elapsed_ms; p.state = Phase::Done;
+                phases.push_back(p);
+            }
+            if (r->failed > 0 && !phases.empty())
+                phases.back().failed = true;
+        }
+        bool is_running = !live_status.empty() && live_status != "QUEUED";
+        if (is_running) {
+            Phase p; p.label = "running"; p.state = Phase::Running;
+            phases.push_back(p);
+        }
+
+        ln();
+        ln("  " + std::string(BOLD) + "Pipeline" + RESET);
+
+        if (phases.empty()) {
+            ln("  " + std::string(DIM) + "(no timing phases — test has not run yet)" + RESET);
+        } else {
+            // Compute column width: enough for longest label + 2 padding, min 7
+            int col_w = 7;
+            for (const auto& p : phases)
+                col_w = std::max(col_w, (int)p.label.size() + 2);
+            // Cap so the pipeline fits in an 80-col terminal
+            col_w = std::min(col_w, 80 / (int)phases.size());
+            if (col_w < 7) col_w = 7;
+
+            // Helper: repeat a UTF-8 string n times
+            auto rep = [](const std::string& s, int n) {
+                std::string r; for (int i = 0; i < n; ++i) r += s; return r;
+            };
+
+            // Dot + connector row  (● ──── ● ──── ○)
+            {
+                std::ostringstream dr; dr << "  ";
+                for (int i = 0; i < (int)phases.size(); ++i) {
+                    const auto& p = phases[i];
+                    const char* dc;
+                    // dot symbol: ● (3 bytes, 1 display col)
+                    // ● = \xe2\x97\x8f  ○ = \xe2\x97\x8b
+                    std::string sym;
+                    if (p.state == Phase::Running)  { dc = BYELLOW; sym = "\xe2\x97\x8f"; }
+                    else if (p.failed)              { dc = BRED;    sym = "\xe2\x97\x8f"; }
+                    else if (p.state == Phase::Done){ dc = BGREEN;  sym = "\xe2\x97\x8f"; }
+                    else                            { dc = GRAY;    sym = "\xe2\x97\x8b"; }
+                    dr << color(dc, sym);
+
+                    if (i + 1 < (int)phases.size()) {
+                        // connector: space + (col_w-3) × ─ + space = col_w-1 display cols
+                        // ─ = \xe2\x94\x80  (3 bytes, 1 display col each)
+                        bool active = (phases[i+1].state != Phase::Pending);
+                        const char* cc = active ? BGREEN : GRAY;
+                        std::string conn = " " + rep("\xe2\x94\x80", col_w - 3) + " ";
+                        dr << color(cc, conn);
+                    }
+                }
+                ln(dr.str());
+            }
+
+            // Label row
+            {
+                std::ostringstream lr; lr << "  ";
+                for (int i = 0; i < (int)phases.size(); ++i) {
+                    const auto& p = phases[i];
+                    std::string lbl = p.label;
+                    if ((int)lbl.size() > col_w) lbl = lbl.substr(0, col_w);
+                    bool last = (i + 1 == (int)phases.size());
+                    lr << (last ? lbl : pad(lbl, col_w));
+                }
+                ln(lr.str());
+            }
+
+            // Duration row (only if any durations present)
+            {
+                bool any_dur = false;
+                for (const auto& p : phases) if (p.state == Phase::Done) { any_dur = true; break; }
+                if (any_dur) {
+                    std::ostringstream dur; dur << "  ";
+                    for (int i = 0; i < (int)phases.size(); ++i) {
+                        const auto& p = phases[i];
+                        std::string d;
+                        if (p.state == Phase::Done) d = fmt_ms(p.ms);
+                        bool last = (i + 1 == (int)phases.size());
+                        dur << color(DIM, last ? d : pad(d, col_w));
+                    }
+                    ln(dur.str());
+                }
+            }
+        }
+    }
+
+    // ── Metadata (user-visible keys) ──────────────────────────────────────
+    {
+        bool any = false;
+        if (r) for (const auto& [k, v] : r->metadata)
+            if (!k.empty() && k[0] != '_') { any = true; break; }
+        if (any) {
+            ln();
+            ln("  " + std::string(BOLD) + "Metadata:" + RESET);
+            for (const auto& [k, v] : r->metadata)
+                if (!k.empty() && k[0] != '_')
+                    ln("    " + k + ": " + v);
+        }
+    }
+
+    // ── SLURM state ───────────────────────────────────────────────────────
+    if (r) {
+        auto it = r->metadata.find("_sacct");
+        if (it != r->metadata.end() && !it->second.empty()) {
+            std::string raw = it->second, state, rest;
+            auto p = raw.find('|');
+            if (p != std::string::npos) { state = raw.substr(0, p); rest = raw.substr(p+1); }
+            else state = raw;
+            bool bad = (state != "COMPLETED");
+            const char* sc = bad ? BRED : BGREEN;
+            std::ostringstream sl;
+            sl << "  " << BOLD << "SLURM state:" << RESET << "  " << color(sc, state);
+            if (!rest.empty()) sl << "  " << DIM << rest << RESET;
+            ln();
+            ln(sl.str());
+        }
+    }
+
+    // ── Scrollable output ─────────────────────────────────────────────────
+    if (r) {
+        auto oit = r->metadata.find("_output_tail");
+        if (oit != r->metadata.end() && !oit->second.empty()) {
+            std::vector<std::string> out_lines;
+            {
+                std::istringstream ss(oit->second);
+                for (std::string l; std::getline(ss, l); )
+                    out_lines.push_back(l);
+            }
+            int total_out = (int)out_lines.size();
+
+            // Rows available for output: terminal height minus everything above + footer (hline+keys)
+            // +1 blank + 1 "Output" header = 2 overhead before lines
+            static constexpr int FOOTER_ROWS = 2;
+            int avail = std::max(3, term_rows() - rows_written - 2 - FOOTER_ROWS);
+
+            // Clamp scroll
+            int max_scroll = std::max(0, total_out - avail);
+            if (detail_scroll > max_scroll) detail_scroll = max_scroll;
+            if (detail_scroll < 0)         detail_scroll = 0;
+
+            RunStatus s2 = r ? result_status(*r) : RunStatus::Unknown;
+            const char* hdr_color = (s2 == RunStatus::Fail) ? BRED : GRAY;
+
+            ln();
+            {
+                std::ostringstream oh;
+                oh << "  " << color(hdr_color, std::string(BOLD) + "Output" + RESET);
+                if (total_out > avail)
+                    oh << std::string(DIM) << " [" << (detail_scroll + 1)
+                       << "\xe2\x80\x93"  // en-dash
+                       << std::min(detail_scroll + avail, total_out)
+                       << "/" << total_out << "]" << RESET;
+                ln(oh.str());
+            }
+
+            if (detail_scroll > 0)
+                ln("    " + std::string(DIM) + "\xe2\x86\x91 " // ↑
+                   + std::to_string(detail_scroll) + " lines above" + RESET);
+
+            int vis_end = std::min(detail_scroll + avail, total_out);
+            for (int i = detail_scroll; i < vis_end; ++i)
+                ln("    " + std::string(DIM) + out_lines[i] + RESET);
+
+            int below = total_out - vis_end;
+            if (below > 0)
+                ln("    " + std::string(DIM) + "\xe2\x86\x93 " // ↓
+                   + std::to_string(below) + " lines below" + RESET);
+        }
+    }
+
+    // ── Footer ────────────────────────────────────────────────────────────
+    o << hline(TOTAL_WIDTH) << "\n";
+    o << DIM << "[b/ESC] back  [j/" << "\xe2\x86\x93" << "] scroll down  "
+      << "[k/" << "\xe2\x86\x91" << "] scroll up  [q] quit" << RESET << "\n";
     o << ERASE_DOWN;
 
     // Clear to end of line on every line to erase artifacts from longer previous frames
@@ -442,7 +611,6 @@ static bool run_add_wizard(Registry& reg,
 
     if (name.empty()) {
         enter_raw_mode();
-        std::cout << ansi::CURSOR_HIDE;
         return false;
     }
 
@@ -450,7 +618,6 @@ static bool run_add_wizard(Registry& reg,
     std::string cmd = wizard_open_editor(name);
 
     enter_raw_mode();
-    std::cout << ansi::CURSOR_HIDE;
 
     if (cmd.empty()) {
         std::cout << ansi::CLEAR;
@@ -518,7 +685,6 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
     std::string cmd = wizard_open_editor(name, test.cmd);
 
     enter_raw_mode();
-    std::cout << ansi::CURSOR_HIDE;
 
     if (cmd.empty()) {
         std::cout << ansi::CLEAR;
@@ -588,8 +754,9 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     std::string results_dir = trailhead_dir + "/results";
     fs::mkdir_p(results_dir);
 
+    std::cout << ansi::ALT_SCREEN_ON;
+    std::cout.flush();
     enter_raw_mode();
-    std::cout << ansi::CURSOR_HIDE;
 
     // Select hardware at startup if nodes are available
     std::string selected_hw;
@@ -599,9 +766,10 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         selected_hw = wizard_select_hardware(reg);
     }
 
-    int selected = 0;
-    int scroll   = 0;
+    int selected     = 0;
+    int scroll       = 0;
     bool detail_mode = false;
+    int detail_scroll = 0;  // scroll offset for detail view output
     int total = 0;
     std::vector<int> filtered; // indices into reg.tests, filtered by selected_hw
 
@@ -789,9 +957,11 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             if (key == '\r' || key == '\n') {
                 if (total > 0) {
                     detail_mode = true;
+                    detail_scroll = 0;
                     const auto& t = reg.tests[filtered[selected]];
                     const TestResult* r = latest_result(idx, t.name);
-                    if (r) render_detail(t, *r);
+                    std::string live = job_log ? job_log->get_live(t.name) : "";
+                    render_detail(t, r, detail_scroll, live);
                     // don't set redraw — detail was just rendered
                 }
             }
@@ -815,16 +985,21 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             } else if (key == 'q' || key == 'Q') {
                 break;
             } else {
-                // Refresh detail
+                if (key == 'j' || key == 1001 /*down*/) ++detail_scroll;
+                else if (key == 'k' || key == 1000 /*up*/) detail_scroll = std::max(0, detail_scroll - 1);
+                // Refresh detail (also runs on timer tick to reflect live status)
                 idx = load_all_results(results_dir);
                 const auto& t = reg.tests[filtered[selected]];
                 const TestResult* r = latest_result(idx, t.name);
-                if (r) render_detail(t, *r);
+                std::string live = job_log ? job_log->get_live(t.name) : "";
+                render_detail(t, r, detail_scroll, live);
             }
         }
     }
 
     restore_terminal();
+    std::cout << ansi::ALT_SCREEN_OFF;
+    std::cout.flush();
     std::cout << "\n";
 
     if (!auto_run) return 0;
