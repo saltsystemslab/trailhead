@@ -22,6 +22,9 @@ struct BuildConfig {
     // rsync: sync source tree to remote before building/running
     std::string rsync_src;      // local source dir to sync (default: project root)
     std::string rsync_dest;     // remote destination (e.g. user@host:/path/to/project)
+    // Set at load time for builds merged from sub-registries. Not serialized.
+    // Relative path from project root to the sub-registry root (e.g. "andes_benchmarks").
+    std::string sub_dir;
 };
 
 // ── Node profile ─────────────────────────────────────────────────────────
@@ -76,6 +79,9 @@ struct TestEntry {
     // Hardware requirement hint for display and compatibility warnings.
     // Values: "" or "any" = no constraint, "gpu" = needs GPU, "cpu" = CPU-only
     std::string requires_hw;
+    // Set at load time for tests merged from sub-registries. Not serialized.
+    // Relative path from project root to the sub-registry root (e.g. "andes_benchmarks").
+    std::string sub_dir;
 };
 
 // ── Registry ──────────────────────────────────────────────────────────────
@@ -89,6 +95,9 @@ struct Registry {
     // sbatch script, and via `trailhead setup run` for local bootstrapping.
     // Typical use: submodule init, dataset downloads, etc.
     std::vector<std::string> setup;
+    // Relative paths to sub-registry roots (e.g. git submodules).
+    // Tests from each are merged into the view at load time.
+    std::vector<std::string> sub_registries;
 };
 
 // ── Serialisation ─────────────────────────────────────────────────────────
@@ -219,6 +228,11 @@ JsonValue registry_to_json(const Registry& reg);
 
 std::optional<Registry> load_registry(const std::string& trailhead_dir);
 bool save_registry(const std::string& trailhead_dir, const Registry& reg);
+
+// Load sub-registries declared in reg.sub_registries and merge their tests in.
+// project_root is the parent directory of .trailhead/.
+// Merged tests have sub_dir set (non-empty) and names prefixed with their submodule name.
+void merge_sub_registries(Registry& reg, const std::string& project_root);
 
 Registry make_default_registry();
 

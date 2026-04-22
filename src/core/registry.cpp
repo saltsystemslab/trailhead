@@ -41,6 +41,9 @@ Registry registry_from_json(const JsonValue& root) {
     // Setup commands
     reg.setup = root.get_str_array("setup");
 
+    // Sub-registry paths
+    reg.sub_registries = root.get_str_array("sub_registries");
+
     return reg;
 }
 
@@ -48,10 +51,11 @@ JsonValue registry_to_json(const Registry& reg) {
     JsonObject root;
     root.push_back({"version", JsonValue((int64_t)reg.version)});
 
-    // Builds
+    // Builds — skip entries that came from sub-registries (contain '/')
     JsonObject builds_obj;
     for (const auto& [name, bc] : reg.builds) {
-        builds_obj.push_back({name, build_to_json(bc)});
+        if (name.find('/') == std::string::npos)
+            builds_obj.push_back({name, build_to_json(bc)});
     }
     root.push_back({"builds", JsonValue(std::move(builds_obj))});
 
@@ -65,10 +69,11 @@ JsonValue registry_to_json(const Registry& reg) {
     // sbatch_defaults
     root.push_back({"sbatch_defaults", sbatch_defaults_to_json(reg.sbatch_defaults)});
 
-    // Tests
+    // Tests — skip tests from sub-registries
     JsonArray tests_arr;
     for (const auto& t : reg.tests) {
-        tests_arr.push_back(test_to_json(t));
+        if (t.sub_dir.empty())
+            tests_arr.push_back(test_to_json(t));
     }
     root.push_back({"tests", JsonValue(std::move(tests_arr))});
 
@@ -76,6 +81,11 @@ JsonValue registry_to_json(const Registry& reg) {
     JsonArray setup_arr;
     for (const auto& s : reg.setup) setup_arr.push_back(JsonValue(s));
     root.push_back({"setup", JsonValue(std::move(setup_arr))});
+
+    // Sub-registry paths
+    JsonArray sub_arr;
+    for (const auto& s : reg.sub_registries) sub_arr.push_back(JsonValue(s));
+    root.push_back({"sub_registries", JsonValue(std::move(sub_arr))});
 
     return JsonValue(std::move(root));
 }
@@ -97,6 +107,44 @@ bool save_registry(const std::string& trailhead_dir, const Registry& reg) {
     std::string path = trailhead_dir + "/registry.json";
     std::string content = json_emit(registry_to_json(reg));
     return fs::write_file_atomic(path, content);
+}
+
+void merge_sub_registries(Registry& reg, const std::string& project_root) {
+    for (const auto& sub_rel : reg.sub_registries) {
+        std::string sub_abs = project_root + "/" + sub_rel;
+        std::string sub_th  = sub_abs + "/.trailhead/registry.json";
+        auto content = fs::read_file(sub_th);
+        if (!content) continue;
+
+        Registry sub;
+        try { sub = registry_from_json(json_parse(*content)); }
+        catch (...) { continue; }
+
+        // The display name is the last path component (e.g. "andes_benchmarks")
+        std::string sub_name = sub_rel;
+        auto slash = sub_name.rfind('/');
+        if (slash != std::string::npos) sub_name = sub_name.substr(slash + 1);
+
+        // Merge build configs — prefix to avoid collisions; record sub_dir for local execution
+        for (const auto& [bname, bc] : sub.builds) {
+            std::string key = sub_name + "/" + bname;
+            if (!reg.builds.count(key)) {
+                BuildConfig merged = bc;
+                merged.sub_dir = sub_rel;
+                reg.builds[key] = merged;
+            }
+        }
+
+        // Merge tests
+        for (auto t : sub.tests) {
+            t.name     = sub_name + "/" + t.name;
+            t.sub_dir  = sub_rel;
+            if (!t.build_name.empty()) t.build_name = sub_name + "/" + t.build_name;
+            // workdir "." means "run from sub-root" for local execution
+            if (t.workdir == "." || t.workdir.empty()) t.workdir = sub_rel;
+            reg.tests.push_back(std::move(t));
+        }
+    }
 }
 
 Registry make_default_registry() {

@@ -425,6 +425,8 @@ static int cmd_list(int argc, char** argv) {
     (void)argc; (void)argv;
     std::string th_dir = require_trailhead();
     auto reg = load_reg(th_dir);
+    auto root = trailhead::fs::find_trailhead_root();
+    if (root) trailhead::merge_sub_registries(reg, *root);
     trailhead::print_status(th_dir, reg);
     return 0;
 }
@@ -441,6 +443,11 @@ static int cmd_remove(int argc, char** argv) {
         [&](const trailhead::TestEntry& t) { return t.name == name; });
     if (it == reg.tests.end()) {
         std::cerr << "Error: test '" << name << "' not found\n"; return 1;
+    }
+    if (!it->sub_dir.empty()) {
+        std::cerr << "Error: '" << name << "' is from sub-registry '"
+                  << it->sub_dir << "' — edit its registry directly.\n";
+        return 1;
     }
     reg.tests.erase(it);
     trailhead::save_registry(th_dir, reg);
@@ -483,6 +490,9 @@ static int cmd_run(int argc, char** argv) {
     Args args = Args::parse(argc, argv, 2);
     std::string th_dir = require_trailhead();
     auto reg = load_reg(th_dir);
+    auto root_opt = trailhead::fs::find_trailhead_root();
+    std::string project_root = root_opt ? *root_opt : "";
+    if (root_opt) trailhead::merge_sub_registries(reg, *root_opt);
 
     bool no_build = args.flag("no-build");  // skip build step
     std::string filter_tag = args.get("tag");
@@ -527,12 +537,18 @@ static int cmd_run(int argc, char** argv) {
             const auto& bc = it->second;
             std::cout << trailhead::ansi::BOLD << "Build [" << t->build_name << "]\n" << trailhead::ansi::RESET;
 
+            // For sub-registry builds, paths are relative to the sub-registry root
+            std::string eff_dir = bc.sub_dir.empty() ? bc.dir
+                                                      : bc.sub_dir + "/" + bc.dir;
+            std::string conf_workdir = bc.sub_dir.empty() ? ""
+                : (project_root.empty() ? bc.sub_dir : project_root + "/" + bc.sub_dir);
+
             // Configure: only if build dir is absent
             bool need_configure = !bc.configure_cmd.empty() &&
-                                  !bc.dir.empty() && !trailhead::fs::is_dir(bc.dir);
+                                  !bc.dir.empty() && !trailhead::fs::is_dir(eff_dir);
             if (need_configure) {
                 std::cout << "  configure: " << bc.configure_cmd << "\n";
-                auto r = trailhead::proc::run(bc.configure_cmd, {}, {}, 300, "", nullptr, true);
+                auto r = trailhead::proc::run(bc.configure_cmd, {}, {}, 300, conf_workdir, nullptr, true);
                 if (r.exit_code != 0) {
                     std::cout << r.stdout_str;
                     if (!r.stderr_str.empty()) std::cerr << r.stderr_str;
@@ -543,9 +559,8 @@ static int cmd_run(int argc, char** argv) {
 
             // Rsync: once per build group
             if (!bc.rsync_dest.empty()) {
-                auto root = trailhead::fs::find_trailhead_root();
                 std::string src = bc.rsync_src.empty()
-                    ? (root ? *root + "/" : "./")
+                    ? (root_opt ? *root_opt + "/" : "./")
                     : bc.rsync_src;
                 std::string rsync_cmd = "rsync -avz --exclude='.trailhead/' "
                     + src + " " + bc.rsync_dest;
@@ -577,9 +592,10 @@ static int cmd_run(int argc, char** argv) {
             auto it = reg.builds.find(t->build_name);
             if (it != reg.builds.end()) {
                 const auto& bc = it->second;
-                std::string target_cmd = "cmake --build " + bc.dir
+                std::string eff_dir = bc.sub_dir.empty() ? bc.dir : bc.sub_dir + "/" + bc.dir;
+                std::string target_cmd = "cmake --build " + eff_dir
                     + " --target " + t->target;
-                std::cout << "\n  cmake --build " << bc.dir << " --target " << t->target << " ...";
+                std::cout << "\n  cmake --build " << eff_dir << " --target " << t->target << " ...";
                 std::cout.flush();
                 auto r = trailhead::proc::run(target_cmd, {}, {}, 300, "", nullptr, true);
                 if (r.exit_code != 0) {
@@ -731,6 +747,7 @@ static int cmd_gen(int argc, char** argv) {
     // Get project root (parent of .trailhead/)
     auto root = trailhead::fs::find_trailhead_root();
     std::string project_root = root ? *root : "";
+    if (root) trailhead::merge_sub_registries(reg, *root);
 
     trailhead::SbatchOptions opts;
     opts.split        = args.flag("split");
@@ -769,6 +786,9 @@ static int cmd_watch(int argc, char** argv) {
     // Determine project root (parent of .trailhead/)
     auto root_opt = trailhead::fs::find_trailhead_root();
     std::string project_root = root_opt ? *root_opt : ".";
+
+    // Merge tests from declared sub-registries
+    if (root_opt) trailhead::merge_sub_registries(reg, *root_opt);
 
     // Check whether any build config has an rsync_dest configured
     std::optional<trailhead::RemoteDest> remote_dest;
@@ -936,6 +956,10 @@ static int cmd_watch(int argc, char** argv) {
 static int cmd_show(int argc, char** argv) {
     std::string th_dir = require_trailhead();
     auto reg = load_reg(th_dir);
+    {
+        auto root = trailhead::fs::find_trailhead_root();
+        if (root) trailhead::merge_sub_registries(reg, *root);
+    }
     auto idx = trailhead::load_all_results(th_dir + "/results");
 
     std::string filter = (argc >= 3) ? argv[2] : "";
@@ -1104,6 +1128,70 @@ static int cmd_setup(int argc, char** argv) {
     return 1;
 }
 
+// ── Subcommand: sub ───────────────────────────────────────────────────────
+
+static int cmd_sub(int argc, char** argv) {
+    if (argc < 3) {
+        std::cout << "Usage:\n"
+                     "  trailhead sub add <path>     # add a sub-registry path\n"
+                     "  trailhead sub list            # list sub-registry paths\n"
+                     "  trailhead sub remove <path>   # remove a sub-registry path\n"
+                     "\n"
+                     "Sub-registries are relative paths to directories that contain\n"
+                     "their own .trailhead/registry.json (typically git submodules).\n"
+                     "Their tests are merged into the parent view at load time with\n"
+                     "names prefixed by the sub-registry's directory name.\n"
+                     "\n"
+                     "Example:\n"
+                     "  trailhead sub add andes_benchmarks\n"
+                     "  # → shows 'andes_benchmarks/my_test' in trailhead watch\n";
+        return 0;
+    }
+    std::string action(argv[2]);
+    std::string th_dir = require_trailhead();
+    auto reg = load_reg(th_dir);
+
+    if (action == "list") {
+        if (reg.sub_registries.empty()) {
+            std::cout << trailhead::ansi::DIM << "No sub-registries defined.\n" << trailhead::ansi::RESET;
+            return 0;
+        }
+        for (const auto& s : reg.sub_registries)
+            std::cout << s << "\n";
+        return 0;
+    }
+
+    if (action == "add") {
+        if (argc < 4) { std::cerr << "Error: specify a path\n"; return 1; }
+        std::string path(argv[3]);
+        for (const auto& s : reg.sub_registries) {
+            if (s == path) { std::cerr << "Already registered: " << path << "\n"; return 1; }
+        }
+        reg.sub_registries.push_back(path);
+        trailhead::save_registry(th_dir, reg);
+        std::cout << trailhead::ansi::BGREEN << "Added sub-registry:" << trailhead::ansi::RESET
+                  << " " << path << "\n";
+        return 0;
+    }
+
+    if (action == "remove") {
+        if (argc < 4) { std::cerr << "Error: specify a path\n"; return 1; }
+        std::string path(argv[3]);
+        auto it = std::find(reg.sub_registries.begin(), reg.sub_registries.end(), path);
+        if (it == reg.sub_registries.end()) {
+            std::cerr << "Error: sub-registry '" << path << "' not found\n"; return 1;
+        }
+        reg.sub_registries.erase(it);
+        trailhead::save_registry(th_dir, reg);
+        std::cout << trailhead::ansi::YELLOW << "Removed sub-registry:" << trailhead::ansi::RESET
+                  << " " << path << "\n";
+        return 0;
+    }
+
+    std::cerr << "Unknown sub action: " << action << "\n";
+    return 1;
+}
+
 // ── Usage ─────────────────────────────────────────────────────────────────
 
 static void print_usage() {
@@ -1136,6 +1224,9 @@ static void print_usage() {
     std::cout << "  setup list                    List setup steps\n";
     std::cout << "  setup remove <index>          Remove a setup step by index\n";
     std::cout << "  setup run                     Run all setup steps locally\n";
+    std::cout << "  sub add <path>                Add a sub-registry (e.g. a git submodule)\n";
+    std::cout << "  sub list                      List declared sub-registries\n";
+    std::cout << "  sub remove <path>             Remove a sub-registry declaration\n";
     std::cout << "\n";
 }
 
@@ -1170,6 +1261,7 @@ int main(int argc, char** argv) {
     if (cmd == "show")         return cmd_show(argc, argv);
     if (cmd == "clean")        return cmd_clean(argc, argv);
     if (cmd == "setup")        return cmd_setup(argc, argv);
+    if (cmd == "sub")          return cmd_sub(argc, argv);
     if (cmd == "--help" || cmd == "help" || cmd == "-h") { print_usage(); return 0; }
 
     std::cerr << "Unknown command: " << cmd << ". Run 'trailhead help' for usage.\n";

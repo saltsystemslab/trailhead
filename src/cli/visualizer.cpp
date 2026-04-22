@@ -1177,13 +1177,21 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 redraw = true;
             }
             if ((key == 'e' || key == 'E') && total > 0) {
-                run_edit_wizard(reg, filtered[selected], trailhead_dir, project_root);
-                rebuild_filtered();
-                idx = load_all_results(results_dir);
+                const auto& te = reg.tests[filtered[selected]];
+                if (!te.sub_dir.empty()) {
+                    job_log->push("[warn] cannot edit sub-registry test: " + te.name);
+                } else {
+                    run_edit_wizard(reg, filtered[selected], trailhead_dir, project_root);
+                    rebuild_filtered();
+                    idx = load_all_results(results_dir);
+                }
                 redraw = true;
             }
             if ((key == 'd' || key == 'D' || key == 127 /*backspace*/) && total > 0) {
-                if (wizard_confirm_delete(reg, filtered[selected], trailhead_dir, project_root)) {
+                const auto& td = reg.tests[filtered[selected]];
+                if (!td.sub_dir.empty()) {
+                    job_log->push("[warn] cannot delete sub-registry test: " + td.name);
+                } else if (wizard_confirm_delete(reg, filtered[selected], trailhead_dir, project_root)) {
                     rebuild_filtered();
                     idx = load_all_results(results_dir);
                 }
