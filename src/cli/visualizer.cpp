@@ -878,19 +878,74 @@ static bool run_add_wizard(Registry& reg,
     return true;
 }
 
+// ── Sub-registry helpers ───────────────────────────────────────────────────
+
+// Last path component of a sub_dir path (e.g. "a/b/c" → "c").
+static std::string sub_name_from_dir(const std::string& sub_dir) {
+    auto slash = sub_dir.rfind('/');
+    return (slash != std::string::npos) ? sub_dir.substr(slash + 1) : sub_dir;
+}
+
+// Strip "subname/" prefix from a merged test name to recover the original name.
+static std::string strip_sub_prefix(const std::string& name, const std::string& sub_dir) {
+    std::string prefix = sub_name_from_dir(sub_dir) + "/";
+    if (name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix)
+        return name.substr(prefix.size());
+    return name;
+}
+
+// Reload the parent registry and re-merge sub-registries into reg.
+static void reload_merged(Registry& reg, const std::string& th_dir,
+                           const std::string& project_root)
+{
+    auto fresh = load_registry(th_dir);
+    if (fresh) {
+        reg = *fresh;
+        merge_sub_registries(reg, project_root);
+    }
+}
+
 // ── Edit-task wizard ──────────────────────────────────────────────────────
 
-// Edit an existing test in-place: name (pre-filled) → editor (pre-filled) → save.
+// Edit an existing test in-place. For sub-registry tests, edits are written
+// to the sub-registry's own registry and the parent view is reloaded.
 static bool run_edit_wizard(Registry& reg, int test_idx,
                              const std::string& th_dir,
                              const std::string& project_root)
 {
-    TestEntry& test = reg.tests[test_idx];
+    const std::string test_sub_dir = reg.tests[test_idx].sub_dir;
+
+    // Resolve which registry to edit and what the un-prefixed test name is
+    std::string eff_th_dir = th_dir;
+    std::string eff_project_root = project_root;
+    Registry sub_reg;
+    Registry* work_reg = &reg;
+    int work_idx = test_idx;
+
+    if (!test_sub_dir.empty()) {
+        eff_th_dir       = project_root + "/" + test_sub_dir + "/.trailhead";
+        eff_project_root = project_root + "/" + test_sub_dir;
+        auto loaded = load_registry(eff_th_dir);
+        if (!loaded) { enter_raw_mode(); return false; }
+        sub_reg  = *loaded;
+        work_reg = &sub_reg;
+        std::string actual_name = strip_sub_prefix(reg.tests[test_idx].name, test_sub_dir);
+        work_idx = -1;
+        for (int i = 0; i < (int)sub_reg.tests.size(); ++i) {
+            if (sub_reg.tests[i].name == actual_name) { work_idx = i; break; }
+        }
+        if (work_idx < 0) { enter_raw_mode(); return false; }
+    }
+
+    TestEntry& test = work_reg->tests[work_idx];
 
     // ── Step 1: name (pre-filled, blank = keep current) ──────────────────
     restore_terminal();
     std::cout << ansi::CLEAR;
-    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Edit task\n\n";
+    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Edit task";
+    if (!test_sub_dir.empty())
+        std::cout << ansi::DIM << "  (sub-registry: " << test_sub_dir << ")" << ansi::RESET;
+    std::cout << "\n\n";
     std::cout << "  Task name [" << test.name << "]: ";
     std::cout.flush();
 
@@ -917,7 +972,7 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
 
     // Remove old sbatch file if name changed
     if (name != test.name) {
-        std::string old_sbatch = th_dir + "/sbatch/" + test.name + ".sbatch";
+        std::string old_sbatch = eff_th_dir + "/sbatch/" + test.name + ".sbatch";
         ::unlink(old_sbatch.c_str());
     }
 
@@ -925,11 +980,14 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
     test.name = name;
     test.cmd  = cmd;
 
-    save_registry(th_dir, reg);
+    save_registry(eff_th_dir, *work_reg);
     SbatchOptions opts;
     opts.split        = true;
-    opts.project_root = project_root;
-    write_sbatch(th_dir, reg, opts);
+    opts.project_root = eff_project_root;
+    write_sbatch(eff_th_dir, *work_reg, opts);
+
+    if (!test_sub_dir.empty())
+        reload_merged(reg, th_dir, project_root);
     return true;
 }
 
@@ -939,26 +997,43 @@ static bool wizard_confirm_delete(Registry& reg, int test_idx,
                                    const std::string& th_dir,
                                    const std::string& project_root)
 {
-    const TestEntry& test = reg.tests[test_idx];
+    const std::string display_name  = reg.tests[test_idx].name;
+    const std::string test_sub_dir  = reg.tests[test_idx].sub_dir;
 
     std::cout << ansi::CLEAR;
     std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Delete task\n\n";
-    std::cout << "  Delete " << ansi::color(ansi::BRED, test.name) << "?\n\n";
+    std::cout << "  Delete " << ansi::color(ansi::BRED, display_name) << "?\n";
+    if (!test_sub_dir.empty())
+        std::cout << "  " << ansi::DIM << "(from sub-registry: " << test_sub_dir << ")"
+                  << ansi::RESET << "\n";
+    std::cout << "\n";
     std::cout << ansi::DIM << "  [y] Yes, delete    [n / ESC] Cancel" << ansi::RESET << "\n";
     std::cout.flush();
 
     while (true) {
         int k = read_key(30000);
         if (k == 'y' || k == 'Y') {
-            // Remove sbatch file
-            std::string sbatch = th_dir + "/sbatch/" + test.name + ".sbatch";
-            ::unlink(sbatch.c_str());
-            reg.tests.erase(reg.tests.begin() + test_idx);
-            save_registry(th_dir, reg);
-            SbatchOptions opts;
-            opts.split        = true;
-            opts.project_root = project_root;
-            write_sbatch(th_dir, reg, opts);
+            if (!test_sub_dir.empty()) {
+                std::string sub_th_dir   = project_root + "/" + test_sub_dir + "/.trailhead";
+                std::string actual_name  = strip_sub_prefix(display_name, test_sub_dir);
+                auto loaded = load_registry(sub_th_dir);
+                if (loaded) {
+                    auto& ts = loaded->tests;
+                    ts.erase(std::remove_if(ts.begin(), ts.end(),
+                        [&](const TestEntry& t){ return t.name == actual_name; }), ts.end());
+                    save_registry(sub_th_dir, *loaded);
+                }
+                reload_merged(reg, th_dir, project_root);
+            } else {
+                std::string sbatch = th_dir + "/sbatch/" + display_name + ".sbatch";
+                ::unlink(sbatch.c_str());
+                reg.tests.erase(reg.tests.begin() + test_idx);
+                save_registry(th_dir, reg);
+                SbatchOptions opts;
+                opts.split        = true;
+                opts.project_root = project_root;
+                write_sbatch(th_dir, reg, opts);
+            }
             return true;
         }
         if (k == 'n' || k == 'N' || k == 27 || k == 'q' || k < 0) return false;
@@ -1177,21 +1252,13 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 redraw = true;
             }
             if ((key == 'e' || key == 'E') && total > 0) {
-                const auto& te = reg.tests[filtered[selected]];
-                if (!te.sub_dir.empty()) {
-                    job_log->push("[warn] cannot edit sub-registry test: " + te.name);
-                } else {
-                    run_edit_wizard(reg, filtered[selected], trailhead_dir, project_root);
-                    rebuild_filtered();
-                    idx = load_all_results(results_dir);
-                }
+                run_edit_wizard(reg, filtered[selected], trailhead_dir, project_root);
+                rebuild_filtered();
+                idx = load_all_results(results_dir);
                 redraw = true;
             }
             if ((key == 'd' || key == 'D' || key == 127 /*backspace*/) && total > 0) {
-                const auto& td = reg.tests[filtered[selected]];
-                if (!td.sub_dir.empty()) {
-                    job_log->push("[warn] cannot delete sub-registry test: " + td.name);
-                } else if (wizard_confirm_delete(reg, filtered[selected], trailhead_dir, project_root)) {
+                if (wizard_confirm_delete(reg, filtered[selected], trailhead_dir, project_root)) {
                     rebuild_filtered();
                     idx = load_all_results(results_dir);
                 }

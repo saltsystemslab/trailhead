@@ -438,17 +438,48 @@ static int cmd_remove(int argc, char** argv) {
     std::string name(argv[2]);
     std::string th_dir = require_trailhead();
     auto reg = load_reg(th_dir);
+    auto root = trailhead::fs::find_trailhead_root();
+    if (root) trailhead::merge_sub_registries(reg, *root);
 
     auto it = std::find_if(reg.tests.begin(), reg.tests.end(),
         [&](const trailhead::TestEntry& t) { return t.name == name; });
     if (it == reg.tests.end()) {
         std::cerr << "Error: test '" << name << "' not found\n"; return 1;
     }
+
     if (!it->sub_dir.empty()) {
-        std::cerr << "Error: '" << name << "' is from sub-registry '"
-                  << it->sub_dir << "' — edit its registry directly.\n";
-        return 1;
+        // Forward the delete to the sub-registry's own registry
+        std::string sub_dir = it->sub_dir;
+        std::string project_root = root ? *root : ".";
+        std::string sub_th_dir = project_root + "/" + sub_dir + "/.trailhead";
+
+        // Strip the "subname/" prefix to get the test's original name
+        std::string sub_name = sub_dir;
+        auto slash = sub_name.rfind('/');
+        if (slash != std::string::npos) sub_name = sub_name.substr(slash + 1);
+        std::string prefix = sub_name + "/";
+        std::string actual_name = name;
+        if (actual_name.size() > prefix.size() && actual_name.substr(0, prefix.size()) == prefix)
+            actual_name = actual_name.substr(prefix.size());
+
+        auto sub_reg = trailhead::load_registry(sub_th_dir);
+        if (!sub_reg) {
+            std::cerr << "Error: could not load sub-registry at '" << sub_th_dir << "'\n";
+            return 1;
+        }
+        auto sit = std::find_if(sub_reg->tests.begin(), sub_reg->tests.end(),
+            [&](const trailhead::TestEntry& t){ return t.name == actual_name; });
+        if (sit == sub_reg->tests.end()) {
+            std::cerr << "Error: test '" << actual_name << "' not found in sub-registry\n";
+            return 1;
+        }
+        sub_reg->tests.erase(sit);
+        trailhead::save_registry(sub_th_dir, *sub_reg);
+        std::cout << trailhead::ansi::YELLOW << "Removed test:" << trailhead::ansi::RESET
+                  << " " << name << "  (" << sub_dir << ")\n";
+        return 0;
     }
+
     reg.tests.erase(it);
     trailhead::save_registry(th_dir, reg);
     std::cout << trailhead::ansi::YELLOW << "Removed test:" << trailhead::ansi::RESET
