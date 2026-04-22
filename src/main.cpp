@@ -107,6 +107,7 @@ static int cmd_init(const Args& args) {
     std::cout << trailhead::ansi::BGREEN << "Initialized" << trailhead::ansi::RESET
               << " " << th_dir << "\n\n";
     std::cout << "Next steps:\n";
+    std::cout << "  trailhead setup add \"git submodule update --init --recursive\"  # one-time setup\n";
     std::cout << "  trailhead node add --name <profile>  # define a node/SLURM profile\n";
     std::cout << "  trailhead add --name <test> --cmd <cmd>  # register a test\n";
     std::cout << "  trailhead run --all                   # run all tests locally\n";
@@ -338,8 +339,8 @@ static int cmd_add(int argc, char** argv) {
     if (name.empty() || cmd.empty()) {
         std::cerr << "Usage: trailhead add --name <n> --cmd <cmd> [--label <l>]\n"
                      "                     [--build <config>] [--target <cmake-target>]\n"
-                     "                     [--node <profile>] [--tag <t>]\n"
-                     "                     [--timeout <sec>] [--workdir <dir>]\n"
+                     "                     [--requires gpu|cpu|any]\n"
+                     "                     [--tag <t>] [--timeout <sec>] [--workdir <dir>]\n"
                      "\n"
                      "  --cmd supports shell syntax (&&, pipes, multi-line via semicolons):\n"
                      "    --cmd \"./build/my_test --verbose\"\n"
@@ -352,11 +353,6 @@ static int cmd_add(int argc, char** argv) {
             std::cout << "\nAvailable build configs:\n";
             for (const auto& [n, bc] : reg.builds)
                 std::cout << "  " << n << "  (" << bc.build_cmd << ")\n";
-        }
-        if (!reg.nodes.empty()) {
-            std::cout << "\nAvailable node profiles:\n";
-            for (const auto& [n, np] : reg.nodes)
-                std::cout << "  " << n << "  (" << np.partition << ")\n";
         }
         return 1;
     }
@@ -381,14 +377,10 @@ static int cmd_add(int argc, char** argv) {
         return 1;
     }
 
-    std::string node = args.get("node");
-    if (!node.empty() && !reg.nodes.count(node)) {
-        std::cerr << "Error: node profile '" << node << "' not found.\n";
-        if (!reg.nodes.empty()) {
-            std::cout << "Available profiles:";
-            for (const auto& [n, _] : reg.nodes) std::cout << " " << n;
-            std::cout << "\n";
-        }
+    std::string requires_hw = args.get("requires");
+    if (!requires_hw.empty() && requires_hw != "any" &&
+        requires_hw != "gpu" && requires_hw != "cpu") {
+        std::cerr << "Error: --requires must be 'gpu', 'cpu', or 'any'\n";
         return 1;
     }
 
@@ -398,8 +390,8 @@ static int cmd_add(int argc, char** argv) {
     t.cmd          = cmd;
     t.workdir      = args.get("workdir", ".");
     t.timeout_sec  = args.get_int("timeout", 300);
-    t.node_profile = node;
     t.build_name   = build;
+    t.requires_hw  = requires_hw;
 
     // target: explicit --target, or defaults to test name when build is set,
     // or empty string to disable per-test rebuild
@@ -422,7 +414,7 @@ static int cmd_add(int argc, char** argv) {
 
     std::cout << trailhead::ansi::BGREEN << "Added test:" << trailhead::ansi::RESET << " " << name;
     if (!build.empty()) std::cout << "  (build: " << build << ", target: " << t.target << ")";
-    if (!node.empty())  std::cout << "  (node: "  << node  << ")";
+    if (!requires_hw.empty() && requires_hw != "any") std::cout << "  (requires: " << requires_hw << ")";
     std::cout << "\n";
     return 0;
 }
@@ -744,6 +736,7 @@ static int cmd_gen(int argc, char** argv) {
     opts.split        = args.flag("split");
     opts.project_root = args.get("root", project_root);
     opts.output_path  = args.get("out");
+    opts.node_name    = args.get("node");
 
     auto scripts = trailhead::generate_sbatch(reg, opts);
     if (scripts.empty()) {
@@ -822,7 +815,7 @@ static int cmd_watch(int argc, char** argv) {
         auto submitter = std::make_shared<trailhead::BatchSubmitter>(
             reg, th_dir, project_root, *remote_dest, job_log, max_concurrent);
 
-        run_fn = [&reg = reg, job_log, make_log_fn, submitter, local_runner](
+        run_fn = [&reg = reg, job_log, make_log_fn, submitter, local_runner, th_dir](
                 const std::string& name, const std::string& node_name) {
             const trailhead::TestEntry* test = nullptr;
             for (const auto& t : reg.tests)
@@ -833,9 +826,11 @@ static int cmd_watch(int argc, char** argv) {
             job_log->clear_live_output(tname);
             if (node_name == "local") {
                 if (!local_runner) { job_log->push("local GPU not available"); return; }
+                trailhead::save_queued_submission(th_dir, {tname, "local"});
                 local_runner->enqueue(*test,
                     make_log_fn(tname),
-                    [job_log, tname](const std::string& status) {
+                    [job_log, tname, th_dir](const std::string& status) {
+                        if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname);
                         job_log->set_live(tname, status);
                     });
             } else {
@@ -848,7 +843,7 @@ static int cmd_watch(int argc, char** argv) {
         };
     } else {
         // No remote configured — local runner only
-        run_fn = [&reg = reg, job_log, make_log_fn, local_runner](
+        run_fn = [&reg = reg, job_log, make_log_fn, local_runner, th_dir](
                 const std::string& name, const std::string& node_name) {
             const trailhead::TestEntry* test = nullptr;
             for (const auto& t : reg.tests)
@@ -859,9 +854,11 @@ static int cmd_watch(int argc, char** argv) {
             job_log->clear_live_output(tname);
             if (node_name == "local") {
                 if (!local_runner) { job_log->push("local GPU not available"); return; }
+                trailhead::save_queued_submission(th_dir, {tname, "local"});
                 local_runner->enqueue(*test,
                     make_log_fn(tname),
-                    [job_log, tname](const std::string& status) {
+                    [job_log, tname, th_dir](const std::string& status) {
+                        if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname);
                         job_log->set_live(tname, status);
                     });
             } else {
@@ -870,16 +867,15 @@ static int cmd_watch(int argc, char** argv) {
         };
     }
 
-    // Resume any jobs that were in-flight when watch was last closed
-    if (remote_dest) {
+    // Resume any SLURM jobs that were in-flight when watch was last closed.
+    // Each pending file stores its own remote address, so no remote_dest needed.
+    {
         auto pending = trailhead::load_pending_jobs(th_dir);
         for (const auto& pj : pending) {
-            // Find the matching test entry
             const trailhead::TestEntry* test = nullptr;
             for (const auto& t : reg.tests)
                 if (t.name == pj.name) { test = &t; break; }
             if (!test) {
-                // Test no longer registered — clean up stale pending file
                 trailhead::clear_pending_job(th_dir, pj.name);
                 continue;
             }
@@ -904,7 +900,6 @@ static int cmd_watch(int argc, char** argv) {
     if (remote_dest) {
         auto queued = trailhead::load_queued_submissions(th_dir);
         for (const auto& qs : queued) {
-            // Check the test still exists
             bool found = false;
             for (const auto& t : reg.tests)
                 if (t.name == qs.name) { found = true; break; }
@@ -914,6 +909,21 @@ static int cmd_watch(int argc, char** argv) {
             }
             job_log->push("[" + qs.name + "] re-queuing from previous session");
             run_fn(qs.name, qs.node_name);
+        }
+    } else if (local_runner && run_fn) {
+        // No remote — restore any local jobs that were queued when watch last closed
+        auto queued = trailhead::load_queued_submissions(th_dir);
+        for (const auto& qs : queued) {
+            if (qs.node_name != "local") continue;
+            bool found = false;
+            for (const auto& t : reg.tests)
+                if (t.name == qs.name) { found = true; break; }
+            if (!found) {
+                trailhead::clear_queued_submission(th_dir, qs.name);
+                continue;
+            }
+            job_log->push("[" + qs.name + "] re-queuing local from previous session");
+            run_fn(qs.name, "local");
         }
     }
 
@@ -952,8 +962,10 @@ static int cmd_show(int argc, char** argv) {
             std::cout << "  timing:  " << te.label << " = " << te.elapsed_ms << "ms\n";
         for (const auto& [k, v] : r->metadata)
             std::cout << "  meta:    " << k << " = " << v << "\n";
-        if (!t.node_profile.empty())
-            std::cout << "  node:    " << t.node_profile << "\n";
+        if (!t.build_name.empty())
+            std::cout << "  build:   " << t.build_name << "\n";
+        if (!t.requires_hw.empty() && t.requires_hw != "any")
+            std::cout << "  requires:" << t.requires_hw << "\n";
         std::cout << "\n";
     }
     return 0;
@@ -985,6 +997,113 @@ static int cmd_clean(int argc, char** argv) {
     return 0;
 }
 
+// ── Subcommand: setup ─────────────────────────────────────────────────────
+
+static int cmd_setup(int argc, char** argv) {
+    if (argc < 3) {
+        std::cout << "Usage:\n"
+                     "  trailhead setup add <command>   # append a setup step\n"
+                     "  trailhead setup list             # show all setup steps\n"
+                     "  trailhead setup remove <index>   # remove step by index (0-based)\n"
+                     "  trailhead setup run              # run all setup steps locally\n"
+                     "\n"
+                     "Setup steps run before cmake configure in every sbatch script,\n"
+                     "and locally via 'trailhead setup run'. Use them for one-time\n"
+                     "tasks that must complete before building: submodule init,\n"
+                     "dataset downloads, dependency installs, etc.\n"
+                     "\n"
+                     "Example:\n"
+                     "  trailhead setup add \"git submodule update --init --recursive\"\n"
+                     "  trailhead setup add \"wget -nc https://example.com/data.tar.gz\"\n";
+        return 0;
+    }
+    std::string action(argv[2]);
+    std::string th_dir = require_trailhead();
+    auto reg = load_reg(th_dir);
+
+    if (action == "list") {
+        if (reg.setup.empty()) {
+            std::cout << trailhead::ansi::DIM << "No setup steps defined.\n" << trailhead::ansi::RESET;
+            return 0;
+        }
+        for (int i = 0; i < (int)reg.setup.size(); ++i)
+            std::cout << "[" << i << "] " << reg.setup[i] << "\n";
+        return 0;
+    }
+
+    if (action == "add") {
+        if (argc < 4) { std::cerr << "Error: provide a command string\n"; return 1; }
+        std::string cmd(argv[3]);
+        reg.setup.push_back(cmd);
+        trailhead::save_registry(th_dir, reg);
+
+        // Regenerate sbatch scripts so all existing tests pick up the new step
+        auto root = trailhead::fs::find_trailhead_root();
+        trailhead::SbatchOptions opts;
+        opts.split        = true;
+        opts.project_root = root ? *root : "";
+        trailhead::write_sbatch(th_dir, reg, opts);
+
+        std::cout << trailhead::ansi::BGREEN << "Added setup step [" << (reg.setup.size()-1) << "]:"
+                  << trailhead::ansi::RESET << " " << cmd << "\n";
+        return 0;
+    }
+
+    if (action == "remove") {
+        if (argc < 4) { std::cerr << "Error: provide an index\n"; return 1; }
+        int idx = -1;
+        try { idx = std::stoi(argv[3]); } catch (...) {}
+        if (idx < 0 || idx >= (int)reg.setup.size()) {
+            std::cerr << "Error: index " << argv[3] << " out of range\n"; return 1;
+        }
+        std::string removed = reg.setup[idx];
+        reg.setup.erase(reg.setup.begin() + idx);
+        trailhead::save_registry(th_dir, reg);
+
+        auto root = trailhead::fs::find_trailhead_root();
+        trailhead::SbatchOptions opts;
+        opts.split        = true;
+        opts.project_root = root ? *root : "";
+        trailhead::write_sbatch(th_dir, reg, opts);
+
+        std::cout << trailhead::ansi::YELLOW << "Removed setup step:" << trailhead::ansi::RESET
+                  << " " << removed << "\n";
+        return 0;
+    }
+
+    if (action == "run") {
+        if (reg.setup.empty()) {
+            std::cout << trailhead::ansi::DIM << "No setup steps defined.\n" << trailhead::ansi::RESET;
+            return 0;
+        }
+        auto root = trailhead::fs::find_trailhead_root();
+        std::string workdir = root ? *root : ".";
+
+        int failed = 0;
+        for (int i = 0; i < (int)reg.setup.size(); ++i) {
+            std::cout << trailhead::ansi::BOLD << "[" << (i+1) << "/" << reg.setup.size() << "]"
+                      << trailhead::ansi::RESET << " " << reg.setup[i] << "\n";
+            std::cout.flush();
+            auto r = trailhead::proc::run(reg.setup[i], {}, {}, 300, workdir,
+                [](const std::string& line){ std::cout << "  " << line << "\n"; },
+                /*use_shell=*/true);
+            if (r.exit_code != 0) {
+                if (!r.stderr_str.empty()) std::cerr << r.stderr_str;
+                std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
+                    "  step failed (exit=" + std::to_string(r.exit_code) + ")\n");
+                ++failed;
+                break; // stop on first failure
+            }
+        }
+        if (failed == 0)
+            std::cout << trailhead::ansi::color(trailhead::ansi::BGREEN, "Setup complete") << "\n";
+        return failed > 0 ? 1 : 0;
+    }
+
+    std::cerr << "Unknown setup action: " << action << "\n";
+    return 1;
+}
+
 // ── Usage ─────────────────────────────────────────────────────────────────
 
 static void print_usage() {
@@ -1003,16 +1122,20 @@ static void print_usage() {
     std::cout << "  node  remove <name>           Remove a node profile\n";
     std::cout << "  add   --name <n> --cmd <c>    Register a test\n";
     std::cout << "        [--build <config>]        link to a build config\n";
-    std::cout << "        [--node <profile>]         link to a node profile\n";
-    std::cout << "        [--label <l>] [--tag <t>] [--timeout <s>] [--args <a>]\n";
-    std::cout << "  remove <name>                 Remove a registered test\n";
-    std::cout << "  list                          Show test status table\n";
+    std::cout << "        [--requires gpu|cpu|any]  hardware requirement hint\n";
+    std::cout << "        [--label <l>] [--tag <t>] [--timeout <s>] [--workdir <d>]\n";
+    std::cout << "  remove <name>  (alias: rm)    Remove a registered test\n";
+    std::cout << "  list           (alias: ls)    Show test status table\n";
     std::cout << "  run   [names] [--all] [--tag <t>] [--no-build]\n";
     std::cout << "                                Build then run tests locally\n";
-    std::cout << "  gen   [--split] [--out <dir>] Generate sbatch script(s)\n";
-    std::cout << "  watch [--interval <ms>]       Live TUI view\n";
+    std::cout << "  gen   [--node <profile>] [--split] [--out <dir>]  Generate sbatch script(s)\n";
+    std::cout << "  watch [--interval <ms>] [--run-all]  Live TUI view (--run-all queues all tests)\n";
     std::cout << "  show  [name]                  Print latest result details\n";
     std::cout << "  clean [--days <n>] [--dry-run] Remove old result files\n";
+    std::cout << "  setup add <cmd>               Add a one-time project setup step\n";
+    std::cout << "  setup list                    List setup steps\n";
+    std::cout << "  setup remove <index>          Remove a setup step by index\n";
+    std::cout << "  setup run                     Run all setup steps locally\n";
     std::cout << "\n";
 }
 
@@ -1046,6 +1169,7 @@ int main(int argc, char** argv) {
     if (cmd == "watch")        return cmd_watch(argc, argv);
     if (cmd == "show")         return cmd_show(argc, argv);
     if (cmd == "clean")        return cmd_clean(argc, argv);
+    if (cmd == "setup")        return cmd_setup(argc, argv);
     if (cmd == "--help" || cmd == "help" || cmd == "-h") { print_usage(); return 0; }
 
     std::cerr << "Unknown command: " << cmd << ". Run 'trailhead help' for usage.\n";

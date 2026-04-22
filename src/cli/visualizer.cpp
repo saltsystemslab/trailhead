@@ -96,7 +96,7 @@ static std::string status_badge(RunStatus s) {
 }
 
 static const int COL_NAME   = 24;
-static const int COL_NODE   = 14;
+static const int COL_NODE   = 16;  // wider to fit build + [gpu/cpu] tag
 static const int COL_STATUS =  8;
 static const int COL_PASS   =  6;
 static const int COL_FAIL   =  6;
@@ -104,6 +104,27 @@ static const int COL_TIME   = 14;
 static const int COL_WALL   =  9;
 static const int COL_WHEN   = 10;
 static const int TOTAL_WIDTH = COL_NAME + COL_NODE + COL_STATUS + COL_PASS + COL_FAIL + COL_TIME + COL_WALL + COL_WHEN + 5;
+
+// Is the given hardware compatible with a test's requires_hw?
+// node_name == "local" is treated as GPU-capable iff has_local_gpu().
+static bool hw_compatible(const std::string& node_name, const std::string& requires_hw,
+                           const Registry& reg)
+{
+    if (requires_hw.empty() || requires_hw == "any") return true;
+    if (node_name == "local") {
+        bool local_gpu = has_local_gpu();
+        if (requires_hw == "gpu") return local_gpu;
+        if (requires_hw == "cpu") return !local_gpu;
+        return true;
+    }
+    auto it = reg.nodes.find(node_name);
+    if (it == reg.nodes.end()) return true;
+    const auto& n = it->second;
+    bool has_gpu = !n.gpu_type.empty() || !n.nodelist.empty();
+    if (requires_hw == "gpu") return has_gpu;
+    if (requires_hw == "cpu") return !has_gpu;
+    return true;
+}
 
 // Format a timing value in ms: integers stay as "NNNms", large values as "N.Ns"
 static std::string fmt_ms(double ms) {
@@ -134,7 +155,7 @@ static std::string header_row() {
     std::ostringstream o;
     o << BOLD
       << pad("NAME",   COL_NAME) << " "
-      << pad("NODE",   COL_NODE) << " "
+      << pad("BUILD",  COL_NODE) << " "
       << pad("STATUS", COL_STATUS) << " "
       << rpad("PASS", COL_PASS) << " "
       << rpad("FAIL", COL_FAIL) << " "
@@ -153,7 +174,10 @@ static std::string test_row(const TestEntry& t, const TestResult* r,
     RunStatus status = r ? result_status(*r) : RunStatus::Unknown;
 
     std::string name_col = pad(t.name, COL_NAME);
-    std::string node_col = pad(t.node_profile, COL_NODE);
+    std::string build_tag = t.build_name;
+    if (!t.requires_hw.empty() && t.requires_hw != "any")
+        build_tag += " [" + t.requires_hw + "]";
+    std::string node_col = pad(build_tag, COL_NODE);
     std::string pass_col = rpad(r ? std::to_string(r->passed) : "-", COL_PASS);
     std::string fail_col = rpad(r ? std::to_string(r->failed) : "-", COL_FAIL);
     std::string time_col = rpad(timing_str(r, COL_TIME), COL_TIME);
@@ -245,9 +269,6 @@ static void render_detail(const TestEntry& t, const TestResult* r,
             ln(ps.str());
         }
     }
-
-    if (!t.node_profile.empty())
-        ln("  Node:     " + t.node_profile);
 
     // ── Pipeline ──────────────────────────────────────────────────────────
     {
@@ -521,36 +542,240 @@ static std::string wizard_open_editor(const std::string& task_name,
     return cmd;
 }
 
+// ── Hardware add/edit wizards ─────────────────────────────────────────────
+
+static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
+                                  const std::string& project_root)
+{
+    restore_terminal();
+    std::cout << ansi::CLEAR;
+    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Add hardware\n\n";
+
+    auto read_line = [](const std::string& prompt, const std::string& def = "") -> std::string {
+        if (def.empty()) std::cout << "  " << prompt << ": ";
+        else             std::cout << "  " << prompt << " [" << def << "]: ";
+        std::cout.flush();
+        std::string s;
+        std::getline(std::cin, s);
+        while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+        while (!s.empty() && s.back()  == ' ') s.pop_back();
+        return s.empty() ? def : s;
+    };
+
+    std::string name = read_line("Name");
+    if (name.empty()) { enter_raw_mode(); return; }
+
+    std::string partition = read_line("Partition");
+
+    std::string type_str = read_line("Target (1=CPU-only, 2=GPU model, 3=specific node)", "2");
+    int ttype = 2;
+    if (type_str == "1") ttype = 1;
+    else if (type_str == "3") ttype = 3;
+
+    std::string gpu_type, nodelist;
+    if (ttype == 2)      gpu_type = read_line("GPU model (e.g. h200, rtx6000)");
+    else if (ttype == 3) nodelist = read_line("Node list (e.g. d4067)");
+
+    std::string cpus_str = read_line("CPUs per task", "1");
+    int cpus = 1;
+    try { cpus = std::stoi(cpus_str); } catch (...) {}
+
+    std::string time_str = read_line("Time limit", "01:00:00");
+
+    enter_raw_mode();
+
+    NodeProfile np;
+    np.name          = name;
+    np.partition     = partition;
+    np.gpu_type      = gpu_type;
+    np.nodelist      = nodelist;
+    np.cpus_per_task = cpus;
+    np.time          = time_str;
+
+    reg.nodes[name] = np;
+    save_registry(th_dir, reg);
+    SbatchOptions opts;
+    opts.split        = true;
+    opts.project_root = project_root;
+    write_sbatch(th_dir, reg, opts);
+}
+
+static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
+                                   const std::string& th_dir, const std::string& project_root)
+{
+    auto it = reg.nodes.find(node_name);
+    if (it == reg.nodes.end()) return;
+    NodeProfile np = it->second;
+
+    restore_terminal();
+    std::cout << ansi::CLEAR;
+    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Edit hardware: " << node_name << "\n\n";
+
+    auto read_line = [](const std::string& prompt, const std::string& def = "") -> std::string {
+        if (def.empty()) std::cout << "  " << prompt << ": ";
+        else             std::cout << "  " << prompt << " [" << def << "]: ";
+        std::cout.flush();
+        std::string s;
+        std::getline(std::cin, s);
+        while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+        while (!s.empty() && s.back()  == ' ') s.pop_back();
+        return s.empty() ? def : s;
+    };
+
+    std::string name = read_line("Name", np.name);
+    std::string partition = read_line("Partition", np.partition);
+
+    int cur_type = np.gpu_type.empty() ? (np.nodelist.empty() ? 1 : 3) : 2;
+    std::string type_str = read_line("Target (1=CPU-only, 2=GPU model, 3=specific node)",
+                                      std::to_string(cur_type));
+    int ttype = cur_type;
+    if (type_str == "1") ttype = 1;
+    else if (type_str == "2") ttype = 2;
+    else if (type_str == "3") ttype = 3;
+
+    std::string gpu_type, nodelist;
+    if (ttype == 2)      gpu_type = read_line("GPU model", np.gpu_type);
+    else if (ttype == 3) nodelist = read_line("Node list", np.nodelist);
+
+    std::string cpus_str = read_line("CPUs per task", std::to_string(np.cpus_per_task));
+    int cpus = np.cpus_per_task;
+    try { cpus = std::stoi(cpus_str); } catch (...) {}
+
+    std::string time_str = read_line("Time limit", np.time);
+
+    enter_raw_mode();
+
+    if (name != node_name) reg.nodes.erase(node_name);
+    np.name          = name;
+    np.partition     = partition;
+    np.gpu_type      = (ttype == 2) ? gpu_type : "";
+    np.nodelist      = (ttype == 3) ? nodelist : "";
+    np.cpus_per_task = cpus;
+    np.time          = time_str;
+    reg.nodes[name]  = np;
+
+    save_registry(th_dir, reg);
+    SbatchOptions opts;
+    opts.split        = true;
+    opts.project_root = project_root;
+    write_sbatch(th_dir, reg, opts);
+}
+
 // ── Add-task wizard ───────────────────────────────────────────────────────
 
-// Single-select hardware picker. Returns selected node name, or "" if cancelled/empty.
-static std::string wizard_select_hardware(const Registry& reg) {
-    std::vector<std::string> names;
-    if (has_local_gpu()) names.push_back("local");
-    for (const auto& [k, v] : reg.nodes) names.push_back(k);
-    std::sort(names.begin() + (names.empty() || names[0] != "local" ? 0 : 1), names.end());
-    if (names.empty()) return "";
-    if (names.size() == 1) return names[0]; // auto-select if only one
+// Single-select hardware picker. Returns selected node name, or "" if cancelled.
+// Supports [a] add and [e] edit hardware in-place.
+static std::string wizard_select_hardware(Registry& reg,
+                                           const std::string& th_dir,
+                                           const std::string& project_root) {
+    auto rebuild_names = [&]() {
+        std::vector<std::string> n;
+        if (has_local_gpu()) n.push_back("local");
+        for (const auto& [k, v] : reg.nodes) n.push_back(k);
+        int start = (!n.empty() && n[0] == "local") ? 1 : 0;
+        std::sort(n.begin() + start, n.end());
+        return n;
+    };
 
+    auto names = rebuild_names();
     int cursor = 0;
     while (true) {
         using namespace ansi;
         std::cout << CLEAR;
         std::cout << BOLD << "TRAILHEAD" << RESET << " — Select hardware\n";
         std::cout << hline(50) << "\n\n";
+        if (names.empty()) {
+            std::cout << DIM << "  No hardware configured. Press [a] to add." << RESET << "\n";
+        }
         for (int i = 0; i < (int)names.size(); ++i) {
             if (i == cursor) std::cout << CYAN << BOLD;
             std::cout << (i == cursor ? " > " : "   ") << names[i];
             if (names[i] == "local") {
                 std::cout << DIM << "  (this machine, sequential)" << RESET;
             } else {
-                auto it = reg.nodes.find(names[i]);
-                if (it != reg.nodes.end()) {
-                    std::cout << DIM << "  (" << it->second.partition;
-                    if (!it->second.gpu_type.empty())  std::cout << ", " << it->second.gpu_type;
-                    if (!it->second.nodelist.empty())   std::cout << ", " << it->second.nodelist;
+                auto nit = reg.nodes.find(names[i]);
+                if (nit != reg.nodes.end()) {
+                    const auto& n = nit->second;
+                    std::cout << DIM << "  (" << n.partition;
+                    if      (!n.gpu_type.empty())  std::cout << ", gpu:" << n.gpu_type;
+                    else if (!n.nodelist.empty())   std::cout << ", node:" << n.nodelist;
+                    else                            std::cout << ", CPU-only";
                     std::cout << ")" << RESET;
                 }
+            }
+            if (i == cursor) std::cout << RESET;
+            std::cout << "\n";
+        }
+        std::cout << "\n" << hline(50) << "\n";
+        std::cout << DIM << "[↑/k] up  [↓/j] down  [enter] select  [a] add  [e] edit  [x] delete  [ESC] cancel"
+                  << RESET << "\n";
+        std::cout.flush();
+
+        int k = read_key(30000);
+        if (k == 27 || k == 'q') return "";
+        if ((k == '\r' || k == '\n') && !names.empty()) return names[cursor];
+        if (k == 1000 || k == 'k') {
+            if (!names.empty()) cursor = (cursor - 1 + (int)names.size()) % (int)names.size();
+        }
+        if (k == 1001 || k == 'j') {
+            if (!names.empty()) cursor = (cursor + 1) % (int)names.size();
+        }
+        if (k == 'a' || k == 'A') {
+            wizard_add_hardware(reg, th_dir, project_root);
+            names = rebuild_names();
+            if (cursor >= (int)names.size()) cursor = std::max(0, (int)names.size() - 1);
+        }
+        if ((k == 'e' || k == 'E') && !names.empty()
+            && cursor < (int)names.size() && names[cursor] != "local") {
+            wizard_edit_hardware(reg, names[cursor], th_dir, project_root);
+            names = rebuild_names();
+            if (cursor >= (int)names.size()) cursor = std::max(0, (int)names.size() - 1);
+        }
+        if ((k == 'x' || k == 'X') && !names.empty()
+            && cursor < (int)names.size() && names[cursor] != "local") {
+            std::string target = names[cursor];
+            // Confirm deletion
+            restore_terminal();
+            std::cout << ansi::YELLOW << "Delete hardware profile '" << target << "'? [y/N] " << ansi::RESET;
+            std::cout.flush();
+            std::string ans;
+            std::getline(std::cin, ans);
+            enter_raw_mode();
+            if (ans == "y" || ans == "Y") {
+                reg.nodes.erase(target);
+                save_registry(th_dir, reg);
+                SbatchOptions opts;
+                opts.split        = true;
+                opts.project_root = project_root;
+                write_sbatch(th_dir, reg, opts);
+            }
+            names = rebuild_names();
+            if (cursor >= (int)names.size()) cursor = std::max(0, (int)names.size() - 1);
+        }
+    }
+}
+
+// Single-select build config picker. Returns selected build name, or "" for none/cancelled.
+// Only called when reg.builds is non-empty.
+static std::string wizard_select_build(const Registry& reg) {
+    std::vector<std::string> names;
+    names.push_back("(none)");
+    for (const auto& [k, v] : reg.builds) names.push_back(k);
+    std::sort(names.begin() + 1, names.end());
+
+    int cursor = 0;
+    while (true) {
+        using namespace ansi;
+        std::cout << CLEAR;
+        std::cout << BOLD << "TRAILHEAD" << RESET << " — Link build config\n";
+        std::cout << hline(50) << "\n\n";
+        for (int i = 0; i < (int)names.size(); ++i) {
+            if (i == cursor) std::cout << CYAN << BOLD;
+            std::cout << (i == cursor ? " > " : "   ") << names[i];
+            if (i > 0) {
+                auto it = reg.builds.find(names[i]);
+                if (it != reg.builds.end() && !it->second.configure_cmd.empty())
+                    std::cout << DIM << "  (" << it->second.configure_cmd << ")" << RESET;
             }
             if (i == cursor) std::cout << RESET;
             std::cout << "\n";
@@ -562,55 +787,14 @@ static std::string wizard_select_hardware(const Registry& reg) {
 
         int k = read_key(30000);
         if (k == 27 || k == 'q') return "";
-        if (k == '\r' || k == '\n') return names[cursor];
+        if (k == '\r' || k == '\n') return (cursor == 0) ? "" : names[cursor];
         if (k == 1000 || k == 'k') cursor = (cursor - 1 + (int)names.size()) % (int)names.size();
         if (k == 1001 || k == 'j') cursor = (cursor + 1) % (int)names.size();
     }
 }
 
 // Multi-select node picker. Returns selected node names; empty = cancelled.
-static std::vector<std::string> wizard_select_nodes(const Registry& reg) {
-    std::vector<std::string> names;
-    for (const auto& [k, v] : reg.nodes) names.push_back(k);
-    std::sort(names.begin(), names.end());
-    if (names.empty()) return {};
-
-    std::vector<bool> checked(names.size(), true); // all selected by default
-    int cursor = 0;
-
-    while (true) {
-        using namespace ansi;
-        std::cout << CLEAR;
-        std::cout << BOLD << "TRAILHEAD" << RESET << " — Select nodes\n";
-        std::cout << hline(50) << "\n\n";
-        for (int i = 0; i < (int)names.size(); ++i) {
-            if (i == cursor) std::cout << CYAN << BOLD;
-            std::cout << (i == cursor ? " > " : "   ");
-            std::cout << (checked[i] ? "[x] " : "[ ] ");
-            std::cout << names[i];
-            if (i == cursor) std::cout << RESET;
-            std::cout << "\n";
-        }
-        std::cout << "\n" << hline(50) << "\n";
-        std::cout << DIM << "[↑/k] up  [↓/j] down  [space] toggle  [enter] confirm  [ESC] cancel"
-                  << RESET << "\n";
-        std::cout.flush();
-
-        int k = read_key(30000);
-        if (k == 27 || k == 'q') return {};
-        if (k == '\r' || k == '\n') {
-            std::vector<std::string> result;
-            for (int i = 0; i < (int)names.size(); ++i)
-                if (checked[i]) result.push_back(names[i]);
-            return result;
-        }
-        if (k == 1000 || k == 'k') cursor = (cursor - 1 + (int)names.size()) % (int)names.size();
-        if (k == 1001 || k == 'j') cursor = (cursor + 1) % (int)names.size();
-        if (k == ' ') checked[cursor] = !checked[cursor];
-    }
-}
-
-// Orchestrates the three-step wizard: name → editor → node select → save.
+// Orchestrates the wizard: name → editor → build select → save.
 // Leaves the terminal in raw+cursor-hidden state when it returns.
 static bool run_add_wizard(Registry& reg,
                             const std::string& th_dir,
@@ -649,26 +833,41 @@ static bool run_add_wizard(Registry& reg,
         return false;
     }
 
-    // ── Step 3: node selection ────────────────────────────────────────────
-    auto selected_nodes = wizard_select_nodes(reg);
-    if (selected_nodes.empty()) return false;
-
-    // ── Step 4: create entries and save ──────────────────────────────────
-    // No cmake build step by default — the cmd is self-contained.
-    // build_name and target stay empty so sbatch_gen skips the cmake --build line.
-    for (const auto& node : selected_nodes) {
-        std::string entry_name = name + "_" + node;
-        // Replace if already exists
-        reg.tests.erase(std::remove_if(reg.tests.begin(), reg.tests.end(),
-            [&](const TestEntry& t){ return t.name == entry_name; }),
-            reg.tests.end());
-
-        TestEntry t;
-        t.name         = entry_name;
-        t.cmd          = cmd;
-        t.node_profile = node;
-        reg.tests.push_back(t);
+    // ── Step 3: hardware requirement ─────────────────────────────────────
+    std::string requires_hw;
+    {
+        using namespace ansi;
+        std::cout << CLEAR;
+        std::cout << BOLD << "TRAILHEAD" << RESET << " — Hardware requirement\n";
+        std::cout << hline(50) << "\n\n";
+        std::cout << "  [1] Any (default)\n";
+        std::cout << "  [2] GPU required\n";
+        std::cout << "  [3] CPU only\n\n";
+        std::cout << hline(50) << "\n";
+        std::cout << DIM << "[1/2/3] select  [ESC] any (default)" << RESET << "\n";
+        std::cout.flush();
+        int k = read_key(30000);
+        if (k == '2') requires_hw = "gpu";
+        else if (k == '3') requires_hw = "cpu";
+        // else: empty = any
     }
+
+    // ── Step 4: build config (optional) ──────────────────────────────────
+    std::string selected_build;
+    if (!reg.builds.empty())
+        selected_build = wizard_select_build(reg);
+
+    // ── Step 5: create entry and save ────────────────────────────────────
+    reg.tests.erase(std::remove_if(reg.tests.begin(), reg.tests.end(),
+        [&](const TestEntry& t){ return t.name == name; }),
+        reg.tests.end());
+
+    TestEntry t;
+    t.name        = name;
+    t.cmd         = cmd;
+    t.build_name  = selected_build;
+    t.requires_hw = requires_hw;
+    reg.tests.push_back(t);
 
     save_registry(th_dir, reg);
     SbatchOptions opts;
@@ -784,7 +983,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     if (auto_run) {
         selected_hw = "local"; // non-interactive: always run locally
     } else if (!reg.nodes.empty() && run_fn) {
-        selected_hw = wizard_select_hardware(reg);
+        selected_hw = wizard_select_hardware(reg, trailhead_dir, project_root);
     }
 
     int selected      = 0;
@@ -802,16 +1001,13 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         for (int i = 0; i < (int)reg.tests.size(); ++i) {
             const auto& t = reg.tests[i];
             if (selected_hw == "local") {
-                // Local runs each unique cmake target once — skip node-specific duplicates.
+                // Local runs each unique cmake target once.
                 if (!t.target.empty()) {
                     if (seen_targets.count(t.target)) continue;
                     seen_targets.insert(t.target);
                 }
-                filtered.push_back(i);
-            } else if (selected_hw.empty() || t.node_profile.empty() ||
-                       t.node_profile == selected_hw) {
-                filtered.push_back(i);
             }
+            filtered.push_back(i);
         }
         total = (int)filtered.size();
         if (selected >= total) selected = std::max(0, total - 1);
@@ -890,7 +1086,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
         o << hline(TOTAL_WIDTH) << "\n";
         o << DIM
-          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [R] run all  [a] add  [e] edit  [d] delete  [h] hw"
+          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [h] hw"
           << RESET << "\n";
 
         // Log panel — fixed at snapshot taken above
@@ -937,14 +1133,25 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 if (selected_hw.empty() && !reg.nodes.empty()) {
                     job_log->push("No hardware selected — press [h] to choose");
                 } else {
+                    int incompatible = 0;
+                    for (int i = 0; i < total; ++i) {
+                        const auto& t = reg.tests[filtered[i]];
+                        if (!t.requires_hw.empty() && t.requires_hw != "any" &&
+                            !selected_hw.empty() &&
+                            !hw_compatible(selected_hw, t.requires_hw, reg))
+                            ++incompatible;
+                    }
+                    if (incompatible > 0)
+                        job_log->push("[warn] " + std::to_string(incompatible)
+                                      + " test(s) may be incompatible with " + selected_hw);
                     job_log->push("Submitting all " + std::to_string(total) + " tests...");
                     for (int i = 0; i < total; ++i)
                         run_fn(reg.tests[filtered[i]].name, selected_hw);
                 }
                 redraw = true;
             }
-            if ((key == 'h' || key == 'H') && !reg.nodes.empty()) {
-                std::string hw = wizard_select_hardware(reg);
+            if ((key == 'h' || key == 'H') && run_fn) {
+                std::string hw = wizard_select_hardware(reg, trailhead_dir, project_root);
                 if (!hw.empty()) { selected_hw = hw; selected = 0; scroll = 0; }
                 rebuild_filtered();
                 redraw = true;
@@ -953,7 +1160,13 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 if (selected_hw.empty() && !reg.nodes.empty()) {
                     job_log->push("No hardware selected — press [h] to choose");
                 } else {
-                    run_fn(reg.tests[filtered[selected]].name, selected_hw);
+                    const auto& t = reg.tests[filtered[selected]];
+                    if (!t.requires_hw.empty() && t.requires_hw != "any" &&
+                        !selected_hw.empty() &&
+                        !hw_compatible(selected_hw, t.requires_hw, reg))
+                        job_log->push("[warn] " + t.name + " requires " + t.requires_hw
+                                      + " but " + selected_hw + " may not provide it");
+                    run_fn(t.name, selected_hw);
                 }
                 redraw = true;
             }

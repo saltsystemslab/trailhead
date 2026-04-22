@@ -217,12 +217,6 @@ static std::string do_sbatch(const TestEntry& test,
         auto it = reg.nodes.find(node_name);
         if (it != reg.nodes.end()) node = &it->second;
     }
-    if (!node && !test.node_profile.empty()) {
-        auto it = reg.nodes.find(test.node_profile);
-        if (it != reg.nodes.end()) node = &it->second;
-    }
-    if (!node && !reg.nodes.empty())
-        node = &reg.nodes.begin()->second;
 
     std::string job_name = reg.sbatch_defaults.job_name_prefix + "-" + test.name;
     std::string flags    = node ? node_sbatch_flags(*node, reg.sbatch_defaults, job_name) : "";
@@ -658,7 +652,7 @@ bool remote_submit_and_wait(
     int64_t t_submit = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    std::string job_id = do_sbatch(test, test.node_profile, reg, dest, th_dir, log, set_status);
+    std::string job_id = do_sbatch(test, "", reg, dest, th_dir, log, set_status);
     if (job_id.empty()) return false;
 
     PendingJob pj;

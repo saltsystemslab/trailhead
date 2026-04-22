@@ -68,12 +68,14 @@ struct TestEntry {
     std::string workdir       = ".";
     int timeout_sec           = 300;
     std::vector<std::string> tags;
-    std::string node_profile;   // references NodeProfile::name
     std::string build_name;     // references BuildConfig::name; empty = no build step
     // cmake target to build before running this test.
     // Defaults to test name when build_name is set (override with --target "").
     // Rebuilt with: cmake --build <build.dir> --target <target>
     std::string target;
+    // Hardware requirement hint for display and compatibility warnings.
+    // Values: "" or "any" = no constraint, "gpu" = needs GPU, "cpu" = CPU-only
+    std::string requires_hw;
 };
 
 // ── Registry ──────────────────────────────────────────────────────────────
@@ -83,6 +85,10 @@ struct Registry {
     std::unordered_map<std::string, NodeProfile>  nodes;
     SbatchDefaults sbatch_defaults;
     std::vector<TestEntry> tests;
+    // One-time project setup commands: run before cmake configure in every
+    // sbatch script, and via `trailhead setup run` for local bootstrapping.
+    // Typical use: submodule init, dataset downloads, etc.
+    std::vector<std::string> setup;
 };
 
 // ── Serialisation ─────────────────────────────────────────────────────────
@@ -183,9 +189,9 @@ inline TestEntry test_from_json(const JsonValue& v) {
     t.workdir      = v.get_str("workdir", ".");
     t.timeout_sec  = (int)v.get_int("timeout_sec", 300);
     t.tags         = v.get_str_array("tags");
-    t.node_profile = v.get_str("node");
     t.build_name   = v.get_str("build");
     t.target       = v.get_str("target");
+    t.requires_hw  = v.get_str("requires");
     return t;
 }
 
@@ -199,9 +205,10 @@ inline JsonValue test_to_json(const TestEntry& t) {
     JsonArray tags;
     for (const auto& tag : t.tags) tags.push_back(JsonValue(tag));
     obj.push_back({"tags", std::move(tags)});
-    if (!t.node_profile.empty()) obj.push_back({"node",   t.node_profile});
-    if (!t.build_name.empty())   obj.push_back({"build",  t.build_name});
-    if (!t.target.empty())       obj.push_back({"target", t.target});
+    if (!t.build_name.empty())              obj.push_back({"build",    t.build_name});
+    if (!t.target.empty())                  obj.push_back({"target",   t.target});
+    if (!t.requires_hw.empty() &&
+        t.requires_hw != "any")             obj.push_back({"requires", t.requires_hw});
     return JsonValue(std::move(obj));
 }
 

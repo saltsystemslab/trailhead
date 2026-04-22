@@ -38,6 +38,9 @@ Registry registry_from_json(const JsonValue& root) {
         }
     }
 
+    // Setup commands
+    reg.setup = root.get_str_array("setup");
+
     return reg;
 }
 
@@ -68,6 +71,11 @@ JsonValue registry_to_json(const Registry& reg) {
         tests_arr.push_back(test_to_json(t));
     }
     root.push_back({"tests", JsonValue(std::move(tests_arr))});
+
+    // Setup commands
+    JsonArray setup_arr;
+    for (const auto& s : reg.setup) setup_arr.push_back(JsonValue(s));
+    root.push_back({"setup", JsonValue(std::move(setup_arr))});
 
     return JsonValue(std::move(root));
 }

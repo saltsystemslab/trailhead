@@ -75,7 +75,8 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
                                 const SbatchDefaults& defs,
                                 const std::string& project_root,
                                 const std::string& build_dir,
-                                const std::string& configure_cmd)
+                                const std::string& configure_cmd,
+                                const std::vector<std::string>& setup = {})
 {
     std::ostringstream o;
 
@@ -95,6 +96,14 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
         o << "cd " << project_root << "\n";
     o << "\n";
 
+    // Project setup: submodule init, dataset downloads, etc.
+    // Runs before cmake configure so the source tree is complete.
+    if (!setup.empty()) {
+        for (const auto& s : setup)
+            o << s << "\n";
+        o << "\n";
+    }
+
     // Configure step: run cmake on the compute node so it auto-detects GPU arch.
     // Only runs if the build directory doesn't already exist (once per node).
     if (!configure_cmd.empty() && !build_dir.empty()) {
@@ -111,9 +120,9 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
         // Substitute build dir in the run cmd (e.g. "build/tests/foo" → "build_h200/tests/foo")
         std::string cmd = str_replace_all(t->cmd, "build/", build_dir + "/");
         if (!t->workdir.empty() && t->workdir != ".") {
-            o << "(\n  cd " << t->workdir << "\n  sh -c '" << cmd << "'\n)\n\n";
+            o << "(\n  cd " << t->workdir << "\n" << cmd << "\n)\n\n";
         } else {
-            o << "sh -c '" << cmd << "'\n\n";
+            o << cmd << "\n\n";
         }
     }
 
@@ -131,19 +140,18 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             std::ostringstream script;
             script << "#!/bin/bash\n";
 
-            // Resolve node profile
+            // Emit hardware headers if a node was specified (via opts.node_name)
             const NodeProfile* node_ptr = nullptr;
             std::string job_name = reg.sbatch_defaults.job_name_prefix + "-" + t.name;
-            if (!t.node_profile.empty()) {
-                auto it = reg.nodes.find(t.node_profile);
+            if (!opts.node_name.empty()) {
+                auto it = reg.nodes.find(opts.node_name);
                 if (it != reg.nodes.end()) {
                     node_ptr = &it->second;
                     script << sbatch_headers(it->second, reg.sbatch_defaults, job_name);
-                } else {
-                    script << "# WARNING: node profile '" << t.node_profile << "' not found\n";
                 }
             } else {
-                script << "# No node profile assigned — add one with: trailhead node add\n";
+                script << "#SBATCH --job-name=" << job_name << "\n";
+                script << "# No hardware target — use 'trailhead gen --node <profile>'\n";
             }
             script << "\n";
 
@@ -167,50 +175,53 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             if (node_ptr && !node_ptr->build_dir.empty())
                 build_dir = node_ptr->build_dir;
 
+            // No linked build config — fall back to any registered build config that has
+            // a configure_cmd so the build directory is created before the test runs.
+            if (configure_cmd.empty()) {
+                for (const auto& [bname, bc] : reg.builds) {
+                    if (!bc.configure_cmd.empty()) {
+                        configure_cmd = bc.configure_cmd;
+                        if (effective_root == opts.project_root && !bc.rsync_dest.empty()) {
+                            std::string rp = remote_path_from_rsync_dest(bc.rsync_dest);
+                            if (!rp.empty()) effective_root = rp;
+                        }
+                        break;
+                    }
+                }
+            }
+
             script << sbatch_body({&t}, reg.sbatch_defaults, effective_root,
-                                  build_dir, configure_cmd);
+                                  build_dir, configure_cmd, reg.setup);
 
             out.push_back({t.name + ".sbatch", script.str()});
         }
     } else {
         // Single combined script
-        // Group tests by node profile for a warning if they differ
-        std::string dominant_profile;
-        for (const auto& t : reg.tests)
-            if (!t.node_profile.empty()) { dominant_profile = t.node_profile; break; }
-
-        bool mixed = false;
-        for (const auto& t : reg.tests)
-            if (!t.node_profile.empty() && t.node_profile != dominant_profile) { mixed = true; break; }
-
         std::ostringstream script;
         script << "#!/bin/bash\n";
-        if (mixed) {
-            script << "# WARNING: tests use different node profiles. Use --split for per-test scripts.\n";
-        }
 
-        // Use dominant profile headers (or bare defaults if none)
+        // Use opts.node_name for headers if specified
+        const NodeProfile* node_ptr = nullptr;
         std::string job_name = reg.sbatch_defaults.job_name_prefix + "-all";
-        if (!dominant_profile.empty()) {
-            auto it = reg.nodes.find(dominant_profile);
-            if (it != reg.nodes.end())
+        if (!opts.node_name.empty()) {
+            auto it = reg.nodes.find(opts.node_name);
+            if (it != reg.nodes.end()) {
+                node_ptr = &it->second;
                 script << sbatch_headers(it->second, reg.sbatch_defaults, job_name);
+            }
         } else {
             script << "#SBATCH --job-name=" << job_name << "\n";
             script << "#SBATCH --output=" << reg.sbatch_defaults.output_pattern << "\n";
             script << "#SBATCH --error="  << reg.sbatch_defaults.error_pattern  << "\n";
+            script << "# No hardware target — use 'trailhead gen --node <profile>'\n";
         }
         script << "\n";
 
-        // For combined scripts, use the dominant node's build_dir (best-effort)
         std::string build_dir = "build";
         std::string configure_cmd;
         std::string effective_root = opts.project_root;
-        if (!dominant_profile.empty()) {
-            auto nit = reg.nodes.find(dominant_profile);
-            if (nit != reg.nodes.end() && !nit->second.build_dir.empty())
-                build_dir = nit->second.build_dir;
-        }
+        if (node_ptr && !node_ptr->build_dir.empty())
+            build_dir = node_ptr->build_dir;
         // Pick configure_cmd and remote root from whichever build config is referenced first
         for (const auto& t : reg.tests) {
             if (!t.build_name.empty()) {
@@ -225,11 +236,24 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                 }
             }
         }
+        // Fall back to any registered build config if none was linked
+        if (configure_cmd.empty()) {
+            for (const auto& [bname, bc] : reg.builds) {
+                if (!bc.configure_cmd.empty()) {
+                    configure_cmd = bc.configure_cmd;
+                    if (effective_root == opts.project_root && !bc.rsync_dest.empty()) {
+                        std::string rp = remote_path_from_rsync_dest(bc.rsync_dest);
+                        if (!rp.empty()) effective_root = rp;
+                    }
+                    break;
+                }
+            }
+        }
 
         std::vector<const TestEntry*> ptrs;
         for (const auto& t : reg.tests) ptrs.push_back(&t);
         script << sbatch_body(ptrs, reg.sbatch_defaults, effective_root,
-                              build_dir, configure_cmd);
+                              build_dir, configure_cmd, reg.setup);
 
         out.push_back({"run_all.sbatch", script.str()});
     }
@@ -257,20 +281,52 @@ std::string generate_test_script(const TestEntry& test,
                                   const Registry& reg,
                                   const SbatchOptions& opts)
 {
-    TestEntry t = test;
-    t.node_profile = node_name;
+    std::ostringstream script;
+    script << "#!/bin/bash\n";
 
-    Registry tmp;
-    tmp.builds         = reg.builds;
-    tmp.nodes          = reg.nodes;
-    tmp.sbatch_defaults = reg.sbatch_defaults;
-    tmp.tests          = {t};
+    std::string job_name = reg.sbatch_defaults.job_name_prefix + "-" + test.name;
+    const NodeProfile* node_ptr = nullptr;
+    if (!node_name.empty()) {
+        auto it = reg.nodes.find(node_name);
+        if (it != reg.nodes.end()) {
+            node_ptr = &it->second;
+            script << sbatch_headers(it->second, reg.sbatch_defaults, job_name);
+        }
+    }
+    script << "\n";
 
-    SbatchOptions split_opts  = opts;
-    split_opts.split          = true;
+    std::string build_dir     = "build";
+    std::string configure_cmd;
+    std::string effective_root = opts.project_root;
+    if (!test.build_name.empty()) {
+        auto bit = reg.builds.find(test.build_name);
+        if (bit != reg.builds.end()) {
+            if (!bit->second.dir.empty()) build_dir = bit->second.dir;
+            configure_cmd = bit->second.configure_cmd;
+            if (!bit->second.rsync_dest.empty()) {
+                std::string rp = remote_path_from_rsync_dest(bit->second.rsync_dest);
+                if (!rp.empty()) effective_root = rp;
+            }
+        }
+    }
+    if (node_ptr && !node_ptr->build_dir.empty())
+        build_dir = node_ptr->build_dir;
+    if (configure_cmd.empty()) {
+        for (const auto& [bname, bc] : reg.builds) {
+            if (!bc.configure_cmd.empty()) {
+                configure_cmd = bc.configure_cmd;
+                if (effective_root == opts.project_root && !bc.rsync_dest.empty()) {
+                    std::string rp = remote_path_from_rsync_dest(bc.rsync_dest);
+                    if (!rp.empty()) effective_root = rp;
+                }
+                break;
+            }
+        }
+    }
 
-    auto scripts = generate_sbatch(tmp, split_opts);
-    return scripts.empty() ? "" : scripts[0].second;
+    script << sbatch_body({&test}, reg.sbatch_defaults, effective_root,
+                          build_dir, configure_cmd, reg.setup);
+    return script.str();
 }
 
 } // namespace trailhead
