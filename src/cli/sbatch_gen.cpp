@@ -55,15 +55,18 @@ static std::string remote_path_from_rsync_dest(const std::string& rsync_dest) {
 }
 
 // Resolve the remote working directory for a script.
-// Prefers the build config's rsync_dest; falls back to the node profile's rsync_dest.
+// rsync_dest is always the *parent* directory; project_name (last component of
+// local project_root) is appended so the path matches where do_rsync puts the files.
 static std::string resolve_effective_root(const std::string& bc_rsync_dest,
                                            const std::string& node_rsync_dest,
-                                           const std::string& fallback)
+                                           const std::string& fallback,
+                                           const std::string& project_name = "")
 {
     for (const auto& d : {bc_rsync_dest, node_rsync_dest}) {
         if (!d.empty()) {
             auto rp = remote_path_from_rsync_dest(d);
-            if (!rp.empty()) return rp;
+            if (!rp.empty())
+                return project_name.empty() ? rp : rp + "/" + project_name;
         }
     }
     return fallback;
@@ -120,10 +123,16 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
     }
 
     // Configure step: run cmake on the compute node so it auto-detects GPU arch.
-    // Only runs if the build directory doesn't already exist (once per node).
+    // For cmake ".." (run-from-build-dir) form, cd into the build dir first.
     if (!configure_cmd.empty() && !build_dir.empty()) {
         std::string cfg = str_replace_all(configure_cmd, "-B build", "-B " + build_dir);
-        o << "[ -d " << build_dir << " ] || " << cfg << "\n\n";
+        bool from_build = cfg.size() >= 3 && cfg.substr(cfg.size() - 3) == " ..";
+        if (from_build) {
+            o << "[ -f " << build_dir << "/CMakeCache.txt ] || "
+              << "(mkdir -p " << build_dir << " && cd " << build_dir << " && " << cfg << ")\n\n";
+        } else {
+            o << "[ -d " << build_dir << " ] || " << cfg << "\n\n";
+        }
     }
 
     for (const TestEntry* t : tests) {
@@ -144,10 +153,42 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
     return o.str();
 }
 
+// For sub-registry builds where effective_root already navigates into the sub-dir,
+// strip the sub-dir prefix from a test's workdir so it stays relative to the new root.
+static std::string adjust_workdir(const std::string& workdir, const std::string& sub_dir_name) {
+    if (sub_dir_name.empty()) return workdir;
+    if (workdir == sub_dir_name) return ".";
+    if (workdir.rfind(sub_dir_name + "/", 0) == 0)
+        return workdir.substr(sub_dir_name.size() + 1);
+    return workdir;
+}
+
+// Append the sub-dir name to effective_root when a sub-registry build relies on the node
+// rsync_dest (has no build-specific rsync_dest). Returns the sub-dir name used (or "").
+static std::string maybe_append_sub_dir(std::string& effective_root,
+                                         const BuildConfig& bc,
+                                         const std::string& node_rsync)
+{
+    if (bc.sub_dir.empty() || !bc.rsync_dest.empty() || node_rsync.empty()) return "";
+    std::string name = bc.sub_dir;
+    auto sl = name.rfind('/');
+    if (sl != std::string::npos) name = name.substr(sl + 1);
+    effective_root += "/" + name;
+    return name;
+}
+
 std::vector<std::pair<std::string,std::string>>
 generate_sbatch(const Registry& reg, const SbatchOptions& opts)
 {
     std::vector<std::pair<std::string,std::string>> out;
+
+    // rsync_dest is always the parent dir; append the local project name to get the remote path
+    std::string project_name;
+    {
+        auto sl = opts.project_root.rfind('/');
+        project_name = (sl != std::string::npos && sl + 1 < opts.project_root.size())
+            ? opts.project_root.substr(sl + 1) : opts.project_root;
+    }
 
     if (opts.split) {
         // One script per test
@@ -175,13 +216,15 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             std::string configure_cmd;
             std::string effective_root = opts.project_root;
             std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
+            std::string sub_dir_name;
             if (!t.build_name.empty()) {
                 auto bit = reg.builds.find(t.build_name);
                 if (bit != reg.builds.end()) {
                     if (!bit->second.dir.empty()) build_dir = bit->second.dir;
                     configure_cmd = bit->second.configure_cmd;
                     effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
-                                                            opts.project_root);
+                                                            opts.project_root, project_name);
+                    sub_dir_name = maybe_append_sub_dir(effective_root, bit->second, node_rsync);
                 }
             }
             // Node-specific build dir overrides the build config's dir
@@ -195,7 +238,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                         configure_cmd = bc.configure_cmd;
                         if (effective_root == opts.project_root)
                             effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
-                                                                    opts.project_root);
+                                                                    opts.project_root, project_name);
                         break;
                     }
                 }
@@ -207,7 +250,9 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                     : "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once | head -1 | tr -d '.')";
                 configure_cmd = str_replace_all(configure_cmd, "{{arch}}", arch_val);
             }
-            script << sbatch_body({&t}, reg.sbatch_defaults, effective_root,
+            TestEntry t_adj = t;
+            t_adj.workdir = adjust_workdir(t.workdir, sub_dir_name);
+            script << sbatch_body({&t_adj}, reg.sbatch_defaults, effective_root,
                                   build_dir, configure_cmd, reg.setup);
 
             out.push_back({t.name + ".sbatch", script.str()});
@@ -247,7 +292,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                 if (bit != reg.builds.end()) {
                     configure_cmd = bit->second.configure_cmd;
                     effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
-                                                            opts.project_root);
+                                                            opts.project_root, project_name);
                     break;
                 }
             }
@@ -259,7 +304,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                     configure_cmd = bc.configure_cmd;
                     if (effective_root == opts.project_root)
                         effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
-                                                                opts.project_root);
+                                                                opts.project_root, project_name);
                     break;
                 }
             }
@@ -312,17 +357,26 @@ std::string generate_test_script(const TestEntry& test,
     }
     script << "\n";
 
+    std::string project_name;
+    {
+        auto sl = opts.project_root.rfind('/');
+        project_name = (sl != std::string::npos && sl + 1 < opts.project_root.size())
+            ? opts.project_root.substr(sl + 1) : opts.project_root;
+    }
+
     std::string build_dir     = "build";
     std::string configure_cmd;
     std::string effective_root = opts.project_root;
     std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
+    std::string sub_dir_name;
     if (!test.build_name.empty()) {
         auto bit = reg.builds.find(test.build_name);
         if (bit != reg.builds.end()) {
             if (!bit->second.dir.empty()) build_dir = bit->second.dir;
             configure_cmd = bit->second.configure_cmd;
             effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
-                                                    opts.project_root);
+                                                    opts.project_root, project_name);
+            sub_dir_name = maybe_append_sub_dir(effective_root, bit->second, node_rsync);
         }
     }
     if (node_ptr && !node_ptr->build_dir.empty())
@@ -333,15 +387,21 @@ std::string generate_test_script(const TestEntry& test,
                 configure_cmd = bc.configure_cmd;
                 if (effective_root == opts.project_root)
                     effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
-                                                            opts.project_root);
+                                                            opts.project_root, project_name);
                 break;
             }
         }
     }
 
-    if (node_ptr && !node_ptr->cuda_arch.empty())
-        configure_cmd = str_replace_all(configure_cmd, "{{arch}}", node_ptr->cuda_arch);
-    script << sbatch_body({&test}, reg.sbatch_defaults, effective_root,
+    if (configure_cmd.find("{{arch}}") != std::string::npos) {
+        std::string arch_val = (node_ptr && !node_ptr->cuda_arch.empty())
+            ? node_ptr->cuda_arch
+            : "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once | head -1 | tr -d '.')";
+        configure_cmd = str_replace_all(configure_cmd, "{{arch}}", arch_val);
+    }
+    TestEntry test_adj = test;
+    test_adj.workdir = adjust_workdir(test.workdir, sub_dir_name);
+    script << sbatch_body({&test_adj}, reg.sbatch_defaults, effective_root,
                           build_dir, configure_cmd, reg.setup);
     return script.str();
 }

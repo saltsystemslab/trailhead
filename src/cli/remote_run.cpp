@@ -16,6 +16,13 @@
 
 namespace trailhead {
 
+// Last path component of a directory path (e.g. "/a/b/gunrock" → "gunrock")
+static std::string last_component(const std::string& path) {
+    auto sl = path.rfind('/');
+    return (sl != std::string::npos && sl + 1 < path.size())
+        ? path.substr(sl + 1) : path;
+}
+
 // ── Public helpers ────────────────────────────────────────────────────────
 
 std::optional<RemoteDest> parse_rsync_dest(const std::string& dest) {
@@ -184,12 +191,17 @@ static bool do_rsync(const std::string& project_root,
                      const RemoteDest& dest,
                      const std::function<void(const std::string&)>& log)
 {
+    // rsync_dest is the *parent* directory; append the project name so the
+    // repo lands at remote_path/project_name/ rather than directly in remote_path/
+    std::string proj_name   = last_component(project_root);
+    std::string remote_dest = dest.remote_path + "/" + proj_name;
+
     log(ansi::BOLD + std::string("rsync") + ansi::RESET
-        + "  " + project_root + " → " + dest.remote + ":" + dest.remote_path);
+        + "  " + project_root + " → " + dest.remote + ":" + remote_dest);
 
     std::string cmd = "rsync -az --exclude='.trailhead/results/' "
         + project_root + "/ "
-        + dest.remote + ":" + dest.remote_path + "/";
+        + dest.remote + ":" + remote_dest + "/";
 
     auto r = proc::run(cmd, {}, {}, 120, "", nullptr, true);
     if (r.exit_code != 0) {
@@ -208,6 +220,7 @@ static std::string do_sbatch(const TestEntry& test,
                               const std::string& node_name,
                               const Registry& reg,
                               const RemoteDest& dest,
+                              const std::string& project_root,
                               const std::string& th_dir,
                               const std::function<void(const std::string&)>& log,
                               const std::function<void(const std::string&)>& set_status)
@@ -226,7 +239,8 @@ static std::string do_sbatch(const TestEntry& test,
     log(ansi::BOLD + std::string("sbatch") + ansi::RESET + " " + script
         + (node ? "  [" + (node->gpu_type.empty() ? node->nodelist : node->gpu_type) + "]" : ""));
 
-    std::string sbatch_cmd = "\"cd " + dest.remote_path
+    std::string remote_project = dest.remote_path + "/" + last_component(project_root);
+    std::string sbatch_cmd = "\"cd " + remote_project
                            + " && sbatch" + flags + " " + script + "\"";
     std::string ssh_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
                         + dest.remote + " " + sbatch_cmd;
@@ -587,7 +601,7 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         int64_t t_submit = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
-        std::string job_id = do_sbatch(s.test, s.node_name, reg_, dest_, th_dir_,
+        std::string job_id = do_sbatch(s.test, s.node_name, reg_, dest_, project_root_, th_dir_,
             s.log_fn ? s.log_fn : [](const std::string&){},
             s.status_fn ? s.status_fn : [](const std::string&){});
 
@@ -652,7 +666,7 @@ bool remote_submit_and_wait(
     int64_t t_submit = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    std::string job_id = do_sbatch(test, "", reg, dest, th_dir, log, set_status);
+    std::string job_id = do_sbatch(test, "", reg, dest, project_root, th_dir, log, set_status);
     if (job_id.empty()) return false;
 
     PendingJob pj;
