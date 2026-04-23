@@ -18,11 +18,10 @@ bool has_local_gpu() {
 // ── LocalRunner ───────────────────────────────────────────────────────────
 
 LocalRunner::LocalRunner(std::string th_dir, std::string project_root,
-                         std::shared_ptr<JobLog> job_log, Registry reg)
+                         std::shared_ptr<JobLog> job_log, Registry)
     : th_dir_(std::move(th_dir))
     , project_root_(std::move(project_root))
     , job_log_(std::move(job_log))
-    , reg_(std::move(reg))
     , worker_([this] { worker_loop(); })
 {}
 
@@ -35,15 +34,21 @@ LocalRunner::~LocalRunner() {
     if (worker_.joinable()) worker_.join();
 }
 
-void LocalRunner::enqueue(const TestEntry& test,
+void LocalRunner::enqueue(const TestEntry& test, const Registry& reg,
                            std::function<void(const std::string&)> log_fn,
                            std::function<void(const std::string&)> status_fn)
 {
+    // Snapshot the current build config so the worker sees the live state at submission time
+    std::optional<BuildConfig> bc;
+    if (!test.build_name.empty()) {
+        auto it = reg.builds.find(test.build_name);
+        if (it != reg.builds.end()) bc = it->second;
+    }
     job_log_->active++;
     if (status_fn) status_fn("QUEUED");
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        queue_.push_back({test, std::move(log_fn), std::move(status_fn)});
+        queue_.push_back({test, std::move(bc), std::move(log_fn), std::move(status_fn)});
     }
     cv_.notify_one();
 }
@@ -71,10 +76,9 @@ void LocalRunner::run_task(Task& task) {
     if (log) log("running locally");
 
     // Per-test cmake configure (once) + target build
-    if (!t.build_name.empty() && !t.target.empty()) {
-        auto it = reg_.builds.find(t.build_name);
-        if (it != reg_.builds.end()) {
-            const auto& bc = it->second;
+    if (!t.build_name.empty() && !t.target.empty() && task.build_config) {
+        {
+            const auto& bc = *task.build_config;
             std::string raw_dir = bc.dir.empty() ? "build" : bc.dir;
             // For sub-registry builds, paths are relative to the sub-registry root
             std::string eff_build_dir = bc.sub_dir.empty()
@@ -82,8 +86,9 @@ void LocalRunner::run_task(Task& task) {
             std::string base_wd = bc.sub_dir.empty()
                 ? project_root_ : project_root_ + "/" + bc.sub_dir;
 
-            // Configure if build dir doesn't exist yet
-            if (!bc.configure_cmd.empty() && !fs::is_dir(project_root_ + "/" + eff_build_dir)) {
+            // Configure if build dir has no CMakeCache.txt (handles missing or partially-created dirs)
+            if (!bc.configure_cmd.empty() &&
+                !fs::exists(project_root_ + "/" + eff_build_dir + "/CMakeCache.txt")) {
                 std::string configure_cmd = bc.configure_cmd;
 
                 // Substitute {{arch}} with auto-detected local GPU compute capability

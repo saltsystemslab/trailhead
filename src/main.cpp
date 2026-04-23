@@ -894,7 +894,7 @@ static int cmd_watch(int argc, char** argv) {
             if (node_name == "local") {
                 if (!local_runner) { job_log->push("local GPU not available"); return; }
                 trailhead::save_queued_submission(th_dir, {tname, "local"});
-                local_runner->enqueue(*test,
+                local_runner->enqueue(*test, reg,
                     make_log_fn(tname),
                     [job_log, tname, th_dir](const std::string& status) {
                         if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname);
@@ -925,7 +925,7 @@ static int cmd_watch(int argc, char** argv) {
             if (node_name == "local") {
                 if (!local_runner) { job_log->push("local GPU not available"); return; }
                 trailhead::save_queued_submission(th_dir, {tname, "local"});
-                local_runner->enqueue(*test,
+                local_runner->enqueue(*test, reg,
                     make_log_fn(tname),
                     [job_log, tname, th_dir](const std::string& status) {
                         if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname);

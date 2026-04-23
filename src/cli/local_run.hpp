@@ -23,13 +23,15 @@ public:
     ~LocalRunner();
 
     // Thread-safe. Increments job_log->active and sets initial status.
-    void enqueue(const TestEntry& test,
+    // reg is read only to snapshot the current build config for the test.
+    void enqueue(const TestEntry& test, const Registry& reg,
                  std::function<void(const std::string&)> log_fn,
                  std::function<void(const std::string&)> status_fn);
 
 private:
     struct Task {
         TestEntry test;
+        std::optional<BuildConfig> build_config; // snapshot at enqueue time
         std::function<void(const std::string&)> log_fn;
         std::function<void(const std::string&)> status_fn;
     };
@@ -40,7 +42,6 @@ private:
     std::string             th_dir_;
     std::string             project_root_;
     std::shared_ptr<JobLog> job_log_;
-    Registry                reg_;
 
     std::mutex              mtx_;
     std::condition_variable cv_;
