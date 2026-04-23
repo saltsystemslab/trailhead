@@ -201,8 +201,12 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                 }
             }
 
-            if (node_ptr && !node_ptr->cuda_arch.empty())
-                configure_cmd = str_replace_all(configure_cmd, "{{arch}}", node_ptr->cuda_arch);
+            if (configure_cmd.find("{{arch}}") != std::string::npos) {
+                std::string arch_val = (node_ptr && !node_ptr->cuda_arch.empty())
+                    ? node_ptr->cuda_arch
+                    : "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once | head -1 | tr -d '.')";
+                configure_cmd = str_replace_all(configure_cmd, "{{arch}}", arch_val);
+            }
             script << sbatch_body({&t}, reg.sbatch_defaults, effective_root,
                                   build_dir, configure_cmd, reg.setup);
 
