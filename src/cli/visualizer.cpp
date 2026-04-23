@@ -755,33 +755,85 @@ static std::string wizard_select_hardware(Registry& reg,
     }
 }
 
-// Single-select build config picker. Returns selected build name, or "" for none/cancelled.
-// Only called when reg.builds is non-empty.
-static std::string wizard_select_build(const Registry& reg) {
-    std::vector<std::string> names;
-    names.push_back("(none)");
-    for (const auto& [k, v] : reg.builds) names.push_back(k);
-    std::sort(names.begin() + 1, names.end());
+// Inline build config creation form.
+// Saves the new config into reg and writes registry to th_dir.
+// Returns the new config name, or "" if cancelled.
+static std::string wizard_create_build(Registry& reg, const std::string& th_dir) {
+    restore_terminal();
+    std::cout << ansi::CLEAR;
+    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — New build config\n\n";
 
+    auto read_line = [](const std::string& prompt, const std::string& def = "") {
+        if (def.empty()) std::cout << "  " << prompt << ": ";
+        else             std::cout << "  " << prompt << " [" << def << "]: ";
+        std::cout.flush();
+        std::string s;
+        std::getline(std::cin, s);
+        while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+        while (!s.empty() && s.back()  == ' ') s.pop_back();
+        return s.empty() ? def : s;
+    };
+
+    std::string name      = read_line("Config name", "release");
+    if (name.empty()) { enter_raw_mode(); return ""; }
+
+    std::string dir       = read_line("Build directory", "build");
+    std::string def_cfg   = "cmake -B " + dir + " -DCMAKE_BUILD_TYPE=Release";
+    std::string configure = read_line("Configure command", def_cfg);
+    std::string def_bld   = "cmake --build " + dir + " -j$(nproc)";
+    std::string build_cmd = read_line("Build command", def_bld);
+    std::string rsync     = read_line("Remote destination (user@host:/path, blank = local only)");
+
+    enter_raw_mode();
+
+    BuildConfig bc;
+    bc.name          = name;
+    bc.dir           = dir;
+    bc.configure_cmd = configure;
+    bc.build_cmd     = build_cmd;
+    bc.rsync_dest    = rsync;
+
+    reg.builds[name] = bc;
+    save_registry(th_dir, reg);
+    return name;
+}
+
+// Single-select build config picker. Returns selected build name, or "" for none/cancelled.
+// [n] opens an inline form to create a new config on the spot.
+static std::string wizard_select_build(Registry& reg, const std::string& th_dir) {
+    auto rebuild_names = [&]() {
+        std::vector<std::string> n;
+        n.push_back("(none)");
+        for (const auto& [k, v] : reg.builds) n.push_back(k);
+        std::sort(n.begin() + 1, n.end());
+        return n;
+    };
+
+    auto names = rebuild_names();
     int cursor = 0;
     while (true) {
         using namespace ansi;
         std::cout << CLEAR;
         std::cout << BOLD << "TRAILHEAD" << RESET << " — Link build config\n";
-        std::cout << hline(50) << "\n\n";
+        std::cout << hline(60) << "\n\n";
         for (int i = 0; i < (int)names.size(); ++i) {
             if (i == cursor) std::cout << CYAN << BOLD;
             std::cout << (i == cursor ? " > " : "   ") << names[i];
             if (i > 0) {
                 auto it = reg.builds.find(names[i]);
-                if (it != reg.builds.end() && !it->second.configure_cmd.empty())
-                    std::cout << DIM << "  (" << it->second.configure_cmd << ")" << RESET;
+                if (it != reg.builds.end()) {
+                    const auto& bc = it->second;
+                    if (!bc.configure_cmd.empty())
+                        std::cout << DIM << "  (" << bc.configure_cmd << ")" << RESET;
+                    if (!bc.rsync_dest.empty())
+                        std::cout << DIM << "  → " << bc.rsync_dest << RESET;
+                }
             }
             if (i == cursor) std::cout << RESET;
             std::cout << "\n";
         }
-        std::cout << "\n" << hline(50) << "\n";
-        std::cout << DIM << "[↑/k] up  [↓/j] down  [enter] select  [ESC] cancel"
+        std::cout << "\n" << hline(60) << "\n";
+        std::cout << DIM << "[↑/k] up  [↓/j] down  [enter] select  [n] new config  [ESC] cancel"
                   << RESET << "\n";
         std::cout.flush();
 
@@ -790,6 +842,15 @@ static std::string wizard_select_build(const Registry& reg) {
         if (k == '\r' || k == '\n') return (cursor == 0) ? "" : names[cursor];
         if (k == 1000 || k == 'k') cursor = (cursor - 1 + (int)names.size()) % (int)names.size();
         if (k == 1001 || k == 'j') cursor = (cursor + 1) % (int)names.size();
+        if (k == 'n' || k == 'N') {
+            std::string new_name = wizard_create_build(reg, th_dir);
+            names = rebuild_names();
+            if (!new_name.empty()) {
+                // Position cursor on the newly created config
+                for (int i = 0; i < (int)names.size(); ++i)
+                    if (names[i] == new_name) { cursor = i; break; }
+            }
+        }
     }
 }
 
@@ -931,10 +992,8 @@ static bool run_add_wizard(Registry& reg,
         else if (k == '3') requires_hw = "cpu";
     }
 
-    // ── Step 4: build config (from destination registry) ─────────────────
-    std::string selected_build;
-    if (!dest_reg->builds.empty())
-        selected_build = wizard_select_build(*dest_reg);
+    // ── Step 4: build config (from destination registry, [n] creates new) ──
+    std::string selected_build = wizard_select_build(*dest_reg, eff_th_dir);
 
     // ── Step 5: cmake target (only when a build is selected) ─────────────
     std::string target;
