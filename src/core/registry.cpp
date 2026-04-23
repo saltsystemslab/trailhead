@@ -144,6 +144,11 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
             if (t.workdir == "." || t.workdir.empty()) t.workdir = sub_rel;
             reg.tests.push_back(std::move(t));
         }
+
+        // Merge node profiles — parent takes priority on name collision
+        for (const auto& [nname, np] : sub.nodes) {
+            if (!reg.nodes.count(nname)) reg.nodes[nname] = np;
+        }
     }
 }
 

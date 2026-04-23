@@ -53,6 +53,9 @@ struct NodeProfile {
     // so each node type needs its own build dir to avoid clobbering each other.
     // If empty, falls back to the build config's dir ("build").
     std::string build_dir;
+    // CUDA compute capability (e.g. "90" for H200, "86" for RTX 3090).
+    // Substituted as {{arch}} in build config configure_cmd at script-generation and local-run time.
+    std::string cuda_arch;
     std::unordered_map<std::string,std::string> extra;
 };
 
@@ -140,8 +143,9 @@ inline NodeProfile node_from_json(const std::string& name, const JsonValue& v) {
     n.account      = v.get_str("account");
     n.rsync_dest   = v.get_str("rsync_dest");
     n.build_dir    = v.get_str("build_dir");
+    n.cuda_arch    = v.get_str("cuda_arch");
     static const std::vector<std::string> known = {
-        "partition","nodelist","gpu_type","nodes","ntasks","cpus_per_task","time","account","rsync_dest","build_dir"
+        "partition","nodelist","gpu_type","nodes","ntasks","cpus_per_task","time","account","rsync_dest","build_dir","cuda_arch"
     };
     if (v.is_object()) {
         for (const auto& [k, val] : v.as_object()) {
@@ -169,6 +173,7 @@ inline JsonValue node_to_json(const NodeProfile& n) {
     add("account",    n.account);
     add("rsync_dest", n.rsync_dest);
     add("build_dir",  n.build_dir);
+    add("cuda_arch",  n.cuda_arch);
     for (const auto& [k, v] : n.extra) add(k, v);
     return JsonValue(std::move(obj));
 }

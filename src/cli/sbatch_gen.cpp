@@ -201,6 +201,8 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                 }
             }
 
+            if (node_ptr && !node_ptr->cuda_arch.empty())
+                configure_cmd = str_replace_all(configure_cmd, "{{arch}}", node_ptr->cuda_arch);
             script << sbatch_body({&t}, reg.sbatch_defaults, effective_root,
                                   build_dir, configure_cmd, reg.setup);
 
@@ -259,6 +261,8 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             }
         }
 
+        if (node_ptr && !node_ptr->cuda_arch.empty())
+            configure_cmd = str_replace_all(configure_cmd, "{{arch}}", node_ptr->cuda_arch);
         std::vector<const TestEntry*> ptrs;
         for (const auto& t : reg.tests) ptrs.push_back(&t);
         script << sbatch_body(ptrs, reg.sbatch_defaults, effective_root,
@@ -331,6 +335,8 @@ std::string generate_test_script(const TestEntry& test,
         }
     }
 
+    if (node_ptr && !node_ptr->cuda_arch.empty())
+        configure_cmd = str_replace_all(configure_cmd, "{{arch}}", node_ptr->cuda_arch);
     script << sbatch_body({&test}, reg.sbatch_defaults, effective_root,
                           build_dir, configure_cmd, reg.setup);
     return script.str();

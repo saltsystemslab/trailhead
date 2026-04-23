@@ -75,12 +75,51 @@ void LocalRunner::run_task(Task& task) {
         auto it = reg_.builds.find(t.build_name);
         if (it != reg_.builds.end()) {
             const auto& bc = it->second;
-            std::string build_dir = bc.dir.empty() ? "build" : bc.dir;
+            std::string raw_dir = bc.dir.empty() ? "build" : bc.dir;
+            // For sub-registry builds, paths are relative to the sub-registry root
+            std::string eff_build_dir = bc.sub_dir.empty()
+                ? raw_dir : bc.sub_dir + "/" + raw_dir;
+            std::string base_wd = bc.sub_dir.empty()
+                ? project_root_ : project_root_ + "/" + bc.sub_dir;
 
-            // Configure if build dir doesn't exist yet (auto-detects local GPU arch)
-            if (!bc.configure_cmd.empty() && !fs::is_dir(project_root_ + "/" + build_dir)) {
-                if (log) log("configuring: " + bc.configure_cmd);
-                auto cr = proc::run(bc.configure_cmd, {}, {}, 300, project_root_, nullptr, true);
+            // Configure if build dir doesn't exist yet
+            if (!bc.configure_cmd.empty() && !fs::is_dir(project_root_ + "/" + eff_build_dir)) {
+                std::string configure_cmd = bc.configure_cmd;
+
+                // Substitute {{arch}} with auto-detected local GPU compute capability
+                if (configure_cmd.find("{{arch}}") != std::string::npos) {
+                    auto ar = proc::run(
+                        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once",
+                        {}, {}, 5, "", nullptr, false);
+                    if (ar.exit_code == 0 && !ar.stdout_str.empty()) {
+                        std::string arch;
+                        for (char c : ar.stdout_str) {
+                            if (c >= '0' && c <= '9') arch += c;
+                            else if (c == '\n' || c == '\r') break;
+                        }
+                        if (!arch.empty()) {
+                            size_t pos = 0;
+                            while ((pos = configure_cmd.find("{{arch}}", pos)) != std::string::npos) {
+                                configure_cmd.replace(pos, 8, arch);
+                                pos += arch.size();
+                            }
+                        }
+                    }
+                }
+
+                // cmake ".." form (run-from-build-dir) vs "-B build" form (run-from-source-root)
+                bool from_build_dir = configure_cmd.size() >= 3 &&
+                                      configure_cmd.substr(configure_cmd.size() - 3) == " ..";
+                std::string conf_wd;
+                if (from_build_dir) {
+                    conf_wd = base_wd + "/" + raw_dir;
+                    fs::mkdir_p(conf_wd);
+                } else {
+                    conf_wd = base_wd;
+                }
+
+                if (log) log("configuring: " + configure_cmd);
+                auto cr = proc::run(configure_cmd, {}, {}, 300, conf_wd, nullptr, true);
                 if (cr.exit_code != 0) {
                     if (log) {
                         if (!cr.stdout_str.empty()) log(cr.stdout_str);
@@ -103,7 +142,7 @@ void LocalRunner::run_task(Task& task) {
                 }
             }
 
-            std::string build_cmd = "cmake --build " + build_dir + " --target " + t.target;
+            std::string build_cmd = "cmake --build " + eff_build_dir + " --target " + t.target;
             if (log) log("building: " + build_cmd);
             auto br = proc::run(build_cmd, {}, {}, 300, project_root_, nullptr, true);
             if (br.exit_code != 0) {

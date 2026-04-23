@@ -580,8 +580,9 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     int cpus = 1;
     try { cpus = std::stoi(cpus_str); } catch (...) {}
 
-    std::string time_str  = read_line("Time limit", "01:00:00");
+    std::string time_str   = read_line("Time limit", "01:00:00");
     std::string rsync_dest = read_line("Remote rsync destination (user@host:/path, blank = local only)");
+    std::string cuda_arch  = read_line("CUDA arch (e.g. 90 for H200, 86 for RTX 3090; used as {{arch}} in configure_cmd)");
 
     enter_raw_mode();
 
@@ -593,6 +594,7 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     np.cpus_per_task = cpus;
     np.time          = time_str;
     np.rsync_dest    = rsync_dest;
+    np.cuda_arch     = cuda_arch;
 
     reg.nodes[name] = np;
     save_registry(th_dir, reg);
@@ -645,6 +647,7 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
 
     std::string time_str   = read_line("Time limit", np.time);
     std::string rsync_dest = read_line("Remote rsync destination (user@host:/path)", np.rsync_dest);
+    std::string cuda_arch  = read_line("CUDA arch (e.g. 90 for H200; used as {{arch}} in configure_cmd)", np.cuda_arch);
 
     enter_raw_mode();
 
@@ -656,6 +659,7 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
     np.cpus_per_task = cpus;
     np.time          = time_str;
     np.rsync_dest    = rsync_dest;
+    np.cuda_arch     = cuda_arch;
     reg.nodes[name]  = np;
 
     save_registry(th_dir, reg);

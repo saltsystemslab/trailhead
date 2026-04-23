@@ -125,7 +125,7 @@ static int cmd_node(int argc, char** argv) {
                      "                      [--gpu-type <model>]   # OR pick GPU model (e.g. h200)\n"
                      "                      [--cpus <n>] [--time <HH:MM:SS>]\n"
                      "                      [--nodes <n>] [--ntasks <n>] [--account <a>]\n"
-                     "                      [--rsync-dest user@host:/path]\n"
+                     "                      [--rsync-dest user@host:/path] [--arch <cuda-arch>]\n"
                      "  trailhead node list\n"
                      "  trailhead node remove <name>\n"
                      "\n"
@@ -152,7 +152,8 @@ static int cmd_node(int argc, char** argv) {
 
         using namespace trailhead::ansi;
         std::cout << BOLD << pad("NAME", (int)max_name+2)
-                  << " PARTITION          TARGET              CPUS  TIME        RSYNC DEST\n" << RESET;
+                  << " PARTITION          TARGET              CPUS  TIME        "
+                  << pad("RSYNC DEST", 30) << " ARCH\n" << RESET;
         for (const auto& [name, np] : reg.nodes) {
             std::string target = !np.gpu_type.empty()
                 ? ("gpu:" + np.gpu_type)
@@ -162,7 +163,8 @@ static int cmd_node(int argc, char** argv) {
                       << " " << pad(target, 18)
                       << " " << pad(std::to_string(np.cpus_per_task), 5)
                       << " " << pad(np.time, 11)
-                      << " " << np.rsync_dest << "\n";
+                      << " " << pad(np.rsync_dest, 30)
+                      << " " << np.cuda_arch << "\n";
         }
         return 0;
     }
@@ -184,6 +186,7 @@ static int cmd_node(int argc, char** argv) {
         np.time         = args.get("time", "01:00:00");
         np.account      = args.get("account");
         np.rsync_dest   = args.get("rsync-dest");
+        np.cuda_arch    = args.get("arch");
 
         if (!np.nodelist.empty() && !np.gpu_type.empty()) {
             std::cerr << "Error: specify --nodelist OR --gpu-type, not both.\n";
@@ -906,8 +909,11 @@ static int cmd_watch(int argc, char** argv) {
             }
         };
     } else {
-        // No remote configured — local runner only
-        run_fn = [&reg = reg, job_log, make_log_fn, local_runner, th_dir](
+        // No remote at startup — lazily create BatchSubmitter on first remote submission
+        // so that rsync_dest added via the TUI hardware editor is picked up at run time.
+        auto lazy_submitter = std::make_shared<std::shared_ptr<trailhead::BatchSubmitter>>();
+
+        run_fn = [&reg = reg, job_log, make_log_fn, local_runner, th_dir, project_root, lazy_submitter](
                 const std::string& name, const std::string& node_name) {
             const trailhead::TestEntry* test = nullptr;
             for (const auto& t : reg.tests)
@@ -926,7 +932,42 @@ static int cmd_watch(int argc, char** argv) {
                         job_log->set_live(tname, status);
                     });
             } else {
-                job_log->push("no remote configured for node: " + node_name);
+                // Try to initialise a BatchSubmitter now if one hasn't been created yet
+                if (!*lazy_submitter) {
+                    std::optional<trailhead::RemoteDest> rd;
+                    for (const auto& [nname, np] : reg.nodes) {
+                        if (!np.rsync_dest.empty()) {
+                            auto d = trailhead::parse_rsync_dest(np.rsync_dest);
+                            if (d) { rd = d; break; }
+                        }
+                    }
+                    if (!rd) {
+                        for (const auto& [bname, bc] : reg.builds) {
+                            if (!bc.rsync_dest.empty()) {
+                                auto d = trailhead::parse_rsync_dest(bc.rsync_dest);
+                                if (d) { rd = d; break; }
+                            }
+                        }
+                    }
+                    if (rd) {
+                        std::vector<std::string> partitions;
+                        for (const auto& [nname, node] : reg.nodes)
+                            if (!node.partition.empty()) partitions.push_back(node.partition);
+                        int max_concurrent = trailhead::query_slurm_job_limit(rd->remote, partitions);
+                        job_log->push("[trailhead] SLURM max concurrent jobs: " + std::to_string(max_concurrent));
+                        *lazy_submitter = std::make_shared<trailhead::BatchSubmitter>(
+                            reg, th_dir, project_root, *rd, job_log, max_concurrent);
+                    }
+                }
+                if (*lazy_submitter) {
+                    (*lazy_submitter)->enqueue(*test, node_name,
+                        make_log_fn(tname),
+                        [job_log, tname](const std::string& status) {
+                            job_log->set_live(tname, status);
+                        });
+                } else {
+                    job_log->push("no remote configured for node: " + node_name);
+                }
             }
         };
     }
