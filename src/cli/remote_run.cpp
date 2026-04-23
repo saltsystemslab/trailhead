@@ -577,7 +577,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
     // Regenerate sbatch scripts for the selected hardware before rsync uploads them
     {
         SbatchOptions script_opts;
-        script_opts.split = true;
+        script_opts.split        = true;
+        script_opts.project_root = project_root_;
         fs::mkdir_p(th_dir_ + "/sbatch");
         for (auto& s : batch) {
             if (s.node_name.empty()) continue;
