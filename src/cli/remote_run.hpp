@@ -45,6 +45,7 @@ struct PendingJob {
     std::string job_id;
     std::string remote;
     std::string remote_path;
+    std::string project_root;
     int64_t     started_at = 0;
 };
 

@@ -75,11 +75,12 @@ static std::string pending_path(const std::string& th_dir, const std::string& na
 void save_pending_job(const std::string& th_dir, const PendingJob& job) {
     fs::mkdir_p(pending_dir(th_dir));
     JsonObject obj;
-    obj.push_back({"name",        job.name});
-    obj.push_back({"job_id",      job.job_id});
-    obj.push_back({"remote",      job.remote});
-    obj.push_back({"remote_path", job.remote_path});
-    obj.push_back({"started_at",  JsonValue(job.started_at)});
+    obj.push_back({"name",         job.name});
+    obj.push_back({"job_id",       job.job_id});
+    obj.push_back({"remote",       job.remote});
+    obj.push_back({"remote_path",  job.remote_path});
+    obj.push_back({"project_root", job.project_root});
+    obj.push_back({"started_at",   JsonValue(job.started_at)});
     fs::write_file_atomic(pending_path(th_dir, job.name),
                           json_emit(JsonValue(std::move(obj))));
 }
@@ -96,11 +97,12 @@ std::vector<PendingJob> load_pending_jobs(const std::string& th_dir) {
             if (!text) continue;
             auto val = json_parse(*text);
             PendingJob j;
-            j.name        = val.get_str("name",        "");
-            j.job_id      = val.get_str("job_id",      "");
-            j.remote      = val.get_str("remote",      "");
-            j.remote_path = val.get_str("remote_path", "");
-            j.started_at  = val.get_int("started_at",  0);
+            j.name         = val.get_str("name",         "");
+            j.job_id       = val.get_str("job_id",       "");
+            j.remote       = val.get_str("remote",       "");
+            j.remote_path  = val.get_str("remote_path",  "");
+            j.project_root = val.get_str("project_root", "");
+            j.started_at   = val.get_int("started_at",   0);
             if (!j.name.empty() && !j.job_id.empty() && !j.remote.empty())
                 out.push_back(std::move(j));
         } catch (...) {}
@@ -301,6 +303,7 @@ static bool poll_and_finalize(
     const Registry& reg,
     const std::string& th_dir,
     const RemoteDest& dest,
+    const std::string& project_root,
     std::function<void(const std::string&)> log_fn,
     std::function<void(const std::string&)> status_fn)
 {
@@ -369,8 +372,10 @@ static bool poll_and_finalize(
         return s;
     };
 
-    std::string remote_out = dest.remote_path + "/" + subst_job_id(reg.sbatch_defaults.output_pattern);
-    std::string remote_err = dest.remote_path + "/" + subst_job_id(reg.sbatch_defaults.error_pattern);
+    // rsync_dest is the parent dir; the project landed at remote_path/project_name/
+    std::string remote_project = dest.remote_path + "/" + last_component(project_root);
+    std::string remote_out = remote_project + "/" + subst_job_id(reg.sbatch_defaults.output_pattern);
+    std::string remote_err = remote_project + "/" + subst_job_id(reg.sbatch_defaults.error_pattern);
 
     std::string slurm_stdout = ssh_run(dest.remote, "\"cat " + remote_out + " 2>/dev/null\"");
     std::string slurm_stderr = ssh_run(dest.remote, "\"cat " + remote_err + " 2>/dev/null\"");
@@ -621,28 +626,30 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
 
         // Save pending state so watch can resume after close
         PendingJob pj;
-        pj.name        = s.test.name;
-        pj.job_id      = job_id;
-        pj.remote      = dest_.remote;
-        pj.remote_path = dest_.remote_path;
-        pj.started_at  = t_submit;
+        pj.name         = s.test.name;
+        pj.job_id       = job_id;
+        pj.remote       = dest_.remote;
+        pj.remote_path  = dest_.remote_path;
+        pj.project_root = project_root_;
+        pj.started_at   = t_submit;
         save_pending_job(th_dir_, pj);
 
         if (s.status_fn) s.status_fn("PENDING");
         if (s.log_fn) s.log_fn("  job " + job_id + " submitted");
 
         // Spawn poll thread — releases the slot when the job completes
-        auto test      = s.test;
-        auto log_fn    = s.log_fn;
-        auto status_fn = s.status_fn;
-        auto reg       = reg_;
-        auto th_dir    = th_dir_;
-        auto dest      = dest_;
-        auto job_log   = job_log_;
-        auto slots     = slots_;
+        auto test         = s.test;
+        auto log_fn       = s.log_fn;
+        auto status_fn    = s.status_fn;
+        auto reg          = reg_;
+        auto th_dir       = th_dir_;
+        auto dest         = dest_;
+        auto project_root = project_root_;
+        auto job_log      = job_log_;
+        auto slots        = slots_;
 
         std::thread([=]() mutable {
-            poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, log_fn, status_fn);
+            poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn);
             slots->release();
             job_log->active--;
         }).detach();
@@ -676,17 +683,18 @@ bool remote_submit_and_wait(
     if (job_id.empty()) return false;
 
     PendingJob pj;
-    pj.name        = test.name;
-    pj.job_id      = job_id;
-    pj.remote      = dest.remote;
-    pj.remote_path = dest.remote_path;
-    pj.started_at  = t_submit;
+    pj.name         = test.name;
+    pj.job_id       = job_id;
+    pj.remote       = dest.remote;
+    pj.remote_path  = dest.remote_path;
+    pj.project_root = project_root;
+    pj.started_at   = t_submit;
     save_pending_job(th_dir, pj);
 
     set_status("PENDING");
     log("  job " + job_id + " submitted");
 
-    return poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, log_fn, status_fn);
+    return poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn);
 }
 
 // ── Resume a previously submitted job ────────────────────────────────────
@@ -703,7 +711,7 @@ bool resume_job(
     if (log_fn) log_fn("  resuming job " + pending.job_id);
     if (status_fn) status_fn("PENDING");
     return poll_and_finalize(pending.job_id, pending.started_at,
-                             test, reg, th_dir, dest, log_fn, status_fn);
+                             test, reg, th_dir, dest, pending.project_root, log_fn, status_fn);
 }
 
 } // namespace trailhead
