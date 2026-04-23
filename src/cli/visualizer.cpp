@@ -1504,7 +1504,13 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         // Erase everything below the current frame (handles shrinking content)
         o << ERASE_DOWN;
 
-        std::cout << o.str();
+        // Clear to end of line on every line to erase artifacts from wider previous frames
+        std::string frame = o.str();
+        std::string eol = std::string(ERASE_EOL) + "\n";
+        size_t pos = 0;
+        while ((pos = frame.find('\n', pos)) != std::string::npos)
+            frame.replace(pos, 1, eol), pos += eol.size();
+        std::cout << frame;
         std::cout.flush();
     };
 
