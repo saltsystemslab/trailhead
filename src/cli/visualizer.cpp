@@ -492,6 +492,59 @@ static void render_detail(const TestEntry& t, const TestResult* r,
     std::cout.flush();
 }
 
+// ── Script preview ────────────────────────────────────────────────────────
+
+static void render_script_preview(const std::string& test_name,
+                                    const std::vector<std::string>& lines,
+                                    int& scroll) {
+    using namespace ansi;
+    std::ostringstream o;
+    int rows_written = 0;
+    auto ln = [&](const std::string& s = "") { o << s << "\n"; ++rows_written; };
+
+    o << CURSOR_HOME;
+    ln(std::string(BOLD) + "TRAILHEAD" + RESET + " \xe2\x80\x94 sbatch preview: "
+       + CYAN + test_name + RESET);
+    ln(hline(TOTAL_WIDTH));
+
+    int total = (int)lines.size();
+    int avail = std::max(3, term_rows() - rows_written - 2 /*footer*/);
+    int max_scroll = std::max(0, total - avail);
+    if (scroll > max_scroll) scroll = max_scroll;
+    if (scroll < 0)          scroll = 0;
+
+    if (scroll > 0)
+        ln("  " + std::string(DIM) + "\xe2\x86\x91 " + std::to_string(scroll) + " lines above" + RESET);
+
+    int vis_end = std::min(scroll + avail, total);
+    for (int i = scroll; i < vis_end; ++i) {
+        const std::string& l = lines[i];
+        if (!l.empty() && l[0] == '#')
+            ln("  " + std::string(DIM) + l + RESET);   // comments dimmed
+        else if (l.rfind("#SBATCH", 0) == 0)
+            ln("  " + std::string(CYAN) + l + RESET);  // never reached but kept for clarity
+        else
+            ln("  " + l);
+    }
+
+    int below = total - vis_end;
+    if (below > 0)
+        ln("  " + std::string(DIM) + "\xe2\x86\x93 " + std::to_string(below) + " lines below" + RESET);
+
+    o << hline(TOTAL_WIDTH) << "\n";
+    o << DIM << "[b/ESC] back  [j/\xe2\x86\x93] scroll down  [k/\xe2\x86\x91] scroll up  "
+      << "[s] submit  [q] quit" << RESET << "\n";
+    o << ERASE_DOWN;
+
+    std::string frame = o.str();
+    std::string eol = std::string(ERASE_EOL) + "\n";
+    size_t pos = 0;
+    while ((pos = frame.find('\n', pos)) != std::string::npos)
+        frame.replace(pos, 1, eol), pos += eol.size();
+    std::cout << frame;
+    std::cout.flush();
+}
+
 // ── Terminal size ─────────────────────────────────────────────────────────
 
 static int term_rows() {
@@ -1286,8 +1339,11 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     int selected      = 0;
     int scroll        = 0;
     bool detail_mode  = false;
-    int detail_scroll = 0;  // scroll offset for detail view output
-    int detail_ticks  = 0;  // ticks since last detail re-render
+    int detail_scroll = 0;
+    int detail_ticks  = 0;
+    bool preview_mode = false;
+    int preview_scroll = 0;
+    std::vector<std::string> preview_lines;
     int total = 0;
     std::vector<int> filtered; // indices into reg.tests, filtered by selected_hw
 
@@ -1383,7 +1439,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
         o << hline(TOTAL_WIDTH) << "\n";
         o << DIM
-          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [h] hw"
+          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [p] preview  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [h] hw"
           << RESET << "\n";
 
         // Log panel — fixed at snapshot taken above
@@ -1420,7 +1476,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     while (true) {
         int key = read_key(tick_ms);
 
-        if (!detail_mode) {
+        if (!detail_mode && !preview_mode) {
             bool redraw = false;
             if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) break;
             if (key == 'j' || key == 1001 /*down*/) { selected = (selected + 1) % std::max(total, 1); redraw = true; }
@@ -1467,6 +1523,45 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 }
                 redraw = true;
             }
+            if ((key == 'p' || key == 'P') && total > 0) {
+                const auto& t = reg.tests[filtered[selected]];
+                SbatchOptions opts;
+                opts.node_name    = (selected_hw == "local") ? "" : selected_hw;
+                opts.project_root = project_root;
+
+                std::string script;
+                if (selected_hw.empty() || selected_hw == "local") {
+                    std::ostringstream ss;
+                    ss << "#!/bin/bash\n# Local run — no sbatch\n\n";
+                    if (!t.build_name.empty() && !t.target.empty()) {
+                        auto bit = reg.builds.find(t.build_name);
+                        if (bit != reg.builds.end()) {
+                            const auto& bc = bit->second;
+                            std::string raw = bc.dir.empty() ? "build" : bc.dir;
+                            std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
+                            if (!bc.configure_cmd.empty())
+                                ss << "# configure (if CMakeCache.txt absent)\n"
+                                   << bc.configure_cmd << "\n\n";
+                            ss << "cmake --build " << eff << " --target " << t.target << "\n\n";
+                        }
+                    }
+                    std::string wd = (t.workdir.empty() || t.workdir == ".") ? "" : t.workdir;
+                    if (!wd.empty()) ss << "cd " << wd << "\n";
+                    ss << t.cmd << "\n";
+                    script = ss.str();
+                } else {
+                    script = generate_test_script(t, selected_hw, reg, opts);
+                }
+
+                preview_lines.clear();
+                std::istringstream ss(script);
+                for (std::string l; std::getline(ss, l); )
+                    preview_lines.push_back(l);
+
+                preview_mode = true;
+                preview_scroll = 0;
+                render_script_preview(t.name, preview_lines, preview_scroll);
+            }
             if (key == 'a' || key == 'A') {
                 run_add_wizard(reg, trailhead_dir, project_root);
                 rebuild_filtered();
@@ -1511,6 +1606,22 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             // auto_run: exit once all submitted jobs have finished
             if (auto_run && submitted_all && job_log && job_log->active.load() == 0)
                 break;
+        } else if (preview_mode) {
+            if (key == 'b' || key == 'B' || key == 27 /*ESC*/) {
+                preview_mode = false;
+                render_main(idx);
+            } else if (key == 'q' || key == 'Q') {
+                break;
+            } else if ((key == 's' || key == 'S') && run_fn && total > 0) {
+                preview_mode = false;
+                const auto& t = reg.tests[filtered[selected]];
+                run_fn(t.name, selected_hw);
+                render_main(idx);
+            } else if (key != -1) {
+                if (key == 'j' || key == 1001 /*down*/) ++preview_scroll;
+                else if (key == 'k' || key == 1000 /*up*/) preview_scroll = std::max(0, preview_scroll - 1);
+                render_script_preview(reg.tests[filtered[selected]].name, preview_lines, preview_scroll);
+            }
         } else {
             // Detail mode
             if (key == 'b' || key == 'B' || key == 27 /*ESC*/) {
@@ -1522,9 +1633,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 bool detail_redraw = false;
                 if (key == 'j' || key == 1001 /*down*/) { ++detail_scroll; detail_redraw = true; }
                 else if (key == 'k' || key == 1000 /*up*/) { detail_scroll = std::max(0, detail_scroll - 1); detail_redraw = true; }
-                else if (key != -1) { detail_redraw = true; } // any other key press
+                else if (key != -1) { detail_redraw = true; }
 
-                // Also re-render on the same timer interval as the main view
                 ++detail_ticks;
                 if (detail_ticks >= refresh_every) { detail_ticks = 0; detail_redraw = true; }
 
