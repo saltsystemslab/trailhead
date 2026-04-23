@@ -479,10 +479,59 @@ static void render_detail(const TestEntry& t, const TestResult* r,
     // ── Footer ────────────────────────────────────────────────────────────
     o << hline(TOTAL_WIDTH) << "\n";
     o << DIM << "[b/ESC] back  [j/" << "\xe2\x86\x93" << "] scroll down  "
-      << "[k/" << "\xe2\x86\x91" << "] scroll up  [q] quit" << RESET << "\n";
+      << "[k/" << "\xe2\x86\x91" << "] scroll up  [o] full output  [q] quit" << RESET << "\n";
     o << ERASE_DOWN;
 
     // Clear to end of line on every line to erase artifacts from longer previous frames
+    std::string frame = o.str();
+    std::string eol = std::string(ERASE_EOL) + "\n";
+    size_t pos = 0;
+    while ((pos = frame.find('\n', pos)) != std::string::npos)
+        frame.replace(pos, 1, eol), pos += eol.size();
+    std::cout << frame;
+    std::cout.flush();
+}
+
+// ── Full output log viewer ────────────────────────────────────────────────
+
+static void render_output_log(const std::string& test_name,
+                               const std::vector<std::string>& lines,
+                               int& scroll) {
+    using namespace ansi;
+    std::ostringstream o;
+    int rows_written = 0;
+    auto ln = [&](const std::string& s = "") { o << s << "\n"; ++rows_written; };
+
+    o << CURSOR_HOME;
+    ln(std::string(BOLD) + "TRAILHEAD" + RESET + " \xe2\x80\x94 full output: "
+       + CYAN + test_name + RESET);
+    ln(hline(TOTAL_WIDTH));
+
+    int total = (int)lines.size();
+    int avail = std::max(3, term_rows() - rows_written - 2 /*footer*/);
+    int max_scroll = std::max(0, total - avail);
+    if (scroll > max_scroll) scroll = max_scroll;
+    if (scroll < 0)          scroll = 0;
+
+    if (total == 0) {
+        ln("  " + std::string(DIM) + "(no output file found)" + RESET);
+    } else {
+        if (scroll > 0)
+            ln("  " + std::string(DIM) + "\xe2\x86\x91 " + std::to_string(scroll) + " lines above" + RESET);
+
+        int vis_end = std::min(scroll + avail, total);
+        for (int i = scroll; i < vis_end; ++i)
+            ln("  " + std::string(DIM) + lines[i] + RESET);
+
+        int below = total - vis_end;
+        if (below > 0)
+            ln("  " + std::string(DIM) + "\xe2\x86\x93 " + std::to_string(below) + " lines below" + RESET);
+    }
+
+    o << hline(TOTAL_WIDTH) << "\n";
+    o << DIM << "[b/ESC] back  [j/\xe2\x86\x93] scroll down  [k/\xe2\x86\x91] scroll up  [q] quit" << RESET << "\n";
+    o << ERASE_DOWN;
+
     std::string frame = o.str();
     std::string eol = std::string(ERASE_EOL) + "\n";
     size_t pos = 0;
@@ -1344,6 +1393,9 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     bool preview_mode = false;
     int preview_scroll = 0;
     std::vector<std::string> preview_lines;
+    bool output_mode = false;
+    int output_scroll = 0;
+    std::vector<std::string> output_lines;
     int total = 0;
     std::vector<int> filtered; // indices into reg.tests, filtered by selected_hw
 
@@ -1476,7 +1528,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     while (true) {
         int key = read_key(tick_ms);
 
-        if (!detail_mode && !preview_mode) {
+        if (!detail_mode && !preview_mode && !output_mode) {
             bool redraw = false;
             if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) break;
             if (key == 'j' || key == 1001 /*down*/) { selected = (selected + 1) % std::max(total, 1); redraw = true; }
@@ -1622,6 +1674,21 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 else if (key == 'k' || key == 1000 /*up*/) preview_scroll = std::max(0, preview_scroll - 1);
                 render_script_preview(reg.tests[filtered[selected]].name, preview_lines, preview_scroll);
             }
+        } else if (output_mode) {
+            if (key == 'b' || key == 'B' || key == 27 /*ESC*/) {
+                output_mode = false;
+                const auto& t = reg.tests[filtered[selected]];
+                const TestResult* r = latest_result(idx, t.name);
+                std::string live = job_log ? job_log->get_live(t.name) : "";
+                auto live_out = job_log ? job_log->get_live_output(t.name) : std::vector<std::string>{};
+                render_detail(t, r, detail_scroll, live, live_out);
+            } else if (key == 'q' || key == 'Q') {
+                break;
+            } else if (key != -1) {
+                if (key == 'j' || key == 1001 /*down*/) ++output_scroll;
+                else if (key == 'k' || key == 1000 /*up*/) output_scroll = std::max(0, output_scroll - 1);
+                render_output_log(reg.tests[filtered[selected]].name, output_lines, output_scroll);
+            }
         } else {
             // Detail mode
             if (key == 'b' || key == 'B' || key == 27 /*ESC*/) {
@@ -1629,6 +1696,22 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 render_main(idx);
             } else if (key == 'q' || key == 'Q') {
                 break;
+            } else if ((key == 'o' || key == 'O') && total > 0) {
+                const auto& t = reg.tests[filtered[selected]];
+                const TestResult* r = latest_result(idx, t.name);
+                output_lines.clear();
+                if (r) {
+                    std::string out_path = result_output_path(*r);
+                    auto content = out_path.empty() ? std::nullopt : fs::read_file(out_path);
+                    if (content) {
+                        std::istringstream ss(*content);
+                        for (std::string l; std::getline(ss, l); )
+                            output_lines.push_back(l);
+                    }
+                }
+                output_mode = true;
+                output_scroll = (int)output_lines.size(); // start at bottom
+                render_output_log(t.name, output_lines, output_scroll);
             } else {
                 bool detail_redraw = false;
                 if (key == 'j' || key == 1001 /*down*/) { ++detail_scroll; detail_redraw = true; }

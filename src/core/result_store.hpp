@@ -145,7 +145,25 @@ inline void parse_trailhead_output(
     if (remaining_stdout) *remaining_stdout = remaining;
 }
 
+// Return the path of the full output sidecar file for a result (may not exist).
+inline std::string result_output_path(const TestResult& r) {
+    if (r.result_file.empty()) return "";
+    auto dot = r.result_file.rfind('.');
+    return (dot != std::string::npos) ? r.result_file.substr(0, dot) + ".out"
+                                      : r.result_file + ".out";
+}
+
 // ── Save ──────────────────────────────────────────────────────────────────
+
+// Save the full stdout/stderr output alongside the result JSON as a .out sidecar file.
+inline void save_result_output(const std::string& results_dir,
+                                const TestResult& res,
+                                const std::string& output) {
+    if (output.empty()) return;
+    std::string path = results_dir + "/" + res.name + "_"
+                     + std::to_string(res.started_at) + ".out";
+    fs::write_file_atomic(path, output);
+}
 
 inline void save_result(const std::string& results_dir, const TestResult& res) {
     std::string path = results_dir + "/" + res.name + "_"

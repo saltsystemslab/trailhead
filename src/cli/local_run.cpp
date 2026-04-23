@@ -141,6 +141,7 @@ void LocalRunner::run_task(Task& task) {
                     std::string results_dir = th_dir_ + "/results";
                     fs::mkdir_p(results_dir);
                     save_result(results_dir, res);
+                    save_result_output(results_dir, res, cr.stdout_str + cr.stderr_str);
                     if (set_status) set_status("");
                     job_log_->active--;
                     return;
@@ -166,6 +167,7 @@ void LocalRunner::run_task(Task& task) {
                 std::string results_dir = th_dir_ + "/results";
                 fs::mkdir_p(results_dir);
                 save_result(results_dir, res);
+                save_result_output(results_dir, res, br.stdout_str + br.stderr_str);
                 if (set_status) set_status("");
                 job_log_->active--;
                 return;
@@ -209,15 +211,16 @@ void LocalRunner::run_task(Task& task) {
         else                  res.failed = 1;
     }
 
+    std::string full_output = r.stdout_str;
+    if (!r.stderr_str.empty()) full_output += "\n--- stderr ---\n" + r.stderr_str;
+
     if (r.timed_out) {
         res.failed = 1;
         res.metadata["_output_tail"] = "timed out after " + std::to_string(t.timeout_sec) + "s";
     } else {
-        // Store last 30 lines of combined output for detail view
-        std::string combined = r.stdout_str;
-        if (!r.stderr_str.empty()) combined += "\n--- stderr ---\n" + r.stderr_str;
+        // Store last 30 lines of combined output for the detail view inline panel
         std::deque<std::string> lines;
-        std::istringstream ss(combined);
+        std::istringstream ss(full_output);
         std::string ln;
         while (std::getline(ss, ln)) {
             lines.push_back(ln);
@@ -231,6 +234,7 @@ void LocalRunner::run_task(Task& task) {
     std::string results_dir = th_dir_ + "/results";
     fs::mkdir_p(results_dir);
     save_result(results_dir, res);
+    save_result_output(results_dir, res, full_output);
 
     // Log outcome
     std::string badge = res.failed > 0

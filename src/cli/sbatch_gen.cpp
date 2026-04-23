@@ -227,9 +227,13 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                     sub_dir_name = maybe_append_sub_dir(effective_root, bit->second, node_rsync);
                 }
             }
-            // Node-specific build dir overrides the build config's dir
-            if (node_ptr && !node_ptr->build_dir.empty())
-                build_dir = node_ptr->build_dir;
+            // Node-specific build dir: explicit setting wins; otherwise default to build_<node>
+            if (node_ptr) {
+                if (!node_ptr->build_dir.empty())
+                    build_dir = node_ptr->build_dir;
+                else if (!opts.node_name.empty())
+                    build_dir = "build_" + opts.node_name;
+            }
 
             // No linked build config — fall back to any registered build config
             if (configure_cmd.empty()) {
@@ -283,8 +287,12 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
         std::string configure_cmd;
         std::string effective_root = opts.project_root;
         std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
-        if (node_ptr && !node_ptr->build_dir.empty())
-            build_dir = node_ptr->build_dir;
+        if (node_ptr) {
+            if (!node_ptr->build_dir.empty())
+                build_dir = node_ptr->build_dir;
+            else if (!opts.node_name.empty())
+                build_dir = "build_" + opts.node_name;
+        }
         // Pick configure_cmd and remote root from whichever build config is referenced first
         for (const auto& t : reg.tests) {
             if (!t.build_name.empty()) {
@@ -379,8 +387,12 @@ std::string generate_test_script(const TestEntry& test,
             sub_dir_name = maybe_append_sub_dir(effective_root, bit->second, node_rsync);
         }
     }
-    if (node_ptr && !node_ptr->build_dir.empty())
-        build_dir = node_ptr->build_dir;
+    if (node_ptr) {
+        if (!node_ptr->build_dir.empty())
+            build_dir = node_ptr->build_dir;
+        else if (!node_name.empty())
+            build_dir = "build_" + node_name;
+    }
     if (configure_cmd.empty()) {
         for (const auto& [bname, bc] : reg.builds) {
             if (!bc.configure_cmd.empty()) {

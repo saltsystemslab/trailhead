@@ -417,6 +417,12 @@ static bool poll_and_finalize(
     }
 
     write_result_json(results_dir, res);
+    {
+        std::string full_out = slurm_stdout;
+        if (!slurm_stderr.empty() && slurm_stderr != slurm_stdout)
+            full_out += "\n--- stderr ---\n" + slurm_stderr;
+        save_result_output(results_dir, res, full_out);
+    }
     clear_pending_job(th_dir, test.name);
 
     std::string badge = res.failed > 0
