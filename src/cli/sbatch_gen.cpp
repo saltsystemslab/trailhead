@@ -54,6 +54,21 @@ static std::string remote_path_from_rsync_dest(const std::string& rsync_dest) {
     return rsync_dest.substr(colon + 1);
 }
 
+// Resolve the remote working directory for a script.
+// Prefers the build config's rsync_dest; falls back to the node profile's rsync_dest.
+static std::string resolve_effective_root(const std::string& bc_rsync_dest,
+                                           const std::string& node_rsync_dest,
+                                           const std::string& fallback)
+{
+    for (const auto& d : {bc_rsync_dest, node_rsync_dest}) {
+        if (!d.empty()) {
+            auto rp = remote_path_from_rsync_dest(d);
+            if (!rp.empty()) return rp;
+        }
+    }
+    return fallback;
+}
+
 // Replace all occurrences of `from` with `to` in `s`
 static std::string str_replace_all(std::string s,
                                     const std::string& from,
@@ -159,32 +174,28 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             std::string build_dir     = "build";
             std::string configure_cmd;
             std::string effective_root = opts.project_root;
+            std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
             if (!t.build_name.empty()) {
                 auto bit = reg.builds.find(t.build_name);
                 if (bit != reg.builds.end()) {
                     if (!bit->second.dir.empty()) build_dir = bit->second.dir;
                     configure_cmd = bit->second.configure_cmd;
-                    // Use the remote path as the working directory in the script
-                    if (!bit->second.rsync_dest.empty()) {
-                        std::string rp = remote_path_from_rsync_dest(bit->second.rsync_dest);
-                        if (!rp.empty()) effective_root = rp;
-                    }
+                    effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
+                                                            opts.project_root);
                 }
             }
             // Node-specific build dir overrides the build config's dir
             if (node_ptr && !node_ptr->build_dir.empty())
                 build_dir = node_ptr->build_dir;
 
-            // No linked build config — fall back to any registered build config that has
-            // a configure_cmd so the build directory is created before the test runs.
+            // No linked build config — fall back to any registered build config
             if (configure_cmd.empty()) {
                 for (const auto& [bname, bc] : reg.builds) {
                     if (!bc.configure_cmd.empty()) {
                         configure_cmd = bc.configure_cmd;
-                        if (effective_root == opts.project_root && !bc.rsync_dest.empty()) {
-                            std::string rp = remote_path_from_rsync_dest(bc.rsync_dest);
-                            if (!rp.empty()) effective_root = rp;
-                        }
+                        if (effective_root == opts.project_root)
+                            effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
+                                                                    opts.project_root);
                         break;
                     }
                 }
@@ -220,6 +231,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
         std::string build_dir = "build";
         std::string configure_cmd;
         std::string effective_root = opts.project_root;
+        std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
         if (node_ptr && !node_ptr->build_dir.empty())
             build_dir = node_ptr->build_dir;
         // Pick configure_cmd and remote root from whichever build config is referenced first
@@ -228,10 +240,8 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                 auto bit = reg.builds.find(t.build_name);
                 if (bit != reg.builds.end()) {
                     configure_cmd = bit->second.configure_cmd;
-                    if (!bit->second.rsync_dest.empty()) {
-                        std::string rp = remote_path_from_rsync_dest(bit->second.rsync_dest);
-                        if (!rp.empty()) effective_root = rp;
-                    }
+                    effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
+                                                            opts.project_root);
                     break;
                 }
             }
@@ -241,10 +251,9 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             for (const auto& [bname, bc] : reg.builds) {
                 if (!bc.configure_cmd.empty()) {
                     configure_cmd = bc.configure_cmd;
-                    if (effective_root == opts.project_root && !bc.rsync_dest.empty()) {
-                        std::string rp = remote_path_from_rsync_dest(bc.rsync_dest);
-                        if (!rp.empty()) effective_root = rp;
-                    }
+                    if (effective_root == opts.project_root)
+                        effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
+                                                                opts.project_root);
                     break;
                 }
             }
@@ -298,15 +307,14 @@ std::string generate_test_script(const TestEntry& test,
     std::string build_dir     = "build";
     std::string configure_cmd;
     std::string effective_root = opts.project_root;
+    std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
     if (!test.build_name.empty()) {
         auto bit = reg.builds.find(test.build_name);
         if (bit != reg.builds.end()) {
             if (!bit->second.dir.empty()) build_dir = bit->second.dir;
             configure_cmd = bit->second.configure_cmd;
-            if (!bit->second.rsync_dest.empty()) {
-                std::string rp = remote_path_from_rsync_dest(bit->second.rsync_dest);
-                if (!rp.empty()) effective_root = rp;
-            }
+            effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
+                                                    opts.project_root);
         }
     }
     if (node_ptr && !node_ptr->build_dir.empty())
@@ -315,10 +323,9 @@ std::string generate_test_script(const TestEntry& test,
         for (const auto& [bname, bc] : reg.builds) {
             if (!bc.configure_cmd.empty()) {
                 configure_cmd = bc.configure_cmd;
-                if (effective_root == opts.project_root && !bc.rsync_dest.empty()) {
-                    std::string rp = remote_path_from_rsync_dest(bc.rsync_dest);
-                    if (!rp.empty()) effective_root = rp;
-                }
+                if (effective_root == opts.project_root)
+                    effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
+                                                            opts.project_root);
                 break;
             }
         }

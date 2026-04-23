@@ -580,7 +580,8 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     int cpus = 1;
     try { cpus = std::stoi(cpus_str); } catch (...) {}
 
-    std::string time_str = read_line("Time limit", "01:00:00");
+    std::string time_str  = read_line("Time limit", "01:00:00");
+    std::string rsync_dest = read_line("Remote rsync destination (user@host:/path, blank = local only)");
 
     enter_raw_mode();
 
@@ -591,6 +592,7 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     np.nodelist      = nodelist;
     np.cpus_per_task = cpus;
     np.time          = time_str;
+    np.rsync_dest    = rsync_dest;
 
     reg.nodes[name] = np;
     save_registry(th_dir, reg);
@@ -637,11 +639,12 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
     if (ttype == 2)      gpu_type = read_line("GPU model", np.gpu_type);
     else if (ttype == 3) nodelist = read_line("Node list", np.nodelist);
 
-    std::string cpus_str = read_line("CPUs per task", std::to_string(np.cpus_per_task));
+    std::string cpus_str  = read_line("CPUs per task", std::to_string(np.cpus_per_task));
     int cpus = np.cpus_per_task;
     try { cpus = std::stoi(cpus_str); } catch (...) {}
 
-    std::string time_str = read_line("Time limit", np.time);
+    std::string time_str   = read_line("Time limit", np.time);
+    std::string rsync_dest = read_line("Remote rsync destination (user@host:/path)", np.rsync_dest);
 
     enter_raw_mode();
 
@@ -652,6 +655,7 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
     np.nodelist      = (ttype == 3) ? nodelist : "";
     np.cpus_per_task = cpus;
     np.time          = time_str;
+    np.rsync_dest    = rsync_dest;
     reg.nodes[name]  = np;
 
     save_registry(th_dir, reg);
@@ -700,6 +704,7 @@ static std::string wizard_select_hardware(Registry& reg,
                     if      (!n.gpu_type.empty())  std::cout << ", gpu:" << n.gpu_type;
                     else if (!n.nodelist.empty())   std::cout << ", node:" << n.nodelist;
                     else                            std::cout << ", CPU-only";
+                    if (!n.rsync_dest.empty())      std::cout << ", " << n.rsync_dest;
                     std::cout << ")" << RESET;
                 }
             }
@@ -1118,6 +1123,67 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
         return false;
     }
 
+    // ── Step 3: hardware requirement (pre-filled) ────────────────────────
+    std::string requires_hw = test.requires_hw;
+    {
+        using namespace ansi;
+        std::cout << CLEAR;
+        std::cout << BOLD << "TRAILHEAD" << RESET << " — Hardware requirement\n";
+        std::cout << hline(50) << "\n\n";
+        std::cout << "  [1] Any" << (requires_hw.empty() || requires_hw == "any" ? "  ← current" : "") << "\n";
+        std::cout << "  [2] GPU required" << (requires_hw == "gpu" ? "  ← current" : "") << "\n";
+        std::cout << "  [3] CPU only"     << (requires_hw == "cpu" ? "  ← current" : "") << "\n\n";
+        std::cout << hline(50) << "\n";
+        std::cout << DIM << "[1/2/3] change  [ESC/enter] keep current" << RESET << "\n";
+        std::cout.flush();
+        int k = read_key(30000);
+        if      (k == '1') requires_hw = "";
+        else if (k == '2') requires_hw = "gpu";
+        else if (k == '3') requires_hw = "cpu";
+        // else: keep existing value
+    }
+
+    // ── Step 4: build config (pre-filled, [n] creates new) ───────────────
+    std::string selected_build = wizard_select_build(*work_reg, eff_th_dir);
+    // Empty string from wizard means "(none)" was chosen, not cancelled.
+    // Re-apply existing build_name if user just pressed ESC (q).
+    // Since wizard returns "" for both cancel and (none), we keep whatever was chosen.
+
+    // ── Step 5: cmake target (only when build selected, pre-filled) ──────
+    std::string target = test.target;
+    if (!selected_build.empty()) {
+        restore_terminal();
+        std::cout << ansi::CLEAR;
+        std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — CMake target\n\n";
+        std::string def_target = target.empty() ? name : target;
+        std::cout << "  cmake --build <dir> --target [" << def_target << "]: ";
+        std::cout.flush();
+        std::string t_in;
+        std::getline(std::cin, t_in);
+        while (!t_in.empty() && t_in.front() == ' ') t_in.erase(t_in.begin());
+        while (!t_in.empty() && t_in.back()  == ' ') t_in.pop_back();
+        target = t_in.empty() ? def_target : t_in;
+        enter_raw_mode();
+    } else {
+        target = "";
+    }
+
+    // ── Step 6: working directory (pre-filled) ────────────────────────────
+    std::string workdir = test.workdir;
+    {
+        restore_terminal();
+        std::cout << ansi::CLEAR;
+        std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Working directory\n\n";
+        std::cout << "  Run test from directory [" << (workdir.empty() ? "." : workdir) << "]: ";
+        std::cout.flush();
+        std::string wd_in;
+        std::getline(std::cin, wd_in);
+        while (!wd_in.empty() && wd_in.front() == ' ') wd_in.erase(wd_in.begin());
+        while (!wd_in.empty() && wd_in.back()  == ' ') wd_in.pop_back();
+        if (!wd_in.empty()) workdir = wd_in;
+        enter_raw_mode();
+    }
+
     // Remove old sbatch file if name changed
     if (name != test.name) {
         std::string old_sbatch = eff_th_dir + "/sbatch/" + test.name + ".sbatch";
@@ -1125,8 +1191,12 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
     }
 
     // ── Update entry and save ─────────────────────────────────────────────
-    test.name = name;
-    test.cmd  = cmd;
+    test.name        = name;
+    test.cmd         = cmd;
+    test.requires_hw = requires_hw;
+    test.build_name  = selected_build;
+    test.target      = target;
+    test.workdir     = workdir;
 
     save_registry(eff_th_dir, *work_reg);
     SbatchOptions opts;

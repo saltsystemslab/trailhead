@@ -45,6 +45,10 @@ struct NodeProfile {
     int cpus_per_task = 1;
     std::string time  = "01:00:00";
     std::string account;
+    // Remote rsync destination for this node (user@host:/path).
+    // When set, trailhead rsyncs the project here before submitting sbatch jobs.
+    // Takes precedence over any rsync_dest set on BuildConfig.
+    std::string rsync_dest;
     // Per-node build directory. cmake auto-detects GPU arch when run on the node,
     // so each node type needs its own build dir to avoid clobbering each other.
     // If empty, falls back to the build config's dir ("build").
@@ -134,9 +138,10 @@ inline NodeProfile node_from_json(const std::string& name, const JsonValue& v) {
     n.cpus_per_task= (int)v.get_int("cpus_per_task", 1);
     n.time         = v.get_str("time", "01:00:00");
     n.account      = v.get_str("account");
+    n.rsync_dest   = v.get_str("rsync_dest");
     n.build_dir    = v.get_str("build_dir");
     static const std::vector<std::string> known = {
-        "partition","nodelist","gpu_type","nodes","ntasks","cpus_per_task","time","account","build_dir"
+        "partition","nodelist","gpu_type","nodes","ntasks","cpus_per_task","time","account","rsync_dest","build_dir"
     };
     if (v.is_object()) {
         for (const auto& [k, val] : v.as_object()) {
@@ -161,8 +166,9 @@ inline JsonValue node_to_json(const NodeProfile& n) {
     if (n.ntasks > 1)        obj.push_back({"ntasks",        JsonValue((int64_t)n.ntasks)});
     if (n.cpus_per_task > 1) obj.push_back({"cpus_per_task", JsonValue((int64_t)n.cpus_per_task)});
     add("time",      n.time);
-    add("account",   n.account);
-    add("build_dir", n.build_dir);
+    add("account",    n.account);
+    add("rsync_dest", n.rsync_dest);
+    add("build_dir",  n.build_dir);
     for (const auto& [k, v] : n.extra) add(k, v);
     return JsonValue(std::move(obj));
 }

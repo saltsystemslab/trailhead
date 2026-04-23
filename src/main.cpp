@@ -125,12 +125,16 @@ static int cmd_node(int argc, char** argv) {
                      "                      [--gpu-type <model>]   # OR pick GPU model (e.g. h200)\n"
                      "                      [--cpus <n>] [--time <HH:MM:SS>]\n"
                      "                      [--nodes <n>] [--ntasks <n>] [--account <a>]\n"
+                     "                      [--rsync-dest user@host:/path]\n"
                      "  trailhead node list\n"
                      "  trailhead node remove <name>\n"
                      "\n"
                      "  --nodelist and --gpu-type are mutually exclusive:\n"
                      "    --nodelist d4067          → pins node, adds --gres=gpu:1\n"
-                     "    --gpu-type h200           → requests model, adds --gres=gpu:h200\n";
+                     "    --gpu-type h200           → requests model, adds --gres=gpu:h200\n"
+                     "\n"
+                     "  --rsync-dest sets the remote destination for syncing code before sbatch.\n"
+                     "    rsync_dest on the node profile takes precedence over build config rsync_dest.\n";
         return 0;
     }
     std::string action(argv[2]);
@@ -148,9 +152,8 @@ static int cmd_node(int argc, char** argv) {
 
         using namespace trailhead::ansi;
         std::cout << BOLD << pad("NAME", (int)max_name+2)
-                  << " PARTITION          TARGET              CPUS  TIME\n" << RESET;
+                  << " PARTITION          TARGET              CPUS  TIME        RSYNC DEST\n" << RESET;
         for (const auto& [name, np] : reg.nodes) {
-            // Show either gpu_type or nodelist as the hardware target
             std::string target = !np.gpu_type.empty()
                 ? ("gpu:" + np.gpu_type)
                 : (!np.nodelist.empty() ? ("node:" + np.nodelist) : "-");
@@ -158,7 +161,8 @@ static int cmd_node(int argc, char** argv) {
                       << " " << pad(np.partition, 18)
                       << " " << pad(target, 18)
                       << " " << pad(std::to_string(np.cpus_per_task), 5)
-                      << " " << np.time << "\n";
+                      << " " << pad(np.time, 11)
+                      << " " << np.rsync_dest << "\n";
         }
         return 0;
     }
@@ -179,6 +183,7 @@ static int cmd_node(int argc, char** argv) {
         np.cpus_per_task= args.get_int("cpus", 1);
         np.time         = args.get("time", "01:00:00");
         np.account      = args.get("account");
+        np.rsync_dest   = args.get("rsync-dest");
 
         if (!np.nodelist.empty() && !np.gpu_type.empty()) {
             std::cerr << "Error: specify --nodelist OR --gpu-type, not both.\n";
@@ -821,12 +826,20 @@ static int cmd_watch(int argc, char** argv) {
     // Merge tests from declared sub-registries
     if (root_opt) trailhead::merge_sub_registries(reg, *root_opt);
 
-    // Check whether any build config has an rsync_dest configured
+    // Check node profiles then build configs for rsync_dest (node takes precedence)
     std::optional<trailhead::RemoteDest> remote_dest;
-    for (const auto& [bname, bc] : reg.builds) {
-        if (!bc.rsync_dest.empty()) {
-            auto d = trailhead::parse_rsync_dest(bc.rsync_dest);
+    for (const auto& [nname, np] : reg.nodes) {
+        if (!np.rsync_dest.empty()) {
+            auto d = trailhead::parse_rsync_dest(np.rsync_dest);
             if (d) { remote_dest = d; break; }
+        }
+    }
+    if (!remote_dest) {
+        for (const auto& [bname, bc] : reg.builds) {
+            if (!bc.rsync_dest.empty()) {
+                auto d = trailhead::parse_rsync_dest(bc.rsync_dest);
+                if (d) { remote_dest = d; break; }
+            }
         }
     }
 
