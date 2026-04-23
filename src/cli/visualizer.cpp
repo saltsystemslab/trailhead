@@ -793,23 +793,103 @@ static std::string wizard_select_build(const Registry& reg) {
     }
 }
 
-// Multi-select node picker. Returns selected node names; empty = cancelled.
-// Orchestrates the wizard: name → editor → build select → save.
+// ── Sub-registry helpers ───────────────────────────────────────────────────
+
+// Last path component of a sub_dir path (e.g. "a/b/c" → "c").
+static std::string sub_name_from_dir(const std::string& sub_dir) {
+    auto slash = sub_dir.rfind('/');
+    return (slash != std::string::npos) ? sub_dir.substr(slash + 1) : sub_dir;
+}
+
+// Strip "subname/" prefix from a merged test name to recover the original name.
+static std::string strip_sub_prefix(const std::string& name, const std::string& sub_dir) {
+    std::string prefix = sub_name_from_dir(sub_dir) + "/";
+    if (name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix)
+        return name.substr(prefix.size());
+    return name;
+}
+
+// Reload the parent registry and re-merge sub-registries into reg.
+static void reload_merged(Registry& reg, const std::string& th_dir,
+                           const std::string& project_root)
+{
+    auto fresh = load_registry(th_dir);
+    if (fresh) {
+        reg = *fresh;
+        merge_sub_registries(reg, project_root);
+    }
+}
+
+// ── Add-task wizard ───────────────────────────────────────────────────────
+
+// Orchestrates the wizard: destination → name → editor → hw → build → target → workdir → save.
 // Leaves the terminal in raw+cursor-hidden state when it returns.
 static bool run_add_wizard(Registry& reg,
                             const std::string& th_dir,
                             const std::string& project_root)
 {
+    // ── Step 0: destination (only shown when sub-registries are declared) ─
+    std::string dest_sub_dir;   // "" = parent, "gunrock" = sub-registry
+    std::string eff_th_dir       = th_dir;
+    std::string eff_project_root = project_root;
+    Registry sub_reg_storage;
+    Registry* dest_reg = &reg;  // points to the registry we'll add into
+
+    if (!reg.sub_registries.empty()) {
+        // Build list: "(this project)" first, then each sub-registry
+        std::vector<std::string> choices;
+        choices.push_back("");  // "" = parent
+        for (const auto& s : reg.sub_registries) choices.push_back(s);
+
+        int cursor = 0;
+        bool cancelled = false;
+        while (true) {
+            using namespace ansi;
+            std::cout << CLEAR;
+            std::cout << BOLD << "TRAILHEAD" << RESET << " — Add to which registry?\n";
+            std::cout << hline(50) << "\n\n";
+            for (int i = 0; i < (int)choices.size(); ++i) {
+                if (i == cursor) std::cout << CYAN << BOLD;
+                std::cout << (i == cursor ? " > " : "   ");
+                std::cout << (choices[i].empty() ? "(this project)" : choices[i]);
+                if (i == cursor) std::cout << RESET;
+                std::cout << "\n";
+            }
+            std::cout << "\n" << hline(50) << "\n";
+            std::cout << DIM << "[↑/k] up  [↓/j] down  [enter] select  [ESC] cancel"
+                      << RESET << "\n";
+            std::cout.flush();
+
+            int k = read_key(30000);
+            if (k == 27 || k == 'q') { cancelled = true; break; }
+            if (k == '\r' || k == '\n') { dest_sub_dir = choices[cursor]; break; }
+            if ((k == 1000 || k == 'k') && cursor > 0) --cursor;
+            if ((k == 1001 || k == 'j') && cursor + 1 < (int)choices.size()) ++cursor;
+        }
+        if (cancelled) { enter_raw_mode(); return false; }
+
+        if (!dest_sub_dir.empty()) {
+            eff_th_dir       = project_root + "/" + dest_sub_dir + "/.trailhead";
+            eff_project_root = project_root + "/" + dest_sub_dir;
+            auto loaded = load_registry(eff_th_dir);
+            if (!loaded) { enter_raw_mode(); return false; }
+            sub_reg_storage = *loaded;
+            dest_reg = &sub_reg_storage;
+        }
+    }
+
     // ── Step 1: name ─────────────────────────────────────────────────────
-    restore_terminal(); // restore canonical mode + echo for normal text input
+    restore_terminal();
     std::cout << ansi::CLEAR;
-    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Add task\n\n";
+    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Add task";
+    if (!dest_sub_dir.empty())
+        std::cout << ansi::DIM << "  → " << dest_sub_dir << ansi::RESET;
+    std::cout << "\n\n";
     std::cout << "  Task name: ";
     std::cout.flush();
 
     std::string name;
     std::getline(std::cin, name);
-    // Trim and sanitize
     while (!name.empty() && name.front() == ' ') name.erase(name.begin());
     while (!name.empty() && name.back()  == ' ') name.pop_back();
     for (auto& c : name) if (c == ' ') c = '_';
@@ -849,60 +929,69 @@ static bool run_add_wizard(Registry& reg,
         int k = read_key(30000);
         if (k == '2') requires_hw = "gpu";
         else if (k == '3') requires_hw = "cpu";
-        // else: empty = any
     }
 
-    // ── Step 4: build config (optional) ──────────────────────────────────
+    // ── Step 4: build config (from destination registry) ─────────────────
     std::string selected_build;
-    if (!reg.builds.empty())
-        selected_build = wizard_select_build(reg);
+    if (!dest_reg->builds.empty())
+        selected_build = wizard_select_build(*dest_reg);
 
-    // ── Step 5: create entry and save ────────────────────────────────────
-    reg.tests.erase(std::remove_if(reg.tests.begin(), reg.tests.end(),
+    // ── Step 5: cmake target (only when a build is selected) ─────────────
+    std::string target;
+    if (!selected_build.empty()) {
+        restore_terminal();
+        std::cout << ansi::CLEAR;
+        std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — CMake target\n\n";
+        std::cout << "  cmake --build <dir> --target [" << name << "]: ";
+        std::cout.flush();
+        std::string t_in;
+        std::getline(std::cin, t_in);
+        while (!t_in.empty() && t_in.front() == ' ') t_in.erase(t_in.begin());
+        while (!t_in.empty() && t_in.back()  == ' ') t_in.pop_back();
+        target = t_in.empty() ? name : t_in;
+        enter_raw_mode();
+    }
+
+    // ── Step 6: working directory ─────────────────────────────────────────
+    std::string workdir = ".";
+    {
+        restore_terminal();
+        std::cout << ansi::CLEAR;
+        std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Working directory\n\n";
+        std::cout << "  Run test from directory [.]: ";
+        std::cout.flush();
+        std::string wd_in;
+        std::getline(std::cin, wd_in);
+        while (!wd_in.empty() && wd_in.front() == ' ') wd_in.erase(wd_in.begin());
+        while (!wd_in.empty() && wd_in.back()  == ' ') wd_in.pop_back();
+        if (!wd_in.empty()) workdir = wd_in;
+        enter_raw_mode();
+    }
+
+    // ── Step 7: create entry and save ─────────────────────────────────────
+    dest_reg->tests.erase(std::remove_if(dest_reg->tests.begin(), dest_reg->tests.end(),
         [&](const TestEntry& t){ return t.name == name; }),
-        reg.tests.end());
+        dest_reg->tests.end());
 
     TestEntry t;
     t.name        = name;
     t.cmd         = cmd;
     t.build_name  = selected_build;
     t.requires_hw = requires_hw;
-    reg.tests.push_back(t);
+    t.target      = target;
+    t.workdir     = workdir;
+    dest_reg->tests.push_back(t);
 
-    save_registry(th_dir, reg);
+    save_registry(eff_th_dir, *dest_reg);
     SbatchOptions opts;
     opts.split        = true;
-    opts.project_root = project_root;
-    write_sbatch(th_dir, reg, opts);
+    opts.project_root = eff_project_root;
+    write_sbatch(eff_th_dir, *dest_reg, opts);
+
+    if (!dest_sub_dir.empty())
+        reload_merged(reg, th_dir, project_root);
 
     return true;
-}
-
-// ── Sub-registry helpers ───────────────────────────────────────────────────
-
-// Last path component of a sub_dir path (e.g. "a/b/c" → "c").
-static std::string sub_name_from_dir(const std::string& sub_dir) {
-    auto slash = sub_dir.rfind('/');
-    return (slash != std::string::npos) ? sub_dir.substr(slash + 1) : sub_dir;
-}
-
-// Strip "subname/" prefix from a merged test name to recover the original name.
-static std::string strip_sub_prefix(const std::string& name, const std::string& sub_dir) {
-    std::string prefix = sub_name_from_dir(sub_dir) + "/";
-    if (name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix)
-        return name.substr(prefix.size());
-    return name;
-}
-
-// Reload the parent registry and re-merge sub-registries into reg.
-static void reload_merged(Registry& reg, const std::string& th_dir,
-                           const std::string& project_root)
-{
-    auto fresh = load_registry(th_dir);
-    if (fresh) {
-        reg = *fresh;
-        merge_sub_registries(reg, project_root);
-    }
 }
 
 // ── Edit-task wizard ──────────────────────────────────────────────────────
