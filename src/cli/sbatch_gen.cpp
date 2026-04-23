@@ -143,8 +143,19 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
         }
         // Substitute build dir in the run cmd (e.g. "build/tests/foo" → "build_h200/tests/foo")
         std::string cmd = str_replace_all(t->cmd, "build/", build_dir + "/");
-        if (!t->workdir.empty() && t->workdir != ".") {
-            o << "(\n  cd " << t->workdir << "\n" << cmd << "\n)\n\n";
+
+        // When workdir is default and a build is linked, run from inside the build directory.
+        // Strip any "build_dir/" prefix from cmd since we're already there.
+        std::string effective_wd = t->workdir;
+        if ((effective_wd.empty() || effective_wd == ".") && !build_dir.empty() && !t->build_name.empty()) {
+            effective_wd = build_dir;
+            const std::string prefix = build_dir + "/";
+            if (cmd.rfind(prefix, 0) == 0)
+                cmd = "./" + cmd.substr(prefix.size());
+        }
+
+        if (!effective_wd.empty() && effective_wd != ".") {
+            o << "(\n  cd " << effective_wd << "\n  " << cmd << "\n)\n\n";
         } else {
             o << cmd << "\n\n";
         }

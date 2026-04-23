@@ -178,17 +178,30 @@ void LocalRunner::run_task(Task& task) {
     int64_t t_start = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    // Resolve working directory: project_root / workdir
+    // Resolve working directory and run command.
+    // When workdir is default (".") and a build is linked, run from inside the build
+    // directory so that ./bin/... paths resolve correctly.
     std::string workdir = project_root_;
-    if (!t.workdir.empty() && t.workdir != ".")
+    std::string run_cmd = t.cmd;
+    if (!t.workdir.empty() && t.workdir != ".") {
         workdir = project_root_ + "/" + t.workdir;
+    } else if (!t.build_name.empty() && task.build_config) {
+        const auto& bc = *task.build_config;
+        std::string raw_dir = bc.dir.empty() ? "build" : bc.dir;
+        std::string eff_dir = bc.sub_dir.empty() ? raw_dir : bc.sub_dir + "/" + raw_dir;
+        workdir = project_root_ + "/" + eff_dir;
+        // Strip "raw_dir/" prefix from cmd if present (andes-benchmarks style)
+        const std::string prefix = raw_dir + "/";
+        if (run_cmd.rfind(prefix, 0) == 0)
+            run_cmd = "./" + run_cmd.substr(prefix.size());
+    }
 
     // Stream stdout lines to the log panel live
     auto on_line = [&](const std::string& line) {
         if (log && !line.empty()) log(line);
     };
 
-    auto r = proc::run(t.cmd, {}, {}, t.timeout_sec, workdir, on_line, /*use_shell=*/true);
+    auto r = proc::run(run_cmd, {}, {}, t.timeout_sec, workdir, on_line, /*use_shell=*/true);
 
     int64_t t_end = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
