@@ -18,6 +18,14 @@ bool has_local_gpu();
 // Returns the paths that were actually removed.
 std::vector<std::string> wipe_build_dirs(const Registry& reg, const std::string& project_root);
 
+// Build all unique cmake targets required by tests, in parallel across independent build dirs.
+// Outputs progress via log_fn. Returns names of any targets that failed to build.
+std::vector<std::string> pre_build_all(
+    const std::vector<TestEntry>& tests,
+    const Registry& reg,
+    const std::string& project_root,
+    std::function<void(const std::string&)> log_fn);
+
 // Runs tests sequentially on the local machine.
 // One task runs at a time; others wait in the queue.
 class LocalRunner {

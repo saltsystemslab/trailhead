@@ -5,7 +5,10 @@
 #include "../util/process.hpp"
 #include <sstream>
 #include <deque>
+#include <map>
 #include <set>
+#include <thread>
+#include <mutex>
 #include <chrono>
 
 namespace trailhead {
@@ -36,6 +39,160 @@ std::vector<std::string> wipe_build_dirs(const Registry& reg, const std::string&
         }
     }
     return removed;
+}
+
+// ── Shared build helpers ──────────────────────────────────────────────────
+
+// Returns CUDA arch digits (e.g. "120"), or "" if detection failed.
+static std::string detect_cuda_arch() {
+    for (const char* qcmd : {
+            "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once",
+            "nvidia-smi --query-gpu=compute_cap --format=csv,noheader"}) {
+        auto r = proc::run(qcmd, {}, {}, 5, "", nullptr, false);
+        if (r.exit_code == 0 && !r.stdout_str.empty()) {
+            std::string arch;
+            for (char c : r.stdout_str) {
+                if (c >= '0' && c <= '9') arch += c;
+                else if (c == '\n' || c == '\r') break;
+            }
+            if (!arch.empty()) return arch;
+        }
+    }
+    // Fallback: parse "Compute Capability : X.Y" from nvidia-smi -q
+    auto r = proc::run("nvidia-smi -q", {}, {}, 5, "", nullptr, false);
+    if (r.exit_code == 0) {
+        const std::string needle = "Compute Capability";
+        auto p = r.stdout_str.find(needle);
+        if (p != std::string::npos) {
+            p = r.stdout_str.find(':', p);
+            if (p != std::string::npos) {
+                std::string arch;
+                for (++p; p < r.stdout_str.size(); ++p) {
+                    char c = r.stdout_str[p];
+                    if (c >= '0' && c <= '9') arch += c;
+                    else if (c == '.') continue;
+                    else if (!arch.empty()) break;
+                }
+                return arch;
+            }
+        }
+    }
+    return "";
+}
+
+// Configure + build a single cmake target. Returns true on success.
+// log_fn/log_mtx: log_mtx may be null (single-threaded callers).
+static bool build_one_target(
+    const BuildConfig& bc,
+    const std::string& target,
+    const std::string& project_root,
+    const std::function<void(const std::string&)>& log_fn,
+    std::mutex* log_mtx = nullptr)
+{
+    auto safe_log = [&](const std::string& msg) {
+        if (!log_fn || msg.empty()) return;
+        if (log_mtx) { std::lock_guard<std::mutex> lk(*log_mtx); log_fn(msg); }
+        else log_fn(msg);
+    };
+
+    std::string raw_dir   = bc.dir.empty() ? "build" : bc.dir;
+    std::string eff_dir   = bc.sub_dir.empty() ? raw_dir : bc.sub_dir + "/" + raw_dir;
+    std::string base_wd   = bc.sub_dir.empty() ? project_root : project_root + "/" + bc.sub_dir;
+    std::string bd        = project_root + "/" + eff_dir;
+
+    bool needs_configure = !bc.configure_cmd.empty() &&
+        !fs::exists(bd + "/Makefile") && !fs::exists(bd + "/build.ninja");
+    if (needs_configure) {
+        std::string configure_cmd = bc.configure_cmd;
+        if (configure_cmd.find("{{arch}}") != std::string::npos) {
+            std::string arch = detect_cuda_arch();
+            if (arch.empty()) {
+                safe_log("arch detection failed: nvidia-smi returned no compute capability");
+                return false;
+            }
+            size_t pos = 0;
+            while ((pos = configure_cmd.find("{{arch}}", pos)) != std::string::npos) {
+                configure_cmd.replace(pos, 8, arch);
+                pos += arch.size();
+            }
+        }
+        bool from_build_dir = configure_cmd.size() >= 3 &&
+                              configure_cmd.substr(configure_cmd.size() - 3) == " ..";
+        std::string conf_wd = from_build_dir ? base_wd + "/" + raw_dir : base_wd;
+        if (from_build_dir) fs::mkdir_p(conf_wd);
+
+        safe_log("configuring: " + configure_cmd);
+        auto cr = proc::run(configure_cmd, {}, {}, 300, conf_wd, [&](const std::string& line) {
+            safe_log(line);
+        }, true);
+        if (cr.exit_code != 0) {
+            if (!cr.stderr_str.empty()) safe_log(cr.stderr_str);
+            safe_log("configure failed (exit=" + std::to_string(cr.exit_code) + ")");
+            return false;
+        }
+    }
+
+    std::string build_cmd = "cmake --build " + eff_dir + " --target " + target;
+    safe_log("building: " + build_cmd);
+    auto br = proc::run(build_cmd, {}, {}, 300, project_root, [&](const std::string& line) {
+        safe_log(line);
+    }, true);
+    if (br.exit_code != 0) {
+        if (!br.stderr_str.empty()) safe_log(br.stderr_str);
+        safe_log("build failed (exit=" + std::to_string(br.exit_code) + ")");
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::string> pre_build_all(
+    const std::vector<TestEntry>& tests,
+    const Registry& reg,
+    const std::string& project_root,
+    std::function<void(const std::string&)> log_fn)
+{
+    // Collect unique (build_name, target) pairs and group by effective build dir.
+    // Targets in different build dirs are independent and can build in parallel.
+    struct BuildJob { std::string build_name, target; };
+    std::set<std::string> seen;
+    std::map<std::string, std::vector<BuildJob>> by_dir;
+
+    for (const auto& t : tests) {
+        if (t.build_name.empty() || t.target.empty()) continue;
+        auto it = reg.builds.find(t.build_name);
+        if (it == reg.builds.end()) continue;
+        std::string key = t.build_name + ":" + t.target;
+        if (!seen.insert(key).second) continue;
+        const auto& bc = it->second;
+        std::string raw = bc.dir.empty() ? "build" : bc.dir;
+        std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
+        by_dir[eff].push_back({t.build_name, t.target});
+    }
+
+    if (by_dir.empty()) return {};
+    if (log_fn) log_fn("pre-build: " + std::to_string(seen.size()) + " target(s) across "
+                       + std::to_string(by_dir.size()) + " build dir(s)");
+
+    std::vector<std::string> failed;
+    std::mutex result_mtx;
+    std::vector<std::thread> threads;
+
+    for (const auto& [dir, jobs] : by_dir) {
+        threads.emplace_back([&, jobs = jobs]() {
+            for (const auto& job : jobs) {
+                auto bc_it = reg.builds.find(job.build_name);
+                if (bc_it == reg.builds.end()) continue;
+                bool ok = build_one_target(bc_it->second, job.target, project_root,
+                                           log_fn, &result_mtx);
+                if (!ok) {
+                    std::lock_guard<std::mutex> lk(result_mtx);
+                    failed.push_back(job.build_name + ":" + job.target);
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    return failed;
 }
 
 // ── LocalRunner ───────────────────────────────────────────────────────────
@@ -105,157 +262,25 @@ void LocalRunner::run_task(Task& task) {
 
     // Per-test cmake configure (once) + target build
     if (!t.build_name.empty() && !t.target.empty() && task.build_config) {
-        {
-            const auto& bc = *task.build_config;
-            std::string raw_dir = bc.dir.empty() ? "build" : bc.dir;
-            // For sub-registry builds, paths are relative to the sub-registry root
-            std::string eff_build_dir = bc.sub_dir.empty()
-                ? raw_dir : bc.sub_dir + "/" + raw_dir;
-            std::string base_wd = bc.sub_dir.empty()
-                ? project_root_ : project_root_ + "/" + bc.sub_dir;
-
-            // Configure if build system file is absent (CMakeCache.txt alone isn't enough —
-            // a partial configure may leave it without a Makefile/build.ninja).
-            std::string bd = project_root_ + "/" + eff_build_dir;
-            bool needs_configure = !bc.configure_cmd.empty() &&
-                !fs::exists(bd + "/Makefile") && !fs::exists(bd + "/build.ninja");
-            if (needs_configure) {
-                std::string configure_cmd = bc.configure_cmd;
-
-                // Substitute {{arch}} with auto-detected local GPU compute capability
-                if (configure_cmd.find("{{arch}}") != std::string::npos) {
-                    std::string arch;
-                    // Try structured query (with and without 'once' for driver compatibility)
-                    for (const char* qcmd : {
-                            "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once",
-                            "nvidia-smi --query-gpu=compute_cap --format=csv,noheader"}) {
-                        auto ar = proc::run(qcmd, {}, {}, 5, "", nullptr, false);
-                        if (ar.exit_code == 0 && !ar.stdout_str.empty()) {
-                            for (char c : ar.stdout_str) {
-                                if (c >= '0' && c <= '9') arch += c;
-                                else if (c == '\n' || c == '\r') break;
-                            }
-                            if (!arch.empty()) break;
-                        }
-                    }
-                    // Fallback: parse "Compute Capability : X.Y" from nvidia-smi -q
-                    if (arch.empty()) {
-                        auto ar = proc::run("nvidia-smi -q", {}, {}, 5, "", nullptr, false);
-                        if (ar.exit_code == 0) {
-                            const std::string needle = "Compute Capability";
-                            auto p = ar.stdout_str.find(needle);
-                            if (p != std::string::npos) {
-                                p = ar.stdout_str.find(':', p);
-                                if (p != std::string::npos) {
-                                    for (++p; p < ar.stdout_str.size(); ++p) {
-                                        char c = ar.stdout_str[p];
-                                        if (c >= '0' && c <= '9') arch += c;
-                                        else if (c == '.') continue; // skip decimal in "12.0"
-                                        else if (!arch.empty()) break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if (arch.empty()) {
-                        if (log) log("arch detection failed: nvidia-smi returned no compute capability");
-                        int64_t ts = now_ms();
-                        TestResult res;
-                        res.name       = t.name;
-                        res.started_at = ts;
-                        res.ended_at   = ts;
-                        res.failed     = 1;
-                        res.exit_code  = 1;
-                        res.run_by     = "local";
-                        res.host       = "localhost";
-                        res.metadata["_output_tail"] = "arch detection failed: nvidia-smi returned no compute capability";
-                        std::string results_dir = th_dir_ + "/results";
-                        fs::mkdir_p(results_dir);
-                        save_result(results_dir, res);
-                        save_result_output(results_dir, res, res.metadata["_output_tail"]);
-                        if (set_status) set_status("");
-                        job_log_->active--;
-                        return;
-                    }
-                    size_t pos = 0;
-                    while ((pos = configure_cmd.find("{{arch}}", pos)) != std::string::npos) {
-                        configure_cmd.replace(pos, 8, arch);
-                        pos += arch.size();
-                    }
-                }
-
-                // cmake ".." form (run-from-build-dir) vs "-B build" form (run-from-source-root)
-                bool from_build_dir = configure_cmd.size() >= 3 &&
-                                      configure_cmd.substr(configure_cmd.size() - 3) == " ..";
-                std::string conf_wd;
-                if (from_build_dir) {
-                    conf_wd = base_wd + "/" + raw_dir;
-                    fs::mkdir_p(conf_wd);
-                } else {
-                    conf_wd = base_wd;
-                }
-
-                if (log) log("configuring: " + configure_cmd);
-                auto cr = proc::run(configure_cmd, {}, {}, 300, conf_wd, [&](const std::string& line) {
-                    if (log && !line.empty()) log(line);
-                }, true);
-                if (cr.exit_code != 0) {
-                    if (log) {
-                        if (!cr.stderr_str.empty()) log(cr.stderr_str);
-                        log("configure failed (exit=" + std::to_string(cr.exit_code) + ")");
-                    }
-                    int64_t ts = now_ms();
-                    TestResult res;
-                    res.name       = t.name;
-                    res.started_at = ts;
-                    res.ended_at   = ts;
-                    res.failed     = 1;
-                    res.exit_code  = cr.exit_code;
-                    res.run_by     = "local";
-                    res.host       = "localhost";
-                    std::string full = cr.stdout_str;
-                    if (!cr.stderr_str.empty()) full += "\n--- stderr ---\n" + cr.stderr_str;
-                    res.metadata["_output_tail"] = full;
-                    std::string results_dir = th_dir_ + "/results";
-                    fs::mkdir_p(results_dir);
-                    save_result(results_dir, res);
-                    save_result_output(results_dir, res, full);
-                    if (set_status) set_status("");
-                    job_log_->active--;
-                    return;
-                }
-            }
-
-            std::string build_cmd = "cmake --build " + eff_build_dir + " --target " + t.target;
-            if (log) log("building: " + build_cmd);
-            auto br = proc::run(build_cmd, {}, {}, 300, project_root_, [&](const std::string& line) {
-                if (log && !line.empty()) log(line);
-            }, true);
-            if (br.exit_code != 0) {
-                if (log) {
-                    if (!br.stderr_str.empty()) log(br.stderr_str);
-                    log("build failed (exit=" + std::to_string(br.exit_code) + ")");
-                }
-                int64_t ts = now_ms();
-                TestResult res;
-                res.name       = t.name;
-                res.started_at = ts;
-                res.ended_at   = ts;
-                res.failed     = 1;
-                res.exit_code  = br.exit_code;
-                res.run_by     = "local";
-                res.host       = "localhost";
-                std::string full = br.stdout_str;
-                if (!br.stderr_str.empty()) full += "\n--- stderr ---\n" + br.stderr_str;
-                res.metadata["_output_tail"] = full;
-                std::string results_dir = th_dir_ + "/results";
-                fs::mkdir_p(results_dir);
-                save_result(results_dir, res);
-                save_result_output(results_dir, res, full);
-                if (set_status) set_status("");
-                job_log_->active--;
-                return;
-            }
+        bool ok = build_one_target(*task.build_config, t.target, project_root_, log);
+        if (!ok) {
+            int64_t ts = now_ms();
+            TestResult res;
+            res.name       = t.name;
+            res.started_at = ts;
+            res.ended_at   = ts;
+            res.failed     = 1;
+            res.exit_code  = 1;
+            res.run_by     = "local";
+            res.host       = "localhost";
+            res.metadata["_output_tail"] = "build failed — see output above";
+            std::string results_dir = th_dir_ + "/results";
+            fs::mkdir_p(results_dir);
+            save_result(results_dir, res);
+            save_result_output(results_dir, res, res.metadata["_output_tail"]);
+            if (set_status) set_status("");
+            job_log_->active--;
+            return;
         }
     }
 

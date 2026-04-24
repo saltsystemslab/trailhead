@@ -1043,6 +1043,20 @@ static int cmd_watch(int argc, char** argv) {
 
     bool auto_run = args.flag("run-all");
     int repeat = args.get_int("repeat", 1);
+
+    // Pre-build all cmake targets before starting the TUI, so tests run immediately.
+    if (auto_run && local_runner) {
+        std::cout << "==> Pre-building cmake targets...\n";
+        std::cout.flush();
+        auto failed = trailhead::pre_build_all(reg.tests, reg, project_root,
+            [](const std::string& msg) { std::cout << "  " << msg << "\n"; std::cout.flush(); });
+        if (!failed.empty()) {
+            std::cout << "\nWarning: " << failed.size() << " target(s) failed to build:\n";
+            for (const auto& f : failed) std::cout << "  FAILED: " << f << "\n";
+        }
+        std::cout << "\n";
+    }
+
     return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, project_root, auto_run, repeat);
 }
 
