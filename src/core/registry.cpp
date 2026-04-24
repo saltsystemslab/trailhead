@@ -140,8 +140,9 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
             t.name     = sub_name + "/" + t.name;
             t.sub_dir  = sub_rel;
             if (!t.build_name.empty()) t.build_name = sub_name + "/" + t.build_name;
-            // workdir "." means "run from sub-root" for local execution
-            if (t.workdir == "." || t.workdir.empty()) t.workdir = sub_rel;
+            // Remap non-trivial workdirs to be relative to project root
+            if (!t.workdir.empty() && t.workdir != ".")
+                t.workdir = sub_rel + "/" + t.workdir;
             reg.tests.push_back(std::move(t));
         }
 

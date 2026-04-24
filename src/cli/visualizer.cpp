@@ -1707,21 +1707,41 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 if (selected_hw.empty() || selected_hw == "local") {
                     std::ostringstream ss;
                     ss << "#!/bin/bash\n# Local run — no sbatch\n\n";
-                    if (!t.build_name.empty() && !t.target.empty()) {
+                    std::string run_cmd = t.cmd;
+                    std::string run_wd;
+                    if (!t.build_name.empty()) {
                         auto bit = reg.builds.find(t.build_name);
                         if (bit != reg.builds.end()) {
                             const auto& bc = bit->second;
                             std::string raw = bc.dir.empty() ? "build" : bc.dir;
                             std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
-                            if (!bc.configure_cmd.empty())
-                                ss << "# configure (if CMakeCache.txt absent)\n"
-                                   << bc.configure_cmd << "\n\n";
-                            ss << "cmake --build " << eff << " --target " << t.target << "\n\n";
+                            if (!t.target.empty() && !bc.configure_cmd.empty()) {
+                                std::string cfg = bc.configure_cmd;
+                                auto ap = cfg.find("{{arch}}");
+                                if (ap != std::string::npos)
+                                    cfg.replace(ap, 8, "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once | head -1 | tr -d '.')");
+                                bool from_build = cfg.size() >= 3 && cfg.substr(cfg.size()-3) == " ..";
+                                ss << "# configure (if CMakeCache.txt absent)\n";
+                                if (from_build)
+                                    ss << "[ -f " << eff << "/CMakeCache.txt ] || "
+                                       << "(mkdir -p " << eff << " && cd " << eff << " && " << cfg << ")\n\n";
+                                else
+                                    ss << "[ -d " << eff << " ] || " << cfg << "\n\n";
+                            }
+                            if (!t.target.empty())
+                                ss << "cmake --build " << eff << " --target " << t.target << "\n\n";
+                            if (t.workdir.empty() || t.workdir == ".") {
+                                run_wd = eff;
+                                const std::string prefix = raw + "/";
+                                if (run_cmd.rfind(prefix, 0) == 0)
+                                    run_cmd = "./" + run_cmd.substr(prefix.size());
+                            }
                         }
                     }
-                    std::string wd = (t.workdir.empty() || t.workdir == ".") ? "" : t.workdir;
-                    if (!wd.empty()) ss << "cd " << wd << "\n";
-                    ss << t.cmd << "\n";
+                    if (run_wd.empty() && !t.workdir.empty() && t.workdir != ".")
+                        run_wd = t.workdir;
+                    if (!run_wd.empty()) ss << "cd " << run_wd << "\n";
+                    ss << run_cmd << "\n";
                     script = ss.str();
                 } else {
                     script = generate_test_script(t, selected_hw, reg, opts);
