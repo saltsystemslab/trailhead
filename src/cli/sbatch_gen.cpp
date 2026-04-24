@@ -100,24 +100,20 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
 {
     std::ostringstream o;
 
-    // Project-wide module loads (only when node has no preamble of its own)
-    if (node_preamble.empty()) {
+    if (!node_preamble.empty()) {
+        // Node preamble takes full control: skip project-level modules and preamble entirely.
+        // This avoids duplication when the sub-registry preamble overlaps with the node preamble.
+        for (const auto& line : node_preamble)
+            o << line << "\n";
+    } else {
+        // No node preamble: use project-level modules + preamble
         for (const auto& mod : defs.modules)
             o << "module load " << mod << "\n";
         if (!defs.modules.empty()) o << "\n";
-    }
-
-    // Project preamble (e.g. set -euo pipefail)
-    for (const auto& line : defs.preamble)
-        o << line << "\n";
-
-    // Per-node preamble: module loads, exports, etc. specific to this cluster/hardware
-    if (!node_preamble.empty()) {
-        if (!defs.preamble.empty()) o << "\n";
-        for (const auto& line : node_preamble)
+        for (const auto& line : defs.preamble)
             o << line << "\n";
     }
-    if (!defs.preamble.empty()) o << "\n";
+    o << "\n";
 
     // Set TRAILHEAD_JOB_ID so reporter.hpp labels results as sbatch-<id>
     o << "export TRAILHEAD_JOB_ID=$SLURM_JOB_ID\n";
