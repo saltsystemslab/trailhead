@@ -1020,7 +1020,6 @@ static std::string wizard_create_build(Registry& reg, const std::string& th_dir)
     std::string configure = read_line("Configure command", def_cfg);
     std::string def_bld   = "cmake --build " + dir + " -j$(nproc)";
     std::string build_cmd = read_line("Build command", def_bld);
-    std::string rsync     = read_line("Remote destination (user@host:/path, blank = local only)");
 
     enter_raw_mode();
 
@@ -1029,7 +1028,6 @@ static std::string wizard_create_build(Registry& reg, const std::string& th_dir)
     bc.dir           = dir;
     bc.configure_cmd = configure;
     bc.build_cmd     = build_cmd;
-    bc.rsync_dest    = rsync;
 
     reg.builds[name] = bc;
     save_registry(th_dir, reg);
@@ -1070,8 +1068,6 @@ static std::string wizard_select_build(Registry& reg, const std::string& th_dir)
                         const auto& bc = it->second;
                         if (!bc.configure_cmd.empty())
                             o << DIM << "  (" << bc.configure_cmd << ")" << RESET;
-                        if (!bc.rsync_dest.empty())
-                            o << DIM << "  \xe2\x86\x92 " << bc.rsync_dest << RESET;
                     }
                 }
                 if (i == cursor) o << RESET;
