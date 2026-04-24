@@ -65,6 +65,17 @@ static int read_key(int timeout_ms) {
     char buf[8] = {};
     ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
     if (r <= 0) return -1;
+
+    // If only ESC arrived, wait briefly for the rest of an arrow-key sequence.
+    // Over SSH, the 3 bytes of \x1b[A can arrive in separate reads.
+    if (r == 1 && buf[0] == 0x1b) {
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        tv.tv_sec = 0; tv.tv_usec = 50000; // 50 ms
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0)
+            r += read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
+    }
+
     if (r >= 3 && buf[0] == 0x1b && buf[1] == '[') {
         switch (buf[2]) {
             case 'A': return 1000; // Up
@@ -425,10 +436,16 @@ static void render_detail(const TestEntry& t, const TestResult* r,
         if (!out_lines.empty() || is_live) {
             int total_out = (int)out_lines.size();
 
-            // Rows available: terminal height minus header rows + footer (hline+keys)
-            // +1 blank + 1 "Output" header = 2 overhead
+            // Rows available: terminal height minus header rows, "Output" label (2),
+            // footer (2), and up to 2 scroll indicator lines (↑/↓).
             static constexpr int FOOTER_ROWS = 2;
-            int avail = std::max(3, term_rows() - rows_written - 2 - FOOTER_ROWS);
+            int scroll_ind = 0;
+            if (!is_live) {
+                if (detail_scroll > 0) ++scroll_ind;  // will show ↑ line
+                int tentative = std::max(3, term_rows() - rows_written - 2 - FOOTER_ROWS - scroll_ind);
+                if (total_out > detail_scroll + tentative) ++scroll_ind;  // will show ↓ line
+            }
+            int avail = std::max(3, term_rows() - rows_written - 2 - FOOTER_ROWS - scroll_ind);
 
             // When showing live output, auto-scroll to the bottom so new lines are visible.
             // When showing saved output, respect the user's scroll position.
@@ -812,44 +829,54 @@ static std::string wizard_select_hardware(Registry& reg,
     auto names = rebuild_names();
     int cursor = 0;
     int name_scroll = 0;
+    int scroll_ticks = 0;
     while (true) {
         using namespace ansi;
         int name_w = std::max(10, term_cols() / 3);
-        std::cout << CLEAR;
-        std::cout << BOLD << "TRAILHEAD" << RESET << " — Select hardware\n";
-        std::cout << hline(50) << "\n\n";
-        if (names.empty()) {
-            std::cout << DIM << "  No hardware configured. Press [a] to add." << RESET << "\n";
-        }
-        for (int i = 0; i < (int)names.size(); ++i) {
-            if (i == cursor) std::cout << CYAN << BOLD;
-            std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
-                                             : names[i].substr(0, name_w);
-            std::cout << (i == cursor ? " > " : "   ") << disp;
-            if (names[i] == "local") {
-                std::cout << DIM << "  (this machine, sequential)" << RESET;
-            } else {
-                auto nit = reg.nodes.find(names[i]);
-                if (nit != reg.nodes.end()) {
-                    const auto& n = nit->second;
-                    std::cout << DIM << "  (" << n.partition;
-                    if      (!n.gpu_type.empty())  std::cout << ", gpu:" << n.gpu_type;
-                    else if (!n.nodelist.empty())   std::cout << ", node:" << n.nodelist;
-                    else                            std::cout << ", CPU-only";
-                    if (!n.rsync_dest.empty())      std::cout << ", " << n.rsync_dest;
-                    std::cout << ")" << RESET;
-                }
+        {
+            std::ostringstream o;
+            o << CLEAR;
+            o << BOLD << "TRAILHEAD" << RESET << " — Select hardware\n";
+            o << hline(50) << "\n\n";
+            if (names.empty()) {
+                o << DIM << "  No hardware configured. Press [a] to add." << RESET << "\n";
             }
-            if (i == cursor) std::cout << RESET;
-            std::cout << "\n";
+            for (int i = 0; i < (int)names.size(); ++i) {
+                if (i == cursor) o << CYAN << BOLD;
+                std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
+                                                 : names[i].substr(0, name_w);
+                o << (i == cursor ? " > " : "   ") << disp;
+                if (names[i] == "local") {
+                    o << DIM << "  (this machine, sequential)" << RESET;
+                } else {
+                    auto nit = reg.nodes.find(names[i]);
+                    if (nit != reg.nodes.end()) {
+                        const auto& n = nit->second;
+                        o << DIM << "  (" << n.partition;
+                        if      (!n.gpu_type.empty())  o << ", gpu:" << n.gpu_type;
+                        else if (!n.nodelist.empty())   o << ", node:" << n.nodelist;
+                        else                            o << ", CPU-only";
+                        if (!n.rsync_dest.empty())      o << ", " << n.rsync_dest;
+                        o << ")" << RESET;
+                    }
+                }
+                if (i == cursor) o << RESET;
+                o << "\n";
+            }
+            o << "\n" << hline(50) << "\n";
+            o << DIM << "[↑/k] up  [↓/j] down  [enter] select  [a] add  [e] edit  [x] delete  [ESC] cancel"
+              << RESET << "\n";
+            std::cout << o.str();
+            std::cout.flush();
         }
-        std::cout << "\n" << hline(50) << "\n";
-        std::cout << DIM << "[↑/k] up  [↓/j] down  [enter] select  [a] add  [e] edit  [x] delete  [ESC] cancel"
-                  << RESET << "\n";
-        std::cout.flush();
 
-        int k = read_key(300);
-        if (k == -1) { ++name_scroll; continue; }
+        int k = read_key(50);
+        if (k == -1) {
+            if (++scroll_ticks < 6) continue;
+            ++name_scroll; scroll_ticks = 0;
+            continue;
+        }
+        scroll_ticks = 0;
         if (k == 27 || k == 'q') return "";
         if ((k == '\r' || k == '\n') && !names.empty()) return names[cursor];
         if (k == 1000 || k == 'k') {
@@ -952,37 +979,47 @@ static std::string wizard_select_build(Registry& reg, const std::string& th_dir)
     auto names = rebuild_names();
     int cursor = 0;
     int name_scroll = 0;
+    int scroll_ticks = 0;
     while (true) {
         using namespace ansi;
         int name_w = std::max(10, term_cols() / 3);
-        std::cout << CLEAR;
-        std::cout << BOLD << "TRAILHEAD" << RESET << " — Link build config\n";
-        std::cout << hline(60) << "\n\n";
-        for (int i = 0; i < (int)names.size(); ++i) {
-            if (i == cursor) std::cout << CYAN << BOLD;
-            std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
-                                             : names[i].substr(0, name_w);
-            std::cout << (i == cursor ? " > " : "   ") << disp;
-            if (i > 0) {
-                auto it = reg.builds.find(names[i]);
-                if (it != reg.builds.end()) {
-                    const auto& bc = it->second;
-                    if (!bc.configure_cmd.empty())
-                        std::cout << DIM << "  (" << bc.configure_cmd << ")" << RESET;
-                    if (!bc.rsync_dest.empty())
-                        std::cout << DIM << "  → " << bc.rsync_dest << RESET;
+        {
+            std::ostringstream o;
+            o << CLEAR;
+            o << BOLD << "TRAILHEAD" << RESET << " — Link build config\n";
+            o << hline(60) << "\n\n";
+            for (int i = 0; i < (int)names.size(); ++i) {
+                if (i == cursor) o << CYAN << BOLD;
+                std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
+                                                 : names[i].substr(0, name_w);
+                o << (i == cursor ? " > " : "   ") << disp;
+                if (i > 0) {
+                    auto it = reg.builds.find(names[i]);
+                    if (it != reg.builds.end()) {
+                        const auto& bc = it->second;
+                        if (!bc.configure_cmd.empty())
+                            o << DIM << "  (" << bc.configure_cmd << ")" << RESET;
+                        if (!bc.rsync_dest.empty())
+                            o << DIM << "  \xe2\x86\x92 " << bc.rsync_dest << RESET;
+                    }
                 }
+                if (i == cursor) o << RESET;
+                o << "\n";
             }
-            if (i == cursor) std::cout << RESET;
-            std::cout << "\n";
+            o << "\n" << hline(60) << "\n";
+            o << DIM << "[↑/k] up  [↓/j] down  [enter] select  [n] new config  [ESC] cancel"
+              << RESET << "\n";
+            std::cout << o.str();
+            std::cout.flush();
         }
-        std::cout << "\n" << hline(60) << "\n";
-        std::cout << DIM << "[↑/k] up  [↓/j] down  [enter] select  [n] new config  [ESC] cancel"
-                  << RESET << "\n";
-        std::cout.flush();
 
-        int k = read_key(300);
-        if (k == -1) { ++name_scroll; continue; }
+        int k = read_key(50);
+        if (k == -1) {
+            if (++scroll_ticks < 6) continue;
+            ++name_scroll; scroll_ticks = 0;
+            continue;
+        }
+        scroll_ticks = 0;
         if (k == 27 || k == 'q') return "";
         if (k == '\r' || k == '\n') return (cursor == 0) ? "" : names[cursor];
         if (k == 1000 || k == 'k') { cursor = (cursor - 1 + (int)names.size()) % (int)names.size(); name_scroll = 0; }
@@ -1049,33 +1086,43 @@ static bool run_add_wizard(Registry& reg,
 
         int cursor = 0;
         int name_scroll = 0;
+        int scroll_ticks = 0;
         bool cancelled = false;
         while (true) {
             using namespace ansi;
             int name_w = std::max(10, term_cols() / 2);
-            std::cout << CLEAR;
-            std::cout << BOLD << "TRAILHEAD" << RESET << " — Add to which registry?\n";
-            std::cout << hline(50) << "\n\n";
-            for (int i = 0; i < (int)choices.size(); ++i) {
-                if (i == cursor) std::cout << CYAN << BOLD;
-                std::cout << (i == cursor ? " > " : "   ");
-                if (choices[i].empty()) {
-                    std::cout << "(this project)";
-                } else {
-                    std::string disp = (i == cursor) ? scroll_name(choices[i], name_scroll, name_w)
-                                                     : choices[i].substr(0, name_w);
-                    std::cout << disp;
+            {
+                std::ostringstream o;
+                o << CLEAR;
+                o << BOLD << "TRAILHEAD" << RESET << " — Add to which registry?\n";
+                o << hline(50) << "\n\n";
+                for (int i = 0; i < (int)choices.size(); ++i) {
+                    if (i == cursor) o << CYAN << BOLD;
+                    o << (i == cursor ? " > " : "   ");
+                    if (choices[i].empty()) {
+                        o << "(this project)";
+                    } else {
+                        std::string disp = (i == cursor) ? scroll_name(choices[i], name_scroll, name_w)
+                                                         : choices[i].substr(0, name_w);
+                        o << disp;
+                    }
+                    if (i == cursor) o << RESET;
+                    o << "\n";
                 }
-                if (i == cursor) std::cout << RESET;
-                std::cout << "\n";
+                o << "\n" << hline(50) << "\n";
+                o << DIM << "[↑/k] up  [↓/j] down  [enter] select  [ESC] cancel"
+                  << RESET << "\n";
+                std::cout << o.str();
+                std::cout.flush();
             }
-            std::cout << "\n" << hline(50) << "\n";
-            std::cout << DIM << "[↑/k] up  [↓/j] down  [enter] select  [ESC] cancel"
-                      << RESET << "\n";
-            std::cout.flush();
 
-            int k = read_key(300);
-            if (k == -1) { ++name_scroll; continue; }
+            int k = read_key(50);
+            if (k == -1) {
+                if (++scroll_ticks < 6) continue;
+                ++name_scroll; scroll_ticks = 0;
+                continue;
+            }
+            scroll_ticks = 0;
             if (k == 27 || k == 'q') { cancelled = true; break; }
             if (k == '\r' || k == '\n') { dest_sub_dir = choices[cursor]; break; }
             if ((k == 1000 || k == 'k') && cursor > 0) { --cursor; name_scroll = 0; }
