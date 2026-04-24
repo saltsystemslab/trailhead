@@ -600,7 +600,29 @@ static int term_rows() {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
         return (int)ws.ws_row;
-    return 24; // fallback
+    return 24;
+}
+
+static int term_cols() {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return (int)ws.ws_col;
+    return 80;
+}
+
+// Return a width-char window into `s` starting at `offset`, wrapping with a gap.
+// If s fits in width it is returned unchanged; otherwise a marquee slice is returned.
+static std::string scroll_name(const std::string& s, int offset, int width) {
+    if ((int)s.size() <= width) return s;
+    static const std::string GAP = "   ";
+    std::string buf = s + GAP;
+    int len = (int)buf.size();
+    int start = offset % len;
+    std::string out;
+    out.reserve(width);
+    for (int i = 0; i < width; ++i)
+        out += buf[(start + i) % len];
+    return out;
 }
 
 // ── Wizard helpers ────────────────────────────────────────────────────────
@@ -789,8 +811,10 @@ static std::string wizard_select_hardware(Registry& reg,
 
     auto names = rebuild_names();
     int cursor = 0;
+    int name_scroll = 0;
     while (true) {
         using namespace ansi;
+        int name_w = std::max(10, term_cols() / 3);
         std::cout << CLEAR;
         std::cout << BOLD << "TRAILHEAD" << RESET << " — Select hardware\n";
         std::cout << hline(50) << "\n\n";
@@ -799,7 +823,9 @@ static std::string wizard_select_hardware(Registry& reg,
         }
         for (int i = 0; i < (int)names.size(); ++i) {
             if (i == cursor) std::cout << CYAN << BOLD;
-            std::cout << (i == cursor ? " > " : "   ") << names[i];
+            std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
+                                             : names[i].substr(0, name_w);
+            std::cout << (i == cursor ? " > " : "   ") << disp;
             if (names[i] == "local") {
                 std::cout << DIM << "  (this machine, sequential)" << RESET;
             } else {
@@ -822,14 +848,17 @@ static std::string wizard_select_hardware(Registry& reg,
                   << RESET << "\n";
         std::cout.flush();
 
-        int k = read_key(30000);
+        int k = read_key(300);
+        if (k == -1) { ++name_scroll; continue; }
         if (k == 27 || k == 'q') return "";
         if ((k == '\r' || k == '\n') && !names.empty()) return names[cursor];
         if (k == 1000 || k == 'k') {
             if (!names.empty()) cursor = (cursor - 1 + (int)names.size()) % (int)names.size();
+            name_scroll = 0;
         }
         if (k == 1001 || k == 'j') {
             if (!names.empty()) cursor = (cursor + 1) % (int)names.size();
+            name_scroll = 0;
         }
         if (k == 'a' || k == 'A') {
             wizard_add_hardware(reg, th_dir, project_root);
@@ -922,14 +951,18 @@ static std::string wizard_select_build(Registry& reg, const std::string& th_dir)
 
     auto names = rebuild_names();
     int cursor = 0;
+    int name_scroll = 0;
     while (true) {
         using namespace ansi;
+        int name_w = std::max(10, term_cols() / 3);
         std::cout << CLEAR;
         std::cout << BOLD << "TRAILHEAD" << RESET << " — Link build config\n";
         std::cout << hline(60) << "\n\n";
         for (int i = 0; i < (int)names.size(); ++i) {
             if (i == cursor) std::cout << CYAN << BOLD;
-            std::cout << (i == cursor ? " > " : "   ") << names[i];
+            std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
+                                             : names[i].substr(0, name_w);
+            std::cout << (i == cursor ? " > " : "   ") << disp;
             if (i > 0) {
                 auto it = reg.builds.find(names[i]);
                 if (it != reg.builds.end()) {
@@ -948,11 +981,12 @@ static std::string wizard_select_build(Registry& reg, const std::string& th_dir)
                   << RESET << "\n";
         std::cout.flush();
 
-        int k = read_key(30000);
+        int k = read_key(300);
+        if (k == -1) { ++name_scroll; continue; }
         if (k == 27 || k == 'q') return "";
         if (k == '\r' || k == '\n') return (cursor == 0) ? "" : names[cursor];
-        if (k == 1000 || k == 'k') cursor = (cursor - 1 + (int)names.size()) % (int)names.size();
-        if (k == 1001 || k == 'j') cursor = (cursor + 1) % (int)names.size();
+        if (k == 1000 || k == 'k') { cursor = (cursor - 1 + (int)names.size()) % (int)names.size(); name_scroll = 0; }
+        if (k == 1001 || k == 'j') { cursor = (cursor + 1) % (int)names.size(); name_scroll = 0; }
         if (k == 'n' || k == 'N') {
             std::string new_name = wizard_create_build(reg, th_dir);
             names = rebuild_names();
@@ -1014,16 +1048,24 @@ static bool run_add_wizard(Registry& reg,
         for (const auto& s : reg.sub_registries) choices.push_back(s);
 
         int cursor = 0;
+        int name_scroll = 0;
         bool cancelled = false;
         while (true) {
             using namespace ansi;
+            int name_w = std::max(10, term_cols() / 2);
             std::cout << CLEAR;
             std::cout << BOLD << "TRAILHEAD" << RESET << " — Add to which registry?\n";
             std::cout << hline(50) << "\n\n";
             for (int i = 0; i < (int)choices.size(); ++i) {
                 if (i == cursor) std::cout << CYAN << BOLD;
                 std::cout << (i == cursor ? " > " : "   ");
-                std::cout << (choices[i].empty() ? "(this project)" : choices[i]);
+                if (choices[i].empty()) {
+                    std::cout << "(this project)";
+                } else {
+                    std::string disp = (i == cursor) ? scroll_name(choices[i], name_scroll, name_w)
+                                                     : choices[i].substr(0, name_w);
+                    std::cout << disp;
+                }
                 if (i == cursor) std::cout << RESET;
                 std::cout << "\n";
             }
@@ -1032,11 +1074,12 @@ static bool run_add_wizard(Registry& reg,
                       << RESET << "\n";
             std::cout.flush();
 
-            int k = read_key(30000);
+            int k = read_key(300);
+            if (k == -1) { ++name_scroll; continue; }
             if (k == 27 || k == 'q') { cancelled = true; break; }
             if (k == '\r' || k == '\n') { dest_sub_dir = choices[cursor]; break; }
-            if ((k == 1000 || k == 'k') && cursor > 0) --cursor;
-            if ((k == 1001 || k == 'j') && cursor + 1 < (int)choices.size()) ++cursor;
+            if ((k == 1000 || k == 'k') && cursor > 0) { --cursor; name_scroll = 0; }
+            if ((k == 1001 || k == 'j') && cursor + 1 < (int)choices.size()) { ++cursor; name_scroll = 0; }
         }
         if (cancelled) { enter_raw_mode(); return false; }
 
