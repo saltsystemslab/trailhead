@@ -1132,15 +1132,14 @@ static int cmd_clean(int argc, char** argv) {
 static int cmd_setup(int argc, char** argv) {
     if (argc < 3) {
         std::cout << "Usage:\n"
-                     "  trailhead setup add <command>   # append a setup step\n"
-                     "  trailhead setup list             # show all setup steps\n"
-                     "  trailhead setup remove <index>   # remove step by index (0-based)\n"
-                     "  trailhead setup run              # run all setup steps locally\n"
+                     "  trailhead setup add <command>      # append a setup step\n"
+                     "  trailhead setup list                # show all setup steps\n"
+                     "  trailhead setup remove <index>      # remove step by index (0-based)\n"
+                     "  trailhead setup run [--force]       # run locally (skipped if already done)\n"
                      "\n"
-                     "Setup steps run before cmake configure in every sbatch script,\n"
-                     "and locally via 'trailhead setup run'. Use them for one-time\n"
-                     "tasks that must complete before building: submodule init,\n"
-                     "dataset downloads, dependency installs, etc.\n"
+                     "Setup steps run once per workspace, guarded by .trailhead/setup_done.\n"
+                     "On remote: the sentinel is created after the first successful sbatch run.\n"
+                     "Locally: use --force to re-run even if the sentinel exists.\n"
                      "\n"
                      "Example:\n"
                      "  trailhead setup add \"git submodule update --init --recursive\"\n"
@@ -1202,12 +1201,24 @@ static int cmd_setup(int argc, char** argv) {
     }
 
     if (action == "run") {
+        bool force = false;
+        for (int i = 3; i < argc; ++i)
+            if (std::string(argv[i]) == "--force") force = true;
+
         if (reg.setup.empty()) {
             std::cout << trailhead::ansi::DIM << "No setup steps defined.\n" << trailhead::ansi::RESET;
             return 0;
         }
         auto root = trailhead::fs::find_trailhead_root();
         std::string workdir = root ? *root : ".";
+        std::string sentinel = th_dir + "/setup_done";
+
+        if (!force && trailhead::fs::exists(sentinel)) {
+            std::cout << trailhead::ansi::DIM
+                      << "Setup already done (.trailhead/setup_done exists). Use --force to re-run.\n"
+                      << trailhead::ansi::RESET;
+            return 0;
+        }
 
         int failed = 0;
         for (int i = 0; i < (int)reg.setup.size(); ++i) {
@@ -1222,11 +1233,13 @@ static int cmd_setup(int argc, char** argv) {
                 std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
                     "  step failed (exit=" + std::to_string(r.exit_code) + ")\n");
                 ++failed;
-                break; // stop on first failure
+                break;
             }
         }
-        if (failed == 0)
+        if (failed == 0) {
+            trailhead::fs::write_file_atomic(sentinel, "");
             std::cout << trailhead::ansi::color(trailhead::ansi::BGREEN, "Setup complete") << "\n";
+        }
         return failed > 0 ? 1 : 0;
     }
 

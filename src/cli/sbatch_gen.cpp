@@ -122,11 +122,14 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
     o << "\n";
 
     // Project setup: submodule init, dataset downloads, etc.
-    // Runs before cmake configure so the source tree is complete.
+    // Guarded by .trailhead/setup_done so it only runs once per remote workspace.
+    // Delete that file (or run with --force-setup) to re-run.
     if (!setup.empty()) {
+        o << "if [ ! -f .trailhead/setup_done ]; then\n";
         for (const auto& s : setup)
-            o << s << "\n";
-        o << "\n";
+            o << "  " << s << "\n";
+        o << "  touch .trailhead/setup_done\n";
+        o << "fi\n\n";
     }
 
     // Configure step: run cmake on the compute node so it auto-detects GPU arch.

@@ -1868,6 +1868,12 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             }
             if (key == 'w' || key == 'W') {
                 auto removed = wipe_build_dirs(reg, project_root);
+                // Also clear the setup sentinel so setup re-runs on next job
+                std::string sentinel = trailhead_dir + "/setup_done";
+                if (fs::exists(sentinel)) {
+                    ::unlink(sentinel.c_str());
+                    job_log->push("wipe: cleared setup_done sentinel");
+                }
                 if (removed.empty()) {
                     job_log->push("wipe: no build directories found");
                 } else {
