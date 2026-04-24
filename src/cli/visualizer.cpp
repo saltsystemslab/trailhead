@@ -660,6 +660,47 @@ static std::string scroll_name(const std::string& s, int offset, int width) {
 
 // ── Wizard helpers ────────────────────────────────────────────────────────
 
+// Open $VISUAL/$EDITOR/vim to edit a list of shell lines (node preamble).
+// Returns the lines as a vector; empty lines and '#' comments are stripped.
+static std::vector<std::string> wizard_edit_preamble(const std::string& node_name,
+                                                       const std::vector<std::string>& existing = {})
+{
+    std::string tmpfile = "/tmp/trailhead_preamble_" + std::to_string(getpid()) + ".sh";
+    {
+        std::ofstream f(tmpfile);
+        f << "# Node preamble for: " << node_name << "\n"
+          << "# Lines starting with '#' are ignored.\n"
+          << "# Add module loads, exports, etc. that this cluster needs.\n"
+          << "# Example:\n"
+          << "#   module load cmake cuda/12.0\n"
+          << "#   export CUDA_HOME=/path/to/cuda\n"
+          << "#   export PATH=$CUDA_HOME/bin:$PATH\n"
+          << "#\n";
+        for (const auto& l : existing) f << l << "\n";
+    }
+    const char* ev = getenv("VISUAL");
+    if (!ev) ev = getenv("EDITOR");
+    std::cout << ansi::ALT_SCREEN_OFF;
+    std::cout.flush();
+    system((std::string(ev ? ev : "vim") + " " + tmpfile).c_str());
+    std::cout << ansi::ALT_SCREEN_ON;
+    std::cout.flush();
+    std::vector<std::string> lines;
+    {
+        std::ifstream f(tmpfile);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line[0] == '#') continue;
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            lines.push_back(line);
+        }
+    }
+    ::unlink(tmpfile.c_str());
+    // Strip trailing blank lines
+    while (!lines.empty() && lines.back().empty()) lines.pop_back();
+    return lines;
+}
+
 // Open $VISUAL/$EDITOR/vim with a temp file pre-populated with `existing_cmd`.
 // Comment lines (starting with '#') are stripped from the result.
 // Caller must restore the terminal BEFORE calling and re-enter raw mode AFTER.
@@ -751,7 +792,6 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     std::string time_str   = read_line("Time limit", "01:00:00");
     std::string rsync_dest = read_line("Remote rsync destination (user@host:/path, blank = local only)");
     std::string cuda_arch  = read_line("CUDA arch (e.g. 90 for H200, 86 for RTX 3090; used as {{arch}} in configure_cmd)");
-    std::string modules_str = read_line("Modules to load (space-separated, e.g. cmake cuda/12.0)");
 
     enter_raw_mode();
 
@@ -764,10 +804,7 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     np.time          = time_str;
     np.rsync_dest    = rsync_dest;
     np.cuda_arch     = cuda_arch;
-    {
-        std::istringstream ss(modules_str);
-        for (std::string m; ss >> m; ) np.modules.push_back(m);
-    }
+    np.preamble      = wizard_edit_preamble(name);
 
     reg.nodes[name] = np;
     save_registry(th_dir, reg);
@@ -821,11 +858,10 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
     std::string time_str   = read_line("Time limit", np.time);
     std::string rsync_dest = read_line("Remote rsync destination (user@host:/path)", np.rsync_dest);
     std::string cuda_arch  = read_line("CUDA arch (e.g. 90 for H200; used as {{arch}} in configure_cmd)", np.cuda_arch);
-    std::string cur_mods;
-    for (const auto& m : np.modules) { if (!cur_mods.empty()) cur_mods += " "; cur_mods += m; }
-    std::string modules_str = read_line("Modules to load (space-separated)", cur_mods);
 
     enter_raw_mode();
+
+    np.preamble = wizard_edit_preamble(name, np.preamble);
 
     if (name != node_name) reg.nodes.erase(node_name);
     np.name          = name;
@@ -836,11 +872,6 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
     np.time          = time_str;
     np.rsync_dest    = rsync_dest;
     np.cuda_arch     = cuda_arch;
-    np.modules.clear();
-    {
-        std::istringstream ss(modules_str);
-        for (std::string m; ss >> m; ) np.modules.push_back(m);
-    }
     reg.nodes[name]  = np;
 
     save_registry(th_dir, reg);

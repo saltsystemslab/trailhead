@@ -86,29 +86,37 @@ static std::string str_replace_all(std::string s,
     return s;
 }
 
-// Build the body of a script (modules + preamble + configure + commands)
-// build_dir:     the directory cmake builds into for this node (e.g. "build_h200")
-// configure_cmd: cmake configure command from the build config (run once on the node)
-// node_modules:  per-node modules (overrides defs.modules when non-empty)
+// Build the body of a script (preamble + configure + commands)
+// build_dir:      the directory cmake builds into for this node (e.g. "build_h200")
+// configure_cmd:  cmake configure command from the build config (run once on the node)
+// node_preamble:  per-node shell lines emitted after project preamble (module loads, exports, etc.)
 static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
                                 const SbatchDefaults& defs,
                                 const std::string& project_root,
                                 const std::string& build_dir,
                                 const std::string& configure_cmd,
                                 const std::vector<std::string>& setup = {},
-                                const std::vector<std::string>& node_modules = {})
+                                const std::vector<std::string>& node_preamble = {})
 {
     std::ostringstream o;
 
-    // Node-specific modules take precedence; fall back to project-wide sbatch_defaults.modules
-    const std::vector<std::string>& modules = node_modules.empty() ? defs.modules : node_modules;
-    for (const auto& mod : modules)
-        o << "module load " << mod << "\n";
-    if (!modules.empty()) o << "\n";
+    // Project-wide module loads (only when node has no preamble of its own)
+    if (node_preamble.empty()) {
+        for (const auto& mod : defs.modules)
+            o << "module load " << mod << "\n";
+        if (!defs.modules.empty()) o << "\n";
+    }
 
-    // Preamble lines
+    // Project preamble (e.g. set -euo pipefail)
     for (const auto& line : defs.preamble)
         o << line << "\n";
+
+    // Per-node preamble: module loads, exports, etc. specific to this cluster/hardware
+    if (!node_preamble.empty()) {
+        if (!defs.preamble.empty()) o << "\n";
+        for (const auto& line : node_preamble)
+            o << line << "\n";
+    }
     if (!defs.preamble.empty()) o << "\n";
 
     // Set TRAILHEAD_JOB_ID so reporter.hpp labels results as sbatch-<id>
@@ -285,7 +293,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             t_adj.workdir = adjust_workdir(t.workdir, sub_dir_name);
             script << sbatch_body({&t_adj}, defs, effective_root,
                                   build_dir, configure_cmd, reg.setup,
-                                  node_ptr ? node_ptr->modules : std::vector<std::string>{});
+                                  node_ptr ? node_ptr->preamble : std::vector<std::string>{});
 
             out.push_back({t.name + ".sbatch", script.str()});
         }
@@ -352,7 +360,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
         for (const auto& t : reg.tests) ptrs.push_back(&t);
         script << sbatch_body(ptrs, reg.sbatch_defaults, effective_root,
                               build_dir, configure_cmd, reg.setup,
-                              node_ptr ? node_ptr->modules : std::vector<std::string>{});
+                              node_ptr ? node_ptr->preamble : std::vector<std::string>{});
 
         out.push_back({"run_all.sbatch", script.str()});
     }
@@ -447,7 +455,7 @@ std::string generate_test_script(const TestEntry& test,
     test_adj.workdir = adjust_workdir(test.workdir, sub_dir_name);
     script << sbatch_body({&test_adj}, defs, effective_root,
                           build_dir, configure_cmd, reg.setup,
-                          node_ptr ? node_ptr->modules : std::vector<std::string>{});
+                          node_ptr ? node_ptr->preamble : std::vector<std::string>{});
     return script.str();
 }
 
