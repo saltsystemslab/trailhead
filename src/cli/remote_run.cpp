@@ -161,6 +161,7 @@ static std::string ssh_run(const std::string& remote, const std::string& remote_
 static void write_result_json(const std::string& results_dir, const TestResult& res) {
     std::string path = results_dir + "/" + res.name + "_"
                      + std::to_string(res.started_at) + ".json";
+    { auto sl = path.rfind('/'); if (sl != std::string::npos) fs::mkdir_p(path.substr(0, sl)); }
     JsonObject obj;
     obj.push_back({"version",    JsonValue((int64_t)1)});
     obj.push_back({"name",       res.name});

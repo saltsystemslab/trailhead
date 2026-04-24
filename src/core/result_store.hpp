@@ -162,12 +162,16 @@ inline void save_result_output(const std::string& results_dir,
     if (output.empty()) return;
     std::string path = results_dir + "/" + res.name + "_"
                      + std::to_string(res.started_at) + ".out";
+    auto slash = path.rfind('/');
+    if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
     fs::write_file_atomic(path, output);
 }
 
 inline void save_result(const std::string& results_dir, const TestResult& res) {
     std::string path = results_dir + "/" + res.name + "_"
                      + std::to_string(res.started_at) + ".json";
+    auto slash = path.rfind('/');
+    if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
     JsonObject obj;
     obj.push_back({"version",    JsonValue((int64_t)1)});
     obj.push_back({"name",       res.name});
@@ -202,7 +206,7 @@ using ResultIndex = std::unordered_map<std::string, std::vector<TestResult>>;
 // Load all results from .trailhead/results/
 inline ResultIndex load_all_results(const std::string& results_dir) {
     ResultIndex idx;
-    for (const auto& path : fs::list_dir(results_dir, ".json")) {
+    for (const auto& path : fs::list_files_recursive(results_dir, ".json")) {
         auto r = parse_result(path);
         if (!r) continue;
         idx[r->name].push_back(*r);

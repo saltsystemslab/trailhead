@@ -86,6 +86,33 @@ inline std::vector<std::string> list_dir(const std::string& path, const std::str
     return out;
 }
 
+// Recursively list all files matching suffix under a directory tree
+inline std::vector<std::string> list_files_recursive(const std::string& path,
+                                                       const std::string& suffix = "") {
+    std::vector<std::string> out;
+    DIR* d = opendir(path.c_str());
+    if (!d) return out;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        std::string name(ent->d_name);
+        if (name == "." || name == "..") continue;
+        std::string full = path + "/" + name;
+        if (is_dir(full)) {
+            auto sub = list_files_recursive(full, suffix);
+            out.insert(out.end(), sub.begin(), sub.end());
+        } else {
+            if (!suffix.empty()) {
+                if (name.size() < suffix.size()) continue;
+                if (name.substr(name.size() - suffix.size()) != suffix) continue;
+            }
+            out.push_back(full);
+        }
+    }
+    closedir(d);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 // Walk up from cwd looking for a directory named ".trailhead"
 // Returns the parent of .trailhead (i.e., the project root)
 inline std::optional<std::string> find_trailhead_root(const std::string& start = "") {
