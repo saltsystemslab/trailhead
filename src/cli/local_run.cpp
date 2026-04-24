@@ -98,6 +98,11 @@ void LocalRunner::run_task(Task& task) {
     if (set_status) set_status("RUNNING");
     if (log) log("running locally");
 
+    auto now_ms = []() -> int64_t {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+
     // Per-test cmake configure (once) + target build
     if (!t.build_name.empty() && !t.target.empty() && task.build_config) {
         {
@@ -154,12 +159,15 @@ void LocalRunner::run_task(Task& task) {
                     }
                     if (arch.empty()) {
                         if (log) log("arch detection failed: nvidia-smi returned no compute capability");
+                        int64_t ts = now_ms();
                         TestResult res;
-                        res.name      = t.name;
-                        res.failed    = 1;
-                        res.exit_code = 1;
-                        res.run_by    = "local";
-                        res.host      = "localhost";
+                        res.name       = t.name;
+                        res.started_at = ts;
+                        res.ended_at   = ts;
+                        res.failed     = 1;
+                        res.exit_code  = 1;
+                        res.run_by     = "local";
+                        res.host       = "localhost";
                         res.metadata["_output_tail"] = "arch detection failed: nvidia-smi returned no compute capability";
                         std::string results_dir = th_dir_ + "/results";
                         fs::mkdir_p(results_dir);
@@ -193,21 +201,25 @@ void LocalRunner::run_task(Task& task) {
                 }, true);
                 if (cr.exit_code != 0) {
                     if (log) {
-                        if (!cr.stdout_str.empty()) log(cr.stdout_str);
                         if (!cr.stderr_str.empty()) log(cr.stderr_str);
                         log("configure failed (exit=" + std::to_string(cr.exit_code) + ")");
                     }
+                    int64_t ts = now_ms();
                     TestResult res;
-                    res.name      = t.name;
-                    res.failed    = 1;
-                    res.exit_code = cr.exit_code;
-                    res.run_by    = "local";
-                    res.host      = "localhost";
-                    res.metadata["_output_tail"] = cr.stdout_str + "\n" + cr.stderr_str;
+                    res.name       = t.name;
+                    res.started_at = ts;
+                    res.ended_at   = ts;
+                    res.failed     = 1;
+                    res.exit_code  = cr.exit_code;
+                    res.run_by     = "local";
+                    res.host       = "localhost";
+                    std::string full = cr.stdout_str;
+                    if (!cr.stderr_str.empty()) full += "\n--- stderr ---\n" + cr.stderr_str;
+                    res.metadata["_output_tail"] = full;
                     std::string results_dir = th_dir_ + "/results";
                     fs::mkdir_p(results_dir);
                     save_result(results_dir, res);
-                    save_result_output(results_dir, res, cr.stdout_str + cr.stderr_str);
+                    save_result_output(results_dir, res, full);
                     if (set_status) set_status("");
                     job_log_->active--;
                     return;
@@ -221,21 +233,25 @@ void LocalRunner::run_task(Task& task) {
             }, true);
             if (br.exit_code != 0) {
                 if (log) {
-                    if (!br.stdout_str.empty()) log(br.stdout_str);
                     if (!br.stderr_str.empty()) log(br.stderr_str);
                     log("build failed (exit=" + std::to_string(br.exit_code) + ")");
                 }
+                int64_t ts = now_ms();
                 TestResult res;
-                res.name      = t.name;
-                res.failed    = 1;
-                res.exit_code = br.exit_code;
-                res.run_by    = "local";
-                res.host      = "localhost";
-                res.metadata["_output_tail"] = br.stdout_str + "\n" + br.stderr_str;
+                res.name       = t.name;
+                res.started_at = ts;
+                res.ended_at   = ts;
+                res.failed     = 1;
+                res.exit_code  = br.exit_code;
+                res.run_by     = "local";
+                res.host       = "localhost";
+                std::string full = br.stdout_str;
+                if (!br.stderr_str.empty()) full += "\n--- stderr ---\n" + br.stderr_str;
+                res.metadata["_output_tail"] = full;
                 std::string results_dir = th_dir_ + "/results";
                 fs::mkdir_p(results_dir);
                 save_result(results_dir, res);
-                save_result_output(results_dir, res, br.stdout_str + br.stderr_str);
+                save_result_output(results_dir, res, full);
                 if (set_status) set_status("");
                 job_log_->active--;
                 return;
