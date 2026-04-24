@@ -105,6 +105,9 @@ struct Registry {
     // Relative paths to sub-registry roots (e.g. git submodules).
     // Tests from each are merged into the view at load time.
     std::vector<std::string> sub_registries;
+    // Per-sub-registry sbatch_defaults, keyed by sub_rel path (e.g. "gunrock").
+    // Populated by merge_sub_registries. Not serialized.
+    std::unordered_map<std::string, SbatchDefaults> sub_sbatch_defaults;
 };
 
 // ── Serialisation ─────────────────────────────────────────────────────────

@@ -149,6 +149,9 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
         for (const auto& [nname, np] : sub.nodes) {
             if (!reg.nodes.count(nname)) reg.nodes[nname] = np;
         }
+
+        // Store sub-registry's own sbatch_defaults for per-test lookup
+        reg.sub_sbatch_defaults[sub_rel] = sub.sbatch_defaults;
     }
 }
 

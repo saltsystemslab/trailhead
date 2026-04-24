@@ -174,6 +174,15 @@ static std::string adjust_workdir(const std::string& workdir, const std::string&
     return workdir;
 }
 
+// Return the sbatch_defaults for a test: sub-registry's own if available, else parent's.
+static const SbatchDefaults& effective_defs(const Registry& reg, const TestEntry& t) {
+    if (!t.sub_dir.empty()) {
+        auto it = reg.sub_sbatch_defaults.find(t.sub_dir);
+        if (it != reg.sub_sbatch_defaults.end()) return it->second;
+    }
+    return reg.sbatch_defaults;
+}
+
 // Append the sub-dir name to effective_root when a sub-registry build relies on the node
 // rsync_dest (has no build-specific rsync_dest). Returns the sub-dir name used (or "").
 static std::string maybe_append_sub_dir(std::string& effective_root,
@@ -209,12 +218,13 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
 
             // Emit hardware headers if a node was specified (via opts.node_name)
             const NodeProfile* node_ptr = nullptr;
-            std::string job_name = reg.sbatch_defaults.job_name_prefix + "-" + t.name;
+            const SbatchDefaults& defs = effective_defs(reg, t);
+            std::string job_name = defs.job_name_prefix + "-" + t.name;
             if (!opts.node_name.empty()) {
                 auto it = reg.nodes.find(opts.node_name);
                 if (it != reg.nodes.end()) {
                     node_ptr = &it->second;
-                    script << sbatch_headers(it->second, reg.sbatch_defaults, job_name);
+                    script << sbatch_headers(it->second, defs, job_name);
                 }
             } else {
                 script << "#SBATCH --job-name=" << job_name << "\n";
@@ -267,7 +277,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             }
             TestEntry t_adj = t;
             t_adj.workdir = adjust_workdir(t.workdir, sub_dir_name);
-            script << sbatch_body({&t_adj}, reg.sbatch_defaults, effective_root,
+            script << sbatch_body({&t_adj}, defs, effective_root,
                                   build_dir, configure_cmd, reg.setup);
 
             out.push_back({t.name + ".sbatch", script.str()});
@@ -367,13 +377,14 @@ std::string generate_test_script(const TestEntry& test,
     std::ostringstream script;
     script << "#!/bin/bash\n";
 
-    std::string job_name = reg.sbatch_defaults.job_name_prefix + "-" + test.name;
+    const SbatchDefaults& defs = effective_defs(reg, test);
+    std::string job_name = defs.job_name_prefix + "-" + test.name;
     const NodeProfile* node_ptr = nullptr;
     if (!node_name.empty()) {
         auto it = reg.nodes.find(node_name);
         if (it != reg.nodes.end()) {
             node_ptr = &it->second;
-            script << sbatch_headers(it->second, reg.sbatch_defaults, job_name);
+            script << sbatch_headers(it->second, defs, job_name);
         }
     }
     script << "\n";
@@ -426,7 +437,7 @@ std::string generate_test_script(const TestEntry& test,
     }
     TestEntry test_adj = test;
     test_adj.workdir = adjust_workdir(test.workdir, sub_dir_name);
-    script << sbatch_body({&test_adj}, reg.sbatch_defaults, effective_root,
+    script << sbatch_body({&test_adj}, defs, effective_root,
                           build_dir, configure_cmd, reg.setup);
     return script.str();
 }
