@@ -950,13 +950,10 @@ static int cmd_watch(int argc, char** argv) {
                         }
                     }
                     if (rd) {
-                        std::vector<std::string> partitions;
-                        for (const auto& [nname, node] : reg.nodes)
-                            if (!node.partition.empty()) partitions.push_back(node.partition);
-                        int max_concurrent = trailhead::query_slurm_job_limit(rd->remote, partitions);
-                        job_log->push("[trailhead] SLURM max concurrent jobs: " + std::to_string(max_concurrent));
+                        // Don't call query_slurm_job_limit here — it makes blocking SSH calls
+                        // on the UI thread. Use the default limit instead.
                         *lazy_submitter = std::make_shared<trailhead::BatchSubmitter>(
-                            reg, th_dir, project_root, *rd, job_log, max_concurrent);
+                            reg, th_dir, project_root, *rd, job_log);
                     }
                 }
                 if (*lazy_submitter) {

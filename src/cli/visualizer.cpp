@@ -1137,7 +1137,7 @@ static bool run_add_wizard(Registry& reg,
                     o << "\n";
                 }
                 o << "\n" << hline(50) << "\n";
-                o << DIM << "[↑/k] up  [↓/j] down  [enter] select  [ESC] cancel"
+                o << DIM << "[↑/k] up  [↓/j] down  [enter] select  [n] new sub-registry  [ESC] cancel"
                   << RESET << "\n";
                 std::cout << o.str();
                 std::cout.flush();
@@ -1154,6 +1154,30 @@ static bool run_add_wizard(Registry& reg,
             if (k == '\r' || k == '\n') { dest_sub_dir = choices[cursor]; break; }
             if ((k == 1000 || k == 'k') && cursor > 0) { --cursor; name_scroll = 0; }
             if ((k == 1001 || k == 'j') && cursor + 1 < (int)choices.size()) { ++cursor; name_scroll = 0; }
+            if (k == 'n' || k == 'N') {
+                restore_terminal();
+                std::cout << ansi::CLEAR;
+                std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Add sub-registry\n\n";
+                std::cout << "  Relative path to subdirectory (e.g. n_queens): ";
+                std::cout.flush();
+                std::string new_sub;
+                std::getline(std::cin, new_sub);
+                while (!new_sub.empty() && new_sub.front() == ' ') new_sub.erase(new_sub.begin());
+                while (!new_sub.empty() && new_sub.back()  == ' ') new_sub.pop_back();
+                enter_raw_mode();
+                if (!new_sub.empty()) {
+                    std::string sub_reg_path = project_root + "/" + new_sub + "/.trailhead/registry.json";
+                    bool already = false;
+                    for (const auto& s : reg.sub_registries) if (s == new_sub) { already = true; break; }
+                    if (!already && fs::exists(sub_reg_path)) {
+                        reg.sub_registries.push_back(new_sub);
+                        save_registry(th_dir, reg);
+                        choices.push_back(new_sub);
+                        cursor = (int)choices.size() - 1;
+                    }
+                }
+                continue;
+            }
         }
         if (cancelled) { enter_raw_mode(); return false; }
 
