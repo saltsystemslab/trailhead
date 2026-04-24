@@ -5,6 +5,7 @@
 #include "../util/process.hpp"
 #include <sstream>
 #include <deque>
+#include <set>
 #include <chrono>
 
 namespace trailhead {
@@ -13,6 +14,28 @@ bool has_local_gpu() {
     // nvidia-smi -L lists one line per GPU; non-empty output = GPU present
     auto r = proc::run("nvidia-smi -L", {}, {}, 5, "", nullptr, false);
     return r.exit_code == 0 && !r.stdout_str.empty();
+}
+
+std::vector<std::string> wipe_build_dirs(const Registry& reg, const std::string& project_root) {
+    std::set<std::string> candidates;
+    for (const auto& [bname, bc] : reg.builds) {
+        std::string base = project_root;
+        if (!bc.sub_dir.empty()) base += "/" + bc.sub_dir;
+        std::string raw = bc.dir.empty() ? "build" : bc.dir;
+        candidates.insert(base + "/" + raw);
+        for (const auto& [nname, np] : reg.nodes) {
+            std::string bdir = np.build_dir.empty() ? "build_" + nname : np.build_dir;
+            candidates.insert(base + "/" + bdir);
+        }
+    }
+    std::vector<std::string> removed;
+    for (const auto& dir : candidates) {
+        if (fs::exists(dir)) {
+            proc::run("rm -rf " + dir, {}, {}, 60, "", nullptr, true);
+            removed.push_back(dir);
+        }
+    }
+    return removed;
 }
 
 // ── LocalRunner ───────────────────────────────────────────────────────────

@@ -890,7 +890,7 @@ static std::string wizard_select_hardware(Registry& reg,
                 o << "\n";
             }
             o << "\n" << hline(50) << "\n";
-            o << DIM << "[↑/k] up  [↓/j] down  [enter] select  [a] add  [e] edit  [x] delete  [ESC] cancel"
+            o << DIM << "[↑/k] up  [↓/j] down  [enter] select  [w] wipe builds + local  [a] add  [e] edit  [x] delete  [ESC] cancel"
               << RESET << "\n";
             std::cout << o.str();
             std::cout.flush();
@@ -944,6 +944,26 @@ static std::string wizard_select_hardware(Registry& reg,
             }
             names = rebuild_names();
             if (cursor >= (int)names.size()) cursor = std::max(0, (int)names.size() - 1);
+        }
+        if (k == 'w' || k == 'W') {
+            auto removed = wipe_build_dirs(reg, project_root);
+            // Brief feedback before returning to caller
+            std::ostringstream o;
+            o << ansi::CLEAR;
+            o << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Wiping build directories\n";
+            o << hline(50) << "\n\n";
+            if (removed.empty()) {
+                o << ansi::DIM << "  No build directories found.\n" << ansi::RESET;
+            } else {
+                for (const auto& d : removed)
+                    o << "  " << ansi::DIM << "removed " << ansi::RESET << d << "\n";
+                o << "\n" << ansi::GREEN << "  Wiped " << removed.size() << " director"
+                  << (removed.size() == 1 ? "y" : "ies") << "." << ansi::RESET << "\n";
+            }
+            std::cout << o.str();
+            std::cout.flush();
+            read_key(1000); // brief pause so user can see the result
+            return "local";
         }
     }
 }
@@ -1607,7 +1627,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
         o << hline(TOTAL_WIDTH) << "\n";
         o << DIM
-          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [p] preview  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [c] clear  [h] hw"
+          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [p] preview  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [c] clear  [w] wipe builds  [h] hw"
           << RESET << "\n";
 
         // Log panel — fixed at snapshot taken above
@@ -1790,6 +1810,18 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                     }
                     idx.erase(it);
                     job_log->push("Cleared " + std::to_string(n) + " result(s) for " + tname);
+                }
+                redraw = true;
+            }
+            if (key == 'w' || key == 'W') {
+                auto removed = wipe_build_dirs(reg, project_root);
+                if (removed.empty()) {
+                    job_log->push("wipe: no build directories found");
+                } else {
+                    for (const auto& d : removed)
+                        job_log->push("wipe: removed " + d);
+                    job_log->push("Wiped " + std::to_string(removed.size()) + " build director"
+                                  + (removed.size() == 1 ? "y" : "ies"));
                 }
                 redraw = true;
             }

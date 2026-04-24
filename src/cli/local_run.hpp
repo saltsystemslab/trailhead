@@ -14,6 +14,10 @@ namespace trailhead {
 // Returns true if nvidia-smi is present and reports at least one GPU.
 bool has_local_gpu();
 
+// Delete all build directories derived from the registry's build configs and node profiles.
+// Returns the paths that were actually removed.
+std::vector<std::string> wipe_build_dirs(const Registry& reg, const std::string& project_root);
+
 // Runs tests sequentially on the local machine.
 // One task runs at a time; others wait in the queue.
 class LocalRunner {
