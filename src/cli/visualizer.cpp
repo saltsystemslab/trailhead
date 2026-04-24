@@ -751,6 +751,7 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     std::string time_str   = read_line("Time limit", "01:00:00");
     std::string rsync_dest = read_line("Remote rsync destination (user@host:/path, blank = local only)");
     std::string cuda_arch  = read_line("CUDA arch (e.g. 90 for H200, 86 for RTX 3090; used as {{arch}} in configure_cmd)");
+    std::string modules_str = read_line("Modules to load (space-separated, e.g. cmake cuda/12.0)");
 
     enter_raw_mode();
 
@@ -763,6 +764,10 @@ static void wizard_add_hardware(Registry& reg, const std::string& th_dir,
     np.time          = time_str;
     np.rsync_dest    = rsync_dest;
     np.cuda_arch     = cuda_arch;
+    {
+        std::istringstream ss(modules_str);
+        for (std::string m; ss >> m; ) np.modules.push_back(m);
+    }
 
     reg.nodes[name] = np;
     save_registry(th_dir, reg);
@@ -816,6 +821,9 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
     std::string time_str   = read_line("Time limit", np.time);
     std::string rsync_dest = read_line("Remote rsync destination (user@host:/path)", np.rsync_dest);
     std::string cuda_arch  = read_line("CUDA arch (e.g. 90 for H200; used as {{arch}} in configure_cmd)", np.cuda_arch);
+    std::string cur_mods;
+    for (const auto& m : np.modules) { if (!cur_mods.empty()) cur_mods += " "; cur_mods += m; }
+    std::string modules_str = read_line("Modules to load (space-separated)", cur_mods);
 
     enter_raw_mode();
 
@@ -828,6 +836,11 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
     np.time          = time_str;
     np.rsync_dest    = rsync_dest;
     np.cuda_arch     = cuda_arch;
+    np.modules.clear();
+    {
+        std::istringstream ss(modules_str);
+        for (std::string m; ss >> m; ) np.modules.push_back(m);
+    }
     reg.nodes[name]  = np;
 
     save_registry(th_dir, reg);

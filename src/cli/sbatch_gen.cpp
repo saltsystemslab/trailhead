@@ -89,19 +89,22 @@ static std::string str_replace_all(std::string s,
 // Build the body of a script (modules + preamble + configure + commands)
 // build_dir:     the directory cmake builds into for this node (e.g. "build_h200")
 // configure_cmd: cmake configure command from the build config (run once on the node)
+// node_modules:  per-node modules (overrides defs.modules when non-empty)
 static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
                                 const SbatchDefaults& defs,
                                 const std::string& project_root,
                                 const std::string& build_dir,
                                 const std::string& configure_cmd,
-                                const std::vector<std::string>& setup = {})
+                                const std::vector<std::string>& setup = {},
+                                const std::vector<std::string>& node_modules = {})
 {
     std::ostringstream o;
 
-    // Module loads
-    for (const auto& mod : defs.modules)
+    // Node-specific modules take precedence; fall back to project-wide sbatch_defaults.modules
+    const std::vector<std::string>& modules = node_modules.empty() ? defs.modules : node_modules;
+    for (const auto& mod : modules)
         o << "module load " << mod << "\n";
-    if (!defs.modules.empty()) o << "\n";
+    if (!modules.empty()) o << "\n";
 
     // Preamble lines
     for (const auto& line : defs.preamble)
@@ -281,7 +284,8 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             TestEntry t_adj = t;
             t_adj.workdir = adjust_workdir(t.workdir, sub_dir_name);
             script << sbatch_body({&t_adj}, defs, effective_root,
-                                  build_dir, configure_cmd, reg.setup);
+                                  build_dir, configure_cmd, reg.setup,
+                                  node_ptr ? node_ptr->modules : std::vector<std::string>{});
 
             out.push_back({t.name + ".sbatch", script.str()});
         }
@@ -347,7 +351,8 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
         std::vector<const TestEntry*> ptrs;
         for (const auto& t : reg.tests) ptrs.push_back(&t);
         script << sbatch_body(ptrs, reg.sbatch_defaults, effective_root,
-                              build_dir, configure_cmd, reg.setup);
+                              build_dir, configure_cmd, reg.setup,
+                              node_ptr ? node_ptr->modules : std::vector<std::string>{});
 
         out.push_back({"run_all.sbatch", script.str()});
     }
@@ -441,7 +446,8 @@ std::string generate_test_script(const TestEntry& test,
     TestEntry test_adj = test;
     test_adj.workdir = adjust_workdir(test.workdir, sub_dir_name);
     script << sbatch_body({&test_adj}, defs, effective_root,
-                          build_dir, configure_cmd, reg.setup);
+                          build_dir, configure_cmd, reg.setup,
+                          node_ptr ? node_ptr->modules : std::vector<std::string>{});
     return script.str();
 }
 

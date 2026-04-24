@@ -56,6 +56,7 @@ struct NodeProfile {
     // CUDA compute capability (e.g. "90" for H200, "86" for RTX 3090).
     // Substituted as {{arch}} in build config configure_cmd at script-generation and local-run time.
     std::string cuda_arch;
+    std::vector<std::string> modules;  // modules to load in sbatch scripts for this node
     std::unordered_map<std::string,std::string> extra;
 };
 
@@ -147,8 +148,9 @@ inline NodeProfile node_from_json(const std::string& name, const JsonValue& v) {
     n.rsync_dest   = v.get_str("rsync_dest");
     n.build_dir    = v.get_str("build_dir");
     n.cuda_arch    = v.get_str("cuda_arch");
+    n.modules      = v.get_str_array("modules");
     static const std::vector<std::string> known = {
-        "partition","nodelist","gpu_type","nodes","ntasks","cpus_per_task","time","account","rsync_dest","build_dir","cuda_arch"
+        "partition","nodelist","gpu_type","nodes","ntasks","cpus_per_task","time","account","rsync_dest","build_dir","cuda_arch","modules"
     };
     if (v.is_object()) {
         for (const auto& [k, val] : v.as_object()) {
@@ -177,6 +179,11 @@ inline JsonValue node_to_json(const NodeProfile& n) {
     add("rsync_dest", n.rsync_dest);
     add("build_dir",  n.build_dir);
     add("cuda_arch",  n.cuda_arch);
+    if (!n.modules.empty()) {
+        JsonArray marr;
+        for (const auto& m : n.modules) marr.push_back(JsonValue(m));
+        obj.push_back({"modules", JsonValue(std::move(marr))});
+    }
     for (const auto& [k, v] : n.extra) add(k, v);
     return JsonValue(std::move(obj));
 }
