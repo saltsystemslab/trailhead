@@ -2,9 +2,10 @@
 # trailhead_run_tests.sh — Build trailhead and run all registered tests locally.
 #
 # Usage:
-#   ./trailhead_run_tests.sh              # build trailhead, run setup, run all tests
+#   ./trailhead_run_tests.sh              # build trailhead, wipe builds, run setup, run all tests
 #   ./trailhead_run_tests.sh --no-build   # skip trailhead cmake (use existing build)
 #   ./trailhead_run_tests.sh --no-setup   # skip 'trailhead setup run'
+#   ./trailhead_run_tests.sh --no-wipe    # skip wiping build directories
 #
 # Exit code: 0 if all tests pass, 1 if any fail or if trailhead can't build.
 # Results are written to .trailhead/results/.
@@ -15,9 +16,11 @@ PROJECT_DIR="$(pwd)"   # directory the user invoked the script from
 
 NO_BUILD=0
 NO_SETUP=0
+NO_WIPE=0
 for arg in "$@"; do
     [[ "$arg" == "--no-build" ]] && NO_BUILD=1
     [[ "$arg" == "--no-setup" ]] && NO_SETUP=1
+    [[ "$arg" == "--no-wipe"  ]] && NO_WIPE=1
 done
 
 if [[ $NO_BUILD -eq 0 ]]; then
@@ -45,5 +48,8 @@ if [[ $NO_SETUP -eq 0 ]]; then
     "$TRAILHEAD" setup run || true   # setup run prints its own errors; don't abort if no steps
 fi
 
+WIPE_FLAG=""
+[[ $NO_WIPE -eq 0 ]] && WIPE_FLAG="--wipe"
+
 echo "==> Running tests in $PROJECT_DIR..."
-exec "$TRAILHEAD" watch --run-all
+exec "$TRAILHEAD" watch --run-all $WIPE_FLAG

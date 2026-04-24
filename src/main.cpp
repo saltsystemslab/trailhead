@@ -1032,6 +1032,15 @@ static int cmd_watch(int argc, char** argv) {
         }
     }
 
+    if (args.flag("wipe")) {
+        auto removed = trailhead::wipe_build_dirs(reg, project_root);
+        for (const auto& d : removed)
+            std::cout << "wipe: removed " << d << "\n";
+        if (!removed.empty())
+            std::cout << "Wiped " << removed.size() << " build director"
+                      << (removed.size() == 1 ? "y" : "ies") << "\n";
+    }
+
     bool auto_run = args.flag("run-all");
     return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, project_root, auto_run);
 }
