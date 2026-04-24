@@ -119,14 +119,37 @@ void LocalRunner::run_task(Task& task) {
 
                 // Substitute {{arch}} with auto-detected local GPU compute capability
                 if (configure_cmd.find("{{arch}}") != std::string::npos) {
-                    auto ar = proc::run(
-                        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once",
-                        {}, {}, 5, "", nullptr, false);
                     std::string arch;
-                    if (ar.exit_code == 0 && !ar.stdout_str.empty()) {
-                        for (char c : ar.stdout_str) {
-                            if (c >= '0' && c <= '9') arch += c;
-                            else if (c == '\n' || c == '\r') break;
+                    // Try structured query (with and without 'once' for driver compatibility)
+                    for (const char* qcmd : {
+                            "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once",
+                            "nvidia-smi --query-gpu=compute_cap --format=csv,noheader"}) {
+                        auto ar = proc::run(qcmd, {}, {}, 5, "", nullptr, false);
+                        if (ar.exit_code == 0 && !ar.stdout_str.empty()) {
+                            for (char c : ar.stdout_str) {
+                                if (c >= '0' && c <= '9') arch += c;
+                                else if (c == '\n' || c == '\r') break;
+                            }
+                            if (!arch.empty()) break;
+                        }
+                    }
+                    // Fallback: parse "Compute Capability : X.Y" from nvidia-smi -q
+                    if (arch.empty()) {
+                        auto ar = proc::run("nvidia-smi -q", {}, {}, 5, "", nullptr, false);
+                        if (ar.exit_code == 0) {
+                            const std::string needle = "Compute Capability";
+                            auto p = ar.stdout_str.find(needle);
+                            if (p != std::string::npos) {
+                                p = ar.stdout_str.find(':', p);
+                                if (p != std::string::npos) {
+                                    for (++p; p < ar.stdout_str.size(); ++p) {
+                                        char c = ar.stdout_str[p];
+                                        if (c >= '0' && c <= '9') arch += c;
+                                        else if (c == '.') continue; // skip decimal in "12.0"
+                                        else if (!arch.empty()) break;
+                                    }
+                                }
+                            }
                         }
                     }
                     if (arch.empty()) {
