@@ -146,12 +146,15 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
             reg.tests.push_back(std::move(t));
         }
 
-        // Merge node profiles — parent takes priority; fill in missing rsync_dest from sub
+        // Merge node profiles — parent takes priority; fill in missing fields from sub
         for (const auto& [nname, np] : sub.nodes) {
             if (!reg.nodes.count(nname)) {
                 reg.nodes[nname] = np;
-            } else if (reg.nodes[nname].rsync_dest.empty() && !np.rsync_dest.empty()) {
-                reg.nodes[nname].rsync_dest = np.rsync_dest;
+            } else {
+                auto& pn = reg.nodes[nname];
+                if (pn.rsync_dest.empty() && !np.rsync_dest.empty()) pn.rsync_dest = np.rsync_dest;
+                if (pn.cuda_arch.empty()  && !np.cuda_arch.empty())  pn.cuda_arch  = np.cuda_arch;
+                if (pn.preamble.empty()   && !np.preamble.empty())   pn.preamble   = np.preamble;
             }
         }
 
