@@ -2,10 +2,10 @@
 # trailhead_run_tests.sh — Build trailhead and run all registered tests locally.
 #
 # Usage:
-#   ./trailhead_run_tests.sh                  # build, wipe, setup, run all tests 5x, report median
+#   ./trailhead_run_tests.sh                  # build, setup, run all tests 5x, report median
+#   ./trailhead_run_tests.sh --wipe           # wipe build directories before running
 #   ./trailhead_run_tests.sh --no-build       # skip trailhead cmake (use existing build)
 #   ./trailhead_run_tests.sh --no-setup       # skip 'trailhead setup run'
-#   ./trailhead_run_tests.sh --no-wipe        # skip wiping build directories
 #   ./trailhead_run_tests.sh --repeat <N>     # run each test N times (default 5)
 #
 # Exit code: 0 if all tests pass, 1 if any fail or if trailhead can't build.
@@ -17,13 +17,13 @@ PROJECT_DIR="$(pwd)"   # directory the user invoked the script from
 
 NO_BUILD=0
 NO_SETUP=0
-NO_WIPE=0
+WIPE=0
 REPEAT=5
 args=("$@")
 for ((idx=0; idx<${#args[@]}; idx++)); do
     [[ "${args[$idx]}" == "--no-build" ]] && NO_BUILD=1
     [[ "${args[$idx]}" == "--no-setup" ]] && NO_SETUP=1
-    [[ "${args[$idx]}" == "--no-wipe"  ]] && NO_WIPE=1
+    [[ "${args[$idx]}" == "--wipe"     ]] && WIPE=1
     if [[ "${args[$idx]}" == "--repeat" ]]; then
         REPEAT="${args[$((idx+1))]}"
         idx=$((idx+1))
@@ -56,7 +56,7 @@ if [[ $NO_SETUP -eq 0 ]]; then
 fi
 
 WIPE_FLAG=""
-[[ $NO_WIPE -eq 0 ]] && WIPE_FLAG="--wipe"
+[[ $WIPE -eq 1 ]] && WIPE_FLAG="--wipe"
 
 echo "==> Running tests in $PROJECT_DIR (${REPEAT}x each)..."
 exec "$TRAILHEAD" watch --run-all $WIPE_FLAG --repeat "$REPEAT"
