@@ -86,7 +86,11 @@ inline RunResult run(
     }
 
     if (pid == 0) {
-        // Child
+        // Child: redirect stdin to /dev/null so child processes don't compete
+        // with the TUI for terminal input (would cause dropped keystrokes in editors).
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull != -1) { dup2(devnull, STDIN_FILENO); close(devnull); }
+
         close(out_pipe[0]); close(err_pipe[0]);
         dup2(out_pipe[1], STDOUT_FILENO);
         dup2(err_pipe[1], STDERR_FILENO);
