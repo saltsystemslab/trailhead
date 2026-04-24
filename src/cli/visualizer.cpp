@@ -665,7 +665,18 @@ static std::string wizard_open_editor(const std::string& task_name,
     }
     const char* ev = getenv("VISUAL");
     if (!ev) ev = getenv("EDITOR");
+
+    // Exit the alternate screen so the editor gets a clean normal terminal.
+    // Some terminals don't support nested alt-screen buffers, causing the
+    // editor to fight with the TUI for the same buffer → dropped inputs.
+    std::cout << ansi::ALT_SCREEN_OFF;
+    std::cout.flush();
+
     system((std::string(ev ? ev : "vim") + " " + tmpfile).c_str());
+
+    // Restore alternate screen for the rest of the wizard.
+    std::cout << ansi::ALT_SCREEN_ON;
+    std::cout.flush();
 
     std::string cmd;
     {
