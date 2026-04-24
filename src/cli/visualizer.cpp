@@ -1953,99 +1953,125 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         if (v.empty()) return 0.0;
         double s = 0; for (double x : v) s += x; return s / v.size();
     };
-    auto reported_ms_of = [](const TestResult* r) -> double {
-        double ms = 0; for (const auto& te : r->timings) ms += te.elapsed_ms; return ms;
-    };
 
     bool multi = repeat > 1;
+
+    // Collect all unique timing labels across all relevant results (stable insertion order)
+    std::vector<std::string> all_labels;
+    {
+        std::unordered_set<std::string> seen_labels;
+        auto collect = [&](const TestResult* r) {
+            if (!r) return;
+            for (const auto& te : r->timings)
+                if (seen_labels.insert(te.label).second)
+                    all_labels.push_back(te.label);
+        };
+        for (int i : filtered) {
+            if (multi)
+                for (const auto* r : session_results(reg.tests[i].name)) collect(r);
+            else
+                collect(latest_result(final_idx, reg.tests[i].name));
+        }
+    }
+
+    // Helper: look up a timing label value in a result (0 if absent)
+    auto timing_val = [](const TestResult* r, const std::string& lbl) -> double {
+        for (const auto& te : r->timings) if (te.label == lbl) return te.elapsed_ms;
+        return 0.0;
+    };
+
     std::ofstream csv(csv_path);
-    if (multi)
-        csv << "test_name,status,runs,reported_ms_median,reported_ms_mean,wall_ms_median,wall_ms_mean,exit_code\n";
-    else
-        csv << "test_name,status,passed,failed,reported_ms,exit_code\n";
+    if (multi) {
+        csv << "test_name,status,runs,wall_ms_median,wall_ms_mean";
+        for (const auto& lbl : all_labels) csv << "," << lbl << "_median," << lbl << "_mean";
+        csv << ",exit_code\n";
+    } else {
+        csv << "test_name,status,passed,failed,wall_ms";
+        for (const auto& lbl : all_labels) csv << "," << lbl;
+        csv << ",exit_code\n";
+    }
 
     int any_failed = 0;
     for (int i : filtered) {
         const auto& t = reg.tests[i];
         const TestResult* latest = latest_result(final_idx, t.name);
         if (!latest) {
-            if (multi) csv << t.name << ",NO_RESULT,0,0,0,0,0,0\n";
-            else       csv << t.name << ",NO_RESULT,0,0,0,0\n";
+            csv << t.name << ",NO_RESULT\n";
             any_failed = 1;
             continue;
         }
+        csv << std::fixed << std::setprecision(3);
         if (multi) {
             auto rs = session_results(t.name);
-            bool any_pass = !rs.empty();
             bool any_fail = (latest->failed > 0 || latest->exit_code != 0);
-            std::string status = any_fail ? "FAIL" : (any_pass ? "PASS" : "NO_RESULT");
-            if (any_fail || !any_pass) any_failed = 1;
-            std::vector<double> rep_vals, wall_vals;
-            for (const auto* r : rs) {
-                rep_vals.push_back(reported_ms_of(r));
-                wall_vals.push_back((double)r->wall_ms);
+            std::string status = any_fail ? "FAIL" : (rs.empty() ? "NO_RESULT" : "PASS");
+            if (any_fail || rs.empty()) any_failed = 1;
+            std::vector<double> wall_vals;
+            for (const auto* r : rs) wall_vals.push_back((double)r->wall_ms);
+            csv << t.name << "," << status << "," << rs.size()
+                << "," << median_of(wall_vals) << "," << mean_of(wall_vals);
+            for (const auto& lbl : all_labels) {
+                std::vector<double> vals;
+                for (const auto* r : rs) vals.push_back(timing_val(r, lbl));
+                csv << "," << median_of(vals) << "," << mean_of(vals);
             }
-            csv << std::fixed << std::setprecision(3)
-                << t.name << "," << status << "," << rs.size()
-                << "," << median_of(rep_vals) << "," << mean_of(rep_vals)
-                << "," << median_of(wall_vals) << "," << mean_of(wall_vals)
-                << "," << latest->exit_code << "\n";
+            csv << "," << latest->exit_code << "\n";
         } else {
             std::string status = (latest->failed > 0 || latest->exit_code != 0) ? "FAIL" : "PASS";
             if (latest->failed > 0 || latest->exit_code != 0) any_failed = 1;
-            csv << std::fixed << std::setprecision(3)
-                << t.name << "," << status << "," << latest->passed << "," << latest->failed
-                << "," << reported_ms_of(latest) << "," << latest->exit_code << "\n";
+            csv << t.name << "," << status << "," << latest->passed << "," << latest->failed
+                << "," << latest->wall_ms;
+            for (const auto& lbl : all_labels) csv << "," << timing_val(latest, lbl);
+            csv << "," << latest->exit_code << "\n";
         }
     }
     csv.close();
 
-    std::cout << "Results written to: " << csv_path << "\n";
-    // Print a quick summary table
-    std::cout << "\n";
-    if (multi) {
-        std::cout << std::left << std::setw(32) << "TEST" << std::setw(8) << "STATUS"
-                  << std::setw(6) << "RUNS" << std::setw(16) << "REPORTED_MS(med)"
-                  << std::setw(16) << "REPORTED_MS(mean)" << "\n";
-        std::cout << std::string(78, '-') << "\n";
-        for (int i : filtered) {
-            const auto& t = reg.tests[i];
+    std::cout << "Results written to: " << csv_path << "\n\n";
+
+    // ── Summary table ─────────────────────────────────────────────────────────
+    // Display columns: wall_ms if no timing labels, otherwise one column per label
+    std::vector<std::string> wall_ms_fallback{"wall_ms"};
+    const std::vector<std::string>& display_labels = all_labels.empty() ? wall_ms_fallback : all_labels;
+    int col_w = 16;
+    std::cout << std::left << std::setw(32) << "TEST" << std::setw(8) << "STATUS";
+    if (multi) std::cout << std::setw(6) << "RUNS";
+    for (const auto& lbl : display_labels)
+        std::cout << std::setw(col_w) << (multi ? lbl + "(med)" : lbl);
+    std::cout << "\n" << std::string(40 + (multi ? 6 : 0) + col_w * display_labels.size(), '-') << "\n";
+
+    for (int i : filtered) {
+        const auto& t = reg.tests[i];
+        const TestResult* latest = latest_result(final_idx, t.name);
+        if (!latest) {
+            std::cout << std::left << std::setw(32) << t.name << "NO_RESULT\n";
+            continue;
+        }
+        bool any_fail = (latest->failed > 0 || latest->exit_code != 0);
+        std::cout << std::left << std::setw(32) << t.name
+                  << std::setw(8) << (any_fail ? "FAIL" : "PASS")
+                  << std::fixed << std::setprecision(3);
+        if (multi) {
             auto rs = session_results(t.name);
-            const TestResult* latest = latest_result(final_idx, t.name);
-            if (!latest || rs.empty()) {
-                std::cout << std::left << std::setw(32) << t.name << std::setw(8) << "NO_RESULT\n";
-                continue;
+            std::cout << std::setw(6) << rs.size();
+            for (const auto& lbl : display_labels) {
+                if (lbl == "wall_ms") {
+                    std::vector<double> v;
+                    for (const auto* r : rs) v.push_back((double)r->wall_ms);
+                    std::cout << std::setw(col_w) << median_of(v);
+                } else {
+                    std::vector<double> v;
+                    for (const auto* r : rs) v.push_back(timing_val(r, lbl));
+                    std::cout << std::setw(col_w) << median_of(v);
+                }
             }
-            bool any_fail = (latest->failed > 0 || latest->exit_code != 0);
-            std::string status = any_fail ? "FAIL" : "PASS";
-            std::vector<double> rep_vals;
-            for (const auto* r : rs) rep_vals.push_back(reported_ms_of(r));
-            std::cout << std::left << std::setw(32) << t.name
-                      << std::setw(8) << status
-                      << std::setw(6) << rs.size()
-                      << std::fixed << std::setprecision(3)
-                      << std::setw(16) << median_of(rep_vals)
-                      << mean_of(rep_vals) << "\n";
-        }
-    } else {
-        std::cout << std::left << std::setw(32) << "TEST" << std::setw(8) << "STATUS"
-                  << std::setw(8) << "PASS" << std::setw(8) << "FAIL"
-                  << std::setw(14) << "REPORTED_MS" << "\n";
-        std::cout << std::string(70, '-') << "\n";
-        for (int i : filtered) {
-            const auto& t = reg.tests[i];
-            const TestResult* r = latest_result(final_idx, t.name);
-            if (!r) {
-                std::cout << std::left << std::setw(32) << t.name << std::setw(8) << "NO_RESULT\n";
-                continue;
+        } else {
+            for (const auto& lbl : display_labels) {
+                double v = (lbl == "wall_ms") ? (double)latest->wall_ms : timing_val(latest, lbl);
+                std::cout << std::setw(col_w) << v;
             }
-            std::string status = (r->failed > 0 || r->exit_code != 0) ? "FAIL" : "PASS";
-            std::cout << std::left << std::setw(32) << t.name
-                      << std::setw(8) << status
-                      << std::setw(8) << r->passed
-                      << std::setw(8) << r->failed
-                      << std::fixed << std::setprecision(3) << reported_ms_of(r) << "\n";
         }
+        std::cout << "\n";
     }
     std::cout << "\n";
 
