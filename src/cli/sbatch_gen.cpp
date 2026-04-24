@@ -189,7 +189,7 @@ static std::string maybe_append_sub_dir(std::string& effective_root,
                                          const BuildConfig& bc,
                                          const std::string& node_rsync)
 {
-    if (bc.sub_dir.empty() || !bc.rsync_dest.empty() || node_rsync.empty()) return "";
+    if (bc.sub_dir.empty() || (bc.rsync_dest.empty() && node_rsync.empty())) return "";
     std::string name = bc.sub_dir;
     auto sl = name.rfind('/');
     if (sl != std::string::npos) name = name.substr(sl + 1);
