@@ -145,9 +145,13 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
             reg.tests.push_back(std::move(t));
         }
 
-        // Merge node profiles — parent takes priority on name collision
+        // Merge node profiles — parent takes priority; fill in missing rsync_dest from sub
         for (const auto& [nname, np] : sub.nodes) {
-            if (!reg.nodes.count(nname)) reg.nodes[nname] = np;
+            if (!reg.nodes.count(nname)) {
+                reg.nodes[nname] = np;
+            } else if (reg.nodes[nname].rsync_dest.empty() && !np.rsync_dest.empty()) {
+                reg.nodes[nname].rsync_dest = np.rsync_dest;
+            }
         }
 
         // Store sub-registry's own sbatch_defaults for per-test lookup

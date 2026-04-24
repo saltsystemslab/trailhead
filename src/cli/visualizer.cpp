@@ -436,16 +436,19 @@ static void render_detail(const TestEntry& t, const TestResult* r,
         if (!out_lines.empty() || is_live) {
             int total_out = (int)out_lines.size();
 
-            // Rows available: terminal height minus header rows, "Output" label (2),
-            // footer (2), and up to 2 scroll indicator lines (↑/↓).
+            // Rows available for output lines.
+            // Budget: term_rows()-1 total newlines (the Nth \n from CURSOR_HOME
+            // scrolls the screen if N == term_rows(), clipping the header).
+            // Subtract: rows_written so far, 2 for blank+Output-header,
+            //           FOOTER_ROWS for the footer, scroll_ind for ↑/↓ indicators.
             static constexpr int FOOTER_ROWS = 2;
             int scroll_ind = 0;
             if (!is_live) {
-                if (detail_scroll > 0) ++scroll_ind;  // will show ↑ line
-                int tentative = std::max(3, term_rows() - rows_written - 2 - FOOTER_ROWS - scroll_ind);
-                if (total_out > detail_scroll + tentative) ++scroll_ind;  // will show ↓ line
+                if (detail_scroll > 0) ++scroll_ind;
+                int tentative = std::max(3, term_rows() - 1 - rows_written - 2 - FOOTER_ROWS - scroll_ind);
+                if (total_out > detail_scroll + tentative) ++scroll_ind;
             }
-            int avail = std::max(3, term_rows() - rows_written - 2 - FOOTER_ROWS - scroll_ind);
+            int avail = std::max(3, term_rows() - 1 - rows_written - 2 - FOOTER_ROWS - scroll_ind);
 
             // When showing live output, auto-scroll to the bottom so new lines are visible.
             // When showing saved output, respect the user's scroll position.
@@ -525,7 +528,13 @@ static void render_output_log(const std::string& test_name,
     ln(hline(TOTAL_WIDTH));
 
     int total = (int)lines.size();
-    int avail = std::max(3, term_rows() - rows_written - 2 /*footer*/);
+    int scroll_ind = 0;
+    if (scroll > 0) ++scroll_ind;
+    {
+        int tentative = std::max(3, term_rows() - 1 - rows_written - 2 - scroll_ind);
+        if (total > scroll + tentative) ++scroll_ind;
+    }
+    int avail = std::max(3, term_rows() - 1 - rows_written - 2 - scroll_ind);
     int max_scroll = std::max(0, total - avail);
     if (scroll > max_scroll) scroll = max_scroll;
     if (scroll < 0)          scroll = 0;
@@ -574,7 +583,13 @@ static void render_script_preview(const std::string& test_name,
     ln(hline(TOTAL_WIDTH));
 
     int total = (int)lines.size();
-    int avail = std::max(3, term_rows() - rows_written - 2 /*footer*/);
+    int scroll_ind = 0;
+    if (scroll > 0) ++scroll_ind;
+    {
+        int tentative = std::max(3, term_rows() - 1 - rows_written - 2 - scroll_ind);
+        if (total > scroll + tentative) ++scroll_ind;
+    }
+    int avail = std::max(3, term_rows() - 1 - rows_written - 2 - scroll_ind);
     int max_scroll = std::max(0, total - avail);
     if (scroll > max_scroll) scroll = max_scroll;
     if (scroll < 0)          scroll = 0;
