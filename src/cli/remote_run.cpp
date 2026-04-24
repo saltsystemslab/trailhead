@@ -583,8 +583,12 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         for (auto& s : batch) {
             if (s.node_name.empty()) continue;
             std::string content = generate_test_script(s.test, s.node_name, reg_, script_opts);
-            if (!content.empty())
-                fs::write_file_atomic(th_dir_ + "/sbatch/" + s.test.name + ".sbatch", content);
+            if (!content.empty()) {
+                std::string path = th_dir_ + "/sbatch/" + s.test.name + ".sbatch";
+                auto slash = path.rfind('/');
+                if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
+                fs::write_file_atomic(path, content);
+            }
         }
     }
 

@@ -352,6 +352,8 @@ bool write_sbatch(const std::string& trailhead_dir,
     bool ok = true;
     for (const auto& [name, content] : scripts) {
         std::string path = sbatch_dir + "/" + name;
+        auto slash = path.rfind('/');
+        if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
         if (!fs::write_file_atomic(path, content)) ok = false;
     }
     return ok;
