@@ -1592,7 +1592,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
         o << hline(TOTAL_WIDTH) << "\n";
         o << DIM
-          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [p] preview  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [h] hw"
+          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [p] preview  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [c] clear  [h] hw"
           << RESET << "\n";
 
         // Log panel — fixed at snapshot taken above
@@ -1737,6 +1737,24 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 if (wizard_confirm_delete(reg, filtered[selected], trailhead_dir, project_root)) {
                     rebuild_filtered();
                     idx = load_all_results(results_dir);
+                }
+                redraw = true;
+            }
+            if ((key == 'c' || key == 'C') && total > 0) {
+                const std::string& tname = reg.tests[filtered[selected]].name;
+                auto it = idx.find(tname);
+                if (it != idx.end()) {
+                    int n = 0;
+                    for (const auto& r : it->second) {
+                        if (!r.result_file.empty()) {
+                            ::unlink(r.result_file.c_str());
+                            std::string out = result_output_path(r);
+                            if (!out.empty()) ::unlink(out.c_str());
+                            ++n;
+                        }
+                    }
+                    idx.erase(it);
+                    job_log->push("Cleared " + std::to_string(n) + " result(s) for " + tname);
                 }
                 redraw = true;
             }
