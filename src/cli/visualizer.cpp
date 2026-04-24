@@ -1956,13 +1956,12 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
     bool multi = repeat > 1;
 
-    // For each test, find the set of timing labels it actually reports.
-    // Only tests with 2+ labels need per-label breakdown columns; single-label
-    // tests are fully represented by reported_ms (= that one label's value).
-    std::vector<std::string> all_labels;
+    // For each test, find the ordered set of timing labels it reports.
+    // Tests with 2+ labels: show per-label columns, suppress reported_ms (sum is meaningless).
+    // Tests with 1 label:   show reported_ms only (= that label's value).
+    std::unordered_map<std::string, std::vector<std::string>> test_label_sets;
+    std::vector<std::string> all_labels; // labels from multi-label tests only
     {
-        // Per-test label sets (ordered by first appearance)
-        std::unordered_map<std::string, std::vector<std::string>> test_label_sets;
         for (int i : filtered) {
             const auto& tname = reg.tests[i].name;
             std::unordered_set<std::string> seen;
@@ -1978,11 +1977,9 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 collect(latest_result(final_idx, tname));
             test_label_sets[tname] = std::move(ordered);
         }
-        // Collect labels only from tests that report 2+ distinct labels
         std::unordered_set<std::string> seen_labels;
         for (int i : filtered) {
-            const auto& tname = reg.tests[i].name;
-            const auto& lbls = test_label_sets[tname];
+            const auto& lbls = test_label_sets[reg.tests[i].name];
             if (lbls.size() < 2) continue;
             for (const auto& lbl : lbls)
                 if (seen_labels.insert(lbl).second)
@@ -1990,16 +1987,20 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         }
     }
 
-    // Helper: look up a timing label value in a result (0 if absent)
     auto timing_val = [](const TestResult* r, const std::string& lbl) -> double {
         for (const auto& te : r->timings) if (te.label == lbl) return te.elapsed_ms;
         return 0.0;
     };
-
     auto reported_ms_of = [](const TestResult* r) -> double {
         double s = 0; for (const auto& te : r->timings) s += te.elapsed_ms; return s;
     };
+    // Does this test report 2+ timing labels?
+    auto is_multi_label = [&](const std::string& name) {
+        auto it = test_label_sets.find(name);
+        return it != test_label_sets.end() && it->second.size() >= 2;
+    };
 
+    // ── CSV ───────────────────────────────────────────────────────────────────
     std::ofstream csv(csv_path);
     if (multi) {
         csv << "test_name,status,runs,reported_ms_median,reported_ms_mean";
@@ -2015,32 +2016,38 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     for (int i : filtered) {
         const auto& t = reg.tests[i];
         const TestResult* latest = latest_result(final_idx, t.name);
-        if (!latest) {
-            csv << t.name << ",NO_RESULT\n";
-            any_failed = 1;
-            continue;
-        }
+        if (!latest) { csv << t.name << ",NO_RESULT\n"; any_failed = 1; continue; }
+        bool mlabel = is_multi_label(t.name);
         csv << std::fixed << std::setprecision(3);
         if (multi) {
             auto rs = session_results(t.name);
             bool any_fail = (latest->failed > 0 || latest->exit_code != 0);
             std::string status = any_fail ? "FAIL" : (rs.empty() ? "NO_RESULT" : "PASS");
             if (any_fail || rs.empty()) any_failed = 1;
-            std::vector<double> rep_vals;
-            for (const auto* r : rs) rep_vals.push_back(reported_ms_of(r));
-            csv << t.name << "," << status << "," << rs.size()
-                << "," << median_of(rep_vals) << "," << mean_of(rep_vals);
+            // reported_ms: value for single-label tests, blank for multi-label
+            csv << t.name << "," << status << "," << rs.size() << ",";
+            if (!mlabel) {
+                std::vector<double> v; for (const auto* r : rs) v.push_back(reported_ms_of(r));
+                csv << median_of(v) << "," << mean_of(v);
+            } else {
+                csv << ","; // blank reported_ms for multi-label tests
+            }
             for (const auto& lbl : all_labels) {
-                std::vector<double> vals;
-                for (const auto* r : rs) vals.push_back(timing_val(r, lbl));
-                csv << "," << median_of(vals) << "," << mean_of(vals);
+                std::vector<double> v; for (const auto* r : rs) v.push_back(timing_val(r, lbl));
+                double med = median_of(v), mn = mean_of(v);
+                if (med == 0.0 && mn == 0.0) csv << ",,";
+                else csv << "," << med << "," << mn;
             }
             csv << "\n";
         } else {
             std::string status = (latest->failed > 0 || latest->exit_code != 0) ? "FAIL" : "PASS";
             if (latest->failed > 0 || latest->exit_code != 0) any_failed = 1;
-            csv << t.name << "," << status << "," << reported_ms_of(latest);
-            for (const auto& lbl : all_labels) csv << "," << timing_val(latest, lbl);
+            csv << t.name << "," << status << ",";
+            if (!mlabel) csv << reported_ms_of(latest);
+            for (const auto& lbl : all_labels) {
+                double v = timing_val(latest, lbl);
+                csv << "," << (v == 0.0 ? "" : std::to_string(v));
+            }
             csv << "\n";
         }
     }
@@ -2049,40 +2056,53 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     std::cout << "Results written to: " << csv_path << "\n\n";
 
     // ── Summary table ─────────────────────────────────────────────────────────
+    // Dynamic name column width
+    size_t name_w = 8;
+    for (int i : filtered) name_w = std::max(name_w, reg.tests[i].name.size() + 2);
+
     int col_w = 16;
-    std::cout << std::left << std::setw(32) << "TEST" << std::setw(8) << "STATUS";
-    if (multi) std::cout << std::setw(6) << "RUNS";
+    int runs_w = multi ? 6 : 0;
+    std::cout << std::left << std::setw((int)name_w) << "TEST" << std::setw(8) << "STATUS";
+    if (multi) std::cout << std::setw(runs_w) << "RUNS";
     std::cout << std::setw(col_w) << (multi ? "reported_ms(med)" : "reported_ms");
     for (const auto& lbl : all_labels)
         std::cout << std::setw(col_w) << (multi ? lbl + "(med)" : lbl);
-    std::cout << "\n" << std::string(40 + (multi ? 6 : 0) + col_w * (1 + all_labels.size()), '-') << "\n";
+    int total_w = (int)name_w + 8 + runs_w + col_w * (1 + (int)all_labels.size());
+    std::cout << "\n" << std::string(total_w, '-') << "\n";
 
     for (int i : filtered) {
         const auto& t = reg.tests[i];
         const TestResult* latest = latest_result(final_idx, t.name);
         if (!latest) {
-            std::cout << std::left << std::setw(32) << t.name << "NO_RESULT\n";
+            std::cout << std::left << std::setw((int)name_w) << t.name << "NO_RESULT\n";
             continue;
         }
         bool any_fail = (latest->failed > 0 || latest->exit_code != 0);
-        std::cout << std::left << std::setw(32) << t.name
+        bool mlabel   = is_multi_label(t.name);
+        std::cout << std::left << std::setw((int)name_w) << t.name
                   << std::setw(8) << (any_fail ? "FAIL" : "PASS")
                   << std::fixed << std::setprecision(3);
         if (multi) {
             auto rs = session_results(t.name);
-            std::cout << std::setw(6) << rs.size();
-            std::vector<double> rep_vals;
-            for (const auto* r : rs) rep_vals.push_back(reported_ms_of(r));
-            std::cout << std::setw(col_w) << median_of(rep_vals);
-            for (const auto& lbl : all_labels) {
-                std::vector<double> v;
-                for (const auto* r : rs) v.push_back(timing_val(r, lbl));
+            std::cout << std::setw(runs_w) << rs.size();
+            // reported_ms: value for single-label, dash for multi-label
+            if (!mlabel) {
+                std::vector<double> v; for (const auto* r : rs) v.push_back(reported_ms_of(r));
                 std::cout << std::setw(col_w) << median_of(v);
+            } else {
+                std::cout << std::setw(col_w) << "—";
+            }
+            for (const auto& lbl : all_labels) {
+                std::vector<double> v; for (const auto* r : rs) v.push_back(timing_val(r, lbl));
+                double med = median_of(v);
+                std::cout << std::setw(col_w) << (med == 0.0 ? "—" : std::to_string(med).substr(0,7));
             }
         } else {
-            std::cout << std::setw(col_w) << reported_ms_of(latest);
-            for (const auto& lbl : all_labels)
-                std::cout << std::setw(col_w) << timing_val(latest, lbl);
+            std::cout << std::setw(col_w) << (mlabel ? "—" : std::to_string(reported_ms_of(latest)).substr(0,9));
+            for (const auto& lbl : all_labels) {
+                double v = timing_val(latest, lbl);
+                std::cout << std::setw(col_w) << (v == 0.0 ? "—" : std::to_string(v).substr(0,9));
+            }
         }
         std::cout << "\n";
     }
