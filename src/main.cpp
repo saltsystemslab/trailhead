@@ -1042,7 +1042,8 @@ static int cmd_watch(int argc, char** argv) {
     }
 
     bool auto_run = args.flag("run-all");
-    return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, project_root, auto_run);
+    int repeat = args.get_int("repeat", 1);
+    return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, project_root, auto_run, repeat);
 }
 
 // ── Subcommand: show ──────────────────────────────────────────────────────

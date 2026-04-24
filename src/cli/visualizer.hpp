@@ -82,7 +82,8 @@ int run_watch(const std::string& trailhead_dir,
               std::shared_ptr<JobLog> job_log = nullptr,
               std::function<void(const std::string&, const std::string&)> run_fn = nullptr,
               std::string project_root = "",
-              bool auto_run = false);
+              bool auto_run = false,
+              int repeat = 1);
 
 // One-shot status print (non-interactive)
 void print_status(const std::string& trailhead_dir,
