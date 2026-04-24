@@ -5,7 +5,6 @@
 #include "../util/process.hpp"
 #include <sstream>
 #include <deque>
-#include <map>
 #include <set>
 #include <thread>
 #include <mutex>
@@ -132,7 +131,9 @@ static bool build_one_target(
         }
     }
 
-    std::string build_cmd = "cmake --build " + eff_dir + " --target " + target;
+    unsigned int nj = std::max(1u, std::thread::hardware_concurrency());
+    std::string build_cmd = "cmake --build " + eff_dir + " --target " + target
+                          + " -j" + std::to_string(nj);  // full CPU count; called alone
     safe_log("building: " + build_cmd);
     auto br = proc::run(build_cmd, {}, {}, 300, project_root, [&](const std::string& line) {
         safe_log(line);
@@ -151,47 +152,114 @@ std::vector<std::string> pre_build_all(
     const std::string& project_root,
     std::function<void(const std::string&)> log_fn)
 {
-    // Collect unique (build_name, target) pairs and group by effective build dir.
-    // Targets in different build dirs are independent and can build in parallel.
     struct BuildJob { std::string build_name, target; };
-    std::set<std::string> seen;
-    std::map<std::string, std::vector<BuildJob>> by_dir;
+    std::set<std::string> seen_jobs, seen_dirs;
+    std::vector<BuildJob> jobs;
+    // build dirs that need configure: eff_dir -> BuildConfig snapshot
+    std::vector<std::pair<std::string, BuildConfig>> dirs_to_configure;
 
     for (const auto& t : tests) {
         if (t.build_name.empty() || t.target.empty()) continue;
         auto it = reg.builds.find(t.build_name);
         if (it == reg.builds.end()) continue;
-        std::string key = t.build_name + ":" + t.target;
-        if (!seen.insert(key).second) continue;
         const auto& bc = it->second;
         std::string raw = bc.dir.empty() ? "build" : bc.dir;
         std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
-        by_dir[eff].push_back({t.build_name, t.target});
+        std::string bd  = project_root + "/" + eff;
+        if (seen_dirs.insert(eff).second && !bc.configure_cmd.empty() &&
+            !fs::exists(bd + "/Makefile") && !fs::exists(bd + "/build.ninja"))
+            dirs_to_configure.push_back({eff, bc});
+        if (seen_jobs.insert(t.build_name + ":" + t.target).second)
+            jobs.push_back({t.build_name, t.target});
     }
 
-    if (by_dir.empty()) return {};
-    if (log_fn) log_fn("pre-build: " + std::to_string(seen.size()) + " target(s) across "
-                       + std::to_string(by_dir.size()) + " build dir(s)");
+    if (jobs.empty()) return {};
+
+    std::mutex log_mtx;
+    auto safe_log = [&](const std::string& msg) {
+        if (log_fn && !msg.empty()) {
+            std::lock_guard<std::mutex> lk(log_mtx);
+            log_fn(msg);
+        }
+    };
 
     std::vector<std::string> failed;
-    std::mutex result_mtx;
-    std::vector<std::thread> threads;
+    std::mutex failed_mtx;
 
-    for (const auto& [dir, jobs] : by_dir) {
-        threads.emplace_back([&, jobs = jobs]() {
-            for (const auto& job : jobs) {
-                auto bc_it = reg.builds.find(job.build_name);
-                if (bc_it == reg.builds.end()) continue;
-                bool ok = build_one_target(bc_it->second, job.target, project_root,
-                                           log_fn, &result_mtx);
-                if (!ok) {
-                    std::lock_guard<std::mutex> lk(result_mtx);
-                    failed.push_back(job.build_name + ":" + job.target);
+    // Phase 1: configure each unique build dir in parallel (fast, few dirs)
+    if (!dirs_to_configure.empty()) {
+        safe_log("pre-build: configuring " + std::to_string(dirs_to_configure.size()) + " dir(s)...");
+        std::vector<std::thread> conf_threads;
+        for (const auto& entry : dirs_to_configure) {
+            const std::string eff = entry.first;
+            const BuildConfig bc  = entry.second;
+            conf_threads.emplace_back([&, eff, bc]() {
+                std::string raw = bc.dir.empty() ? "build" : bc.dir;
+                std::string base_wd = bc.sub_dir.empty()
+                    ? project_root : project_root + "/" + bc.sub_dir;
+                std::string configure_cmd = bc.configure_cmd;
+                if (configure_cmd.find("{{arch}}") != std::string::npos) {
+                    std::string arch = detect_cuda_arch();
+                    if (arch.empty()) {
+                        safe_log("arch detection failed for " + eff);
+                        std::lock_guard<std::mutex> lk(failed_mtx);
+                        failed.push_back("configure:" + eff);
+                        return;
+                    }
+                    size_t pos = 0;
+                    while ((pos = configure_cmd.find("{{arch}}", pos)) != std::string::npos) {
+                        configure_cmd.replace(pos, 8, arch);
+                        pos += arch.size();
+                    }
                 }
+                bool from_build = configure_cmd.size() >= 3 &&
+                                  configure_cmd.substr(configure_cmd.size() - 3) == " ..";
+                std::string conf_wd = from_build ? base_wd + "/" + raw : base_wd;
+                if (from_build) fs::mkdir_p(conf_wd);
+                safe_log("configuring: " + configure_cmd);
+                auto cr = proc::run(configure_cmd, {}, {}, 300, conf_wd,
+                    [&](const std::string& line) { safe_log(line); }, true);
+                if (cr.exit_code != 0) {
+                    if (!cr.stderr_str.empty()) safe_log(cr.stderr_str);
+                    safe_log("configure failed (exit=" + std::to_string(cr.exit_code) + ")");
+                    std::lock_guard<std::mutex> lk(failed_mtx);
+                    failed.push_back("configure:" + eff);
+                }
+            });
+        }
+        for (auto& th : conf_threads) th.join();
+        if (!failed.empty()) return failed;
+    }
+
+    // Phase 2: build ALL unique targets in parallel, dividing CPU threads among them
+    unsigned int ncpus = std::max(1u, std::thread::hardware_concurrency());
+    unsigned int jobs_each = std::max(1u, ncpus / (unsigned)jobs.size());
+    safe_log("pre-build: building " + std::to_string(jobs.size()) + " target(s)"
+             + " (-j" + std::to_string(jobs_each) + " each, "
+             + std::to_string(ncpus) + " logical CPUs)");
+
+    std::vector<std::thread> build_threads;
+    for (const auto& job : jobs) {
+        build_threads.emplace_back([&, job]() {
+            auto bc_it = reg.builds.find(job.build_name);
+            if (bc_it == reg.builds.end()) return;
+            const auto& bc = bc_it->second;
+            std::string raw = bc.dir.empty() ? "build" : bc.dir;
+            std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
+            std::string build_cmd = "cmake --build " + eff + " --target " + job.target
+                                  + " -j" + std::to_string(jobs_each);
+            safe_log("building: " + build_cmd);
+            auto br = proc::run(build_cmd, {}, {}, 600, project_root,
+                [&](const std::string& line) { safe_log(line); }, true);
+            if (br.exit_code != 0) {
+                if (!br.stderr_str.empty()) safe_log(br.stderr_str);
+                safe_log("build failed: " + job.build_name + ":" + job.target);
+                std::lock_guard<std::mutex> lk(failed_mtx);
+                failed.push_back(job.build_name + ":" + job.target);
             }
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : build_threads) th.join();
     return failed;
 }
 
