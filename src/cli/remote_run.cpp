@@ -559,6 +559,13 @@ void BatchSubmitter::worker_loop() {
 }
 
 void BatchSubmitter::process_batch(std::vector<Submission> batch) {
+    // Refresh registry from disk so hardware edits made during the session are picked up.
+    // process_batch only runs on the single worker thread, so no locking needed.
+    if (auto fresh = load_registry(th_dir_)) {
+        reg_ = *fresh;
+        merge_sub_registries(reg_, project_root_);
+    }
+
     // Shared log: prefix with "[batch N]" for messages that apply to all tests
     int n = (int)batch.size();
     auto blog = [&](const std::string& msg) {
