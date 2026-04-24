@@ -122,19 +122,34 @@ void LocalRunner::run_task(Task& task) {
                     auto ar = proc::run(
                         "nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once",
                         {}, {}, 5, "", nullptr, false);
+                    std::string arch;
                     if (ar.exit_code == 0 && !ar.stdout_str.empty()) {
-                        std::string arch;
                         for (char c : ar.stdout_str) {
                             if (c >= '0' && c <= '9') arch += c;
                             else if (c == '\n' || c == '\r') break;
                         }
-                        if (!arch.empty()) {
-                            size_t pos = 0;
-                            while ((pos = configure_cmd.find("{{arch}}", pos)) != std::string::npos) {
-                                configure_cmd.replace(pos, 8, arch);
-                                pos += arch.size();
-                            }
-                        }
+                    }
+                    if (arch.empty()) {
+                        if (log) log("arch detection failed: nvidia-smi returned no compute capability");
+                        TestResult res;
+                        res.name      = t.name;
+                        res.failed    = 1;
+                        res.exit_code = 1;
+                        res.run_by    = "local";
+                        res.host      = "localhost";
+                        res.metadata["_output_tail"] = "arch detection failed: nvidia-smi returned no compute capability";
+                        std::string results_dir = th_dir_ + "/results";
+                        fs::mkdir_p(results_dir);
+                        save_result(results_dir, res);
+                        save_result_output(results_dir, res, res.metadata["_output_tail"]);
+                        if (set_status) set_status("");
+                        job_log_->active--;
+                        return;
+                    }
+                    size_t pos = 0;
+                    while ((pos = configure_cmd.find("{{arch}}", pos)) != std::string::npos) {
+                        configure_cmd.replace(pos, 8, arch);
+                        pos += arch.size();
                     }
                 }
 
@@ -150,7 +165,9 @@ void LocalRunner::run_task(Task& task) {
                 }
 
                 if (log) log("configuring: " + configure_cmd);
-                auto cr = proc::run(configure_cmd, {}, {}, 300, conf_wd, nullptr, true);
+                auto cr = proc::run(configure_cmd, {}, {}, 300, conf_wd, [&](const std::string& line) {
+                    if (log && !line.empty()) log(line);
+                }, true);
                 if (cr.exit_code != 0) {
                     if (log) {
                         if (!cr.stdout_str.empty()) log(cr.stdout_str);
@@ -176,7 +193,9 @@ void LocalRunner::run_task(Task& task) {
 
             std::string build_cmd = "cmake --build " + eff_build_dir + " --target " + t.target;
             if (log) log("building: " + build_cmd);
-            auto br = proc::run(build_cmd, {}, {}, 300, project_root_, nullptr, true);
+            auto br = proc::run(build_cmd, {}, {}, 300, project_root_, [&](const std::string& line) {
+                if (log && !line.empty()) log(line);
+            }, true);
             if (br.exit_code != 0) {
                 if (log) {
                     if (!br.stdout_str.empty()) log(br.stdout_str);
