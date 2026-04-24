@@ -86,9 +86,12 @@ void LocalRunner::run_task(Task& task) {
             std::string base_wd = bc.sub_dir.empty()
                 ? project_root_ : project_root_ + "/" + bc.sub_dir;
 
-            // Configure if build dir has no CMakeCache.txt (handles missing or partially-created dirs)
-            if (!bc.configure_cmd.empty() &&
-                !fs::exists(project_root_ + "/" + eff_build_dir + "/CMakeCache.txt")) {
+            // Configure if build system file is absent (CMakeCache.txt alone isn't enough —
+            // a partial configure may leave it without a Makefile/build.ninja).
+            std::string bd = project_root_ + "/" + eff_build_dir;
+            bool needs_configure = !bc.configure_cmd.empty() &&
+                !fs::exists(bd + "/Makefile") && !fs::exists(bd + "/build.ninja");
+            if (needs_configure) {
                 std::string configure_cmd = bc.configure_cmd;
 
                 // Substitute {{arch}} with auto-detected local GPU compute capability

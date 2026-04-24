@@ -1721,12 +1721,12 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                                 if (ap != std::string::npos)
                                     cfg.replace(ap, 8, "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,once | head -1 | tr -d '.')");
                                 bool from_build = cfg.size() >= 3 && cfg.substr(cfg.size()-3) == " ..";
-                                ss << "# configure (if CMakeCache.txt absent)\n";
+                                ss << "# configure (if build system absent)\n";
+                                std::string chk = "([ -f " + eff + "/Makefile ] || [ -f " + eff + "/build.ninja ])";
                                 if (from_build)
-                                    ss << "[ -f " << eff << "/CMakeCache.txt ] || "
-                                       << "(mkdir -p " << eff << " && cd " << eff << " && " << cfg << ")\n\n";
+                                    ss << chk << " || (mkdir -p " << eff << " && cd " << eff << " && " << cfg << ")\n\n";
                                 else
-                                    ss << "[ -d " << eff << " ] || " << cfg << "\n\n";
+                                    ss << chk << " || " << cfg << "\n\n";
                             }
                             if (!t.target.empty())
                                 ss << "cmake --build " << eff << " --target " << t.target << "\n\n";

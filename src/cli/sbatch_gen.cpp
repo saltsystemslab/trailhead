@@ -127,11 +127,14 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
     if (!configure_cmd.empty() && !build_dir.empty()) {
         std::string cfg = str_replace_all(configure_cmd, "-B build", "-B " + build_dir);
         bool from_build = cfg.size() >= 3 && cfg.substr(cfg.size() - 3) == " ..";
+        // Check for the build system file (not just CMakeCache.txt) so a partial
+        // configure that left no Makefile/build.ninja still triggers a re-run.
         if (from_build) {
-            o << "[ -f " << build_dir << "/CMakeCache.txt ] || "
+            o << "([ -f " << build_dir << "/Makefile ] || [ -f " << build_dir << "/build.ninja ]) || "
               << "(mkdir -p " << build_dir << " && cd " << build_dir << " && " << cfg << ")\n\n";
         } else {
-            o << "[ -d " << build_dir << " ] || " << cfg << "\n\n";
+            o << "([ -f " << build_dir << "/Makefile ] || [ -f " << build_dir << "/build.ninja ]) || "
+              << cfg << "\n\n";
         }
     }
 
