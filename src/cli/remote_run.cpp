@@ -365,8 +365,13 @@ static bool poll_and_finalize(
         }
     }
 
-    // Release the SLURM slot immediately — the job has left the queue, so a new
-    // sbatch can go in now.  Result collection (ssh cat + rsync-back) continues below.
+    // Brief pause so SLURM's QOS accounting catches up before we submit the next job.
+    // squeue going empty doesn't always mean the slot counter has decremented yet;
+    // without this, rapid succession of completions triggers QOSMaxSubmitJobPerUserLimit.
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+
+    // Release the SLURM slot — a new sbatch can go in now.
+    // Result collection (ssh cat + rsync-back) continues below.
     if (on_job_done) on_job_done();
 
     int64_t t_end = std::chrono::duration_cast<std::chrono::milliseconds>(

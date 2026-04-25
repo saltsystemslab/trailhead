@@ -107,6 +107,8 @@ static std::string status_badge(RunStatus s) {
     }
 }
 
+static std::string scroll_name(const std::string& s, int offset, int width);
+
 static const int COL_NAME   = 24;
 static const int COL_NODE   = 16;  // wider to fit build + [gpu/cpu] tag
 static const int COL_STATUS =  8;
@@ -180,12 +182,14 @@ static std::string header_row() {
 
 static std::string test_row(const TestEntry& t, const TestResult* r,
                               const Registry& reg, bool selected,
-                              const std::string& live_status = "")
+                              const std::string& live_status = "",
+                              int name_offset = 0)
 {
     using namespace ansi;
     RunStatus status = r ? result_status(*r) : RunStatus::Unknown;
 
-    std::string name_col = pad(t.name, COL_NAME);
+    std::string name_col = selected ? scroll_name(t.name, name_offset, COL_NAME)
+                                     : pad(t.name, COL_NAME);
     std::string build_tag = t.build_name;
     if (!t.requires_hw.empty() && t.requires_hw != "any")
         build_tag += " [" + t.requires_hw + "]";
@@ -1568,6 +1572,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
     int selected      = 0;
     int scroll        = 0;
+    int name_scroll   = 0;
+    int name_scroll_ticks = 0;
     bool detail_mode  = false;
     int detail_scroll = 0;
     int detail_ticks  = 0;
@@ -1669,7 +1675,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             const auto& t = reg.tests[filtered[i]];
             const TestResult* r = latest_result(idx, t.name);
             std::string live = job_log ? job_log->get_live(t.name) : "";
-            o << test_row(t, r, reg, i == selected, live) << "\n";
+            o << test_row(t, r, reg, i == selected, live,
+                          i == selected ? name_scroll : 0) << "\n";
         }
 
         if (need_down)
@@ -1727,8 +1734,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         if (!detail_mode && !preview_mode && !output_mode) {
             bool redraw = false;
             if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) break;
-            if (key == 'j' || key == 1001 /*down*/) { selected = (selected + 1) % std::max(total, 1); redraw = true; }
-            if (key == 'k' || key == 1000 /*up*/)   { selected = (selected - 1 + std::max(total, 1)) % std::max(total, 1); redraw = true; }
+            if (key == 'j' || key == 1001 /*down*/) { selected = (selected + 1) % std::max(total, 1); name_scroll = 0; name_scroll_ticks = 0; redraw = true; }
+            if (key == 'k' || key == 1000 /*up*/)   { selected = (selected - 1 + std::max(total, 1)) % std::max(total, 1); name_scroll = 0; name_scroll_ticks = 0; redraw = true; }
             if (key == 'r') { idx = load_all_results(results_dir); ticks = 0; redraw = true; }
             if ((key == 'R') && total > 0 && run_fn) {
                 if (selected_hw.empty() && !reg.nodes.empty()) {
@@ -1900,6 +1907,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             }
             // Auto-refresh
             ++ticks;
+            // Advance name marquee every 6 ticks (~600ms) when name is long
+            if (++name_scroll_ticks >= 6) { ++name_scroll; name_scroll_ticks = 0; redraw = true; }
             if (ticks >= refresh_every) {
                 idx = load_all_results(results_dir);
                 ticks = 0;
