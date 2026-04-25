@@ -90,13 +90,17 @@ static std::string str_replace_all(std::string s,
 // build_dir:      the directory cmake builds into for this node (e.g. "build_h200")
 // configure_cmd:  cmake configure command from the build config (run once on the node)
 // node_preamble:  per-node shell lines emitted after project preamble (module loads, exports, etc.)
+// parent_project: absolute remote path of the root project (non-empty only for sub-registry tests)
+// parent_setup:   root project setup commands, run before own setup when parent_project is set
 static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
                                 const SbatchDefaults& defs,
                                 const std::string& project_root,
                                 const std::string& build_dir,
                                 const std::string& configure_cmd,
                                 const std::vector<std::string>& setup = {},
-                                const std::vector<std::string>& node_preamble = {})
+                                const std::vector<std::string>& node_preamble = {},
+                                const std::string& parent_project = {},
+                                const std::vector<std::string>& parent_setup = {})
 {
     std::ostringstream o;
 
@@ -120,6 +124,18 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
     if (!project_root.empty())
         o << "cd " << project_root << "\n";
     o << "\n";
+
+    // Root project setup: run before own setup for sub-registry tests that depend on it.
+    if (!parent_project.empty() && !parent_setup.empty()) {
+        o << "if [ ! -f " << parent_project << "/.trailhead/setup_done ]; then\n";
+        o << "  (\n";
+        o << "    cd " << parent_project << "\n";
+        for (const auto& s : parent_setup)
+            o << "    " << s << "\n";
+        o << "    touch .trailhead/setup_done\n";
+        o << "  )\n";
+        o << "fi\n\n";
+    }
 
     // Project setup: submodule init, dataset downloads, etc.
     // Guarded by .trailhead/setup_done so it only runs once per remote workspace.
@@ -263,6 +279,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             std::string effective_root = opts.project_root;
             std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
             std::string sub_dir_name;
+            std::string root_remote;
             if (!t.build_name.empty()) {
                 auto bit = reg.builds.find(t.build_name);
                 if (bit != reg.builds.end()) {
@@ -270,6 +287,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                     configure_cmd = bit->second.configure_cmd;
                     effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
                                                             opts.project_root, project_name);
+                    root_remote = effective_root;
                     sub_dir_name = maybe_append_sub_dir(effective_root, bit->second, node_rsync);
                 }
             }
@@ -286,9 +304,12 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                 for (const auto& [bname, bc] : reg.builds) {
                     if (!bc.configure_cmd.empty()) {
                         configure_cmd = bc.configure_cmd;
-                        if (effective_root == opts.project_root)
+                        if (effective_root == opts.project_root) {
                             effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
                                                                     opts.project_root, project_name);
+                            root_remote = effective_root;
+                            maybe_append_sub_dir(effective_root, bc, node_rsync);
+                        }
                         break;
                     }
                 }
@@ -302,9 +323,19 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             }
             TestEntry t_adj = t;
             t_adj.workdir = adjust_workdir(t.workdir, sub_dir_name);
+
+            std::string parent_project;
+            std::vector<std::string> parent_setup_vec;
+            if (!t.sub_dir.empty() && !reg.setup.empty() && !root_remote.empty()
+                    && root_remote != effective_root) {
+                parent_project = root_remote;
+                parent_setup_vec = reg.setup;
+            }
+
             script << sbatch_body({&t_adj}, defs, effective_root,
                                   build_dir, configure_cmd, effective_setup(reg, t),
-                                  node_ptr ? node_ptr->preamble : std::vector<std::string>{});
+                                  node_ptr ? node_ptr->preamble : std::vector<std::string>{},
+                                  parent_project, parent_setup_vec);
 
             out.push_back({t.name + ".sbatch", script.str()});
         }
@@ -428,6 +459,7 @@ std::string generate_test_script(const TestEntry& test,
     std::string effective_root = opts.project_root;
     std::string node_rsync = node_ptr ? node_ptr->rsync_dest : "";
     std::string sub_dir_name;
+    std::string root_remote;  // root project remote path (before sub-dir appended)
     if (!test.build_name.empty()) {
         auto bit = reg.builds.find(test.build_name);
         if (bit != reg.builds.end()) {
@@ -435,6 +467,7 @@ std::string generate_test_script(const TestEntry& test,
             configure_cmd = bit->second.configure_cmd;
             effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
                                                     opts.project_root, project_name);
+            root_remote = effective_root;
             sub_dir_name = maybe_append_sub_dir(effective_root, bit->second, node_rsync);
         }
     }
@@ -448,9 +481,12 @@ std::string generate_test_script(const TestEntry& test,
         for (const auto& [bname, bc] : reg.builds) {
             if (!bc.configure_cmd.empty()) {
                 configure_cmd = bc.configure_cmd;
-                if (effective_root == opts.project_root)
+                if (effective_root == opts.project_root) {
                     effective_root = resolve_effective_root(bc.rsync_dest, node_rsync,
                                                             opts.project_root, project_name);
+                    root_remote = effective_root;
+                    maybe_append_sub_dir(effective_root, bc, node_rsync);
+                }
                 break;
             }
         }
@@ -464,9 +500,20 @@ std::string generate_test_script(const TestEntry& test,
     }
     TestEntry test_adj = test;
     test_adj.workdir = adjust_workdir(test.workdir, sub_dir_name);
+
+    // For sub-registry tests: also run root setup if the root has setup commands
+    std::string parent_project;
+    std::vector<std::string> parent_setup_vec;
+    if (!test.sub_dir.empty() && !reg.setup.empty() && !root_remote.empty()
+            && root_remote != effective_root) {
+        parent_project = root_remote;
+        parent_setup_vec = reg.setup;
+    }
+
     script << sbatch_body({&test_adj}, defs, effective_root,
                           build_dir, configure_cmd, effective_setup(reg, test),
-                          node_ptr ? node_ptr->preamble : std::vector<std::string>{});
+                          node_ptr ? node_ptr->preamble : std::vector<std::string>{},
+                          parent_project, parent_setup_vec);
     return script.str();
 }
 
