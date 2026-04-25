@@ -545,10 +545,10 @@ void BatchSubmitter::worker_loop() {
             cv_.wait(lk, [&] { return stopped_ || !queue_.empty(); });
             if (stopped_ && queue_.empty()) break;
 
-            // Short grace period to collect additional presses before rsyncing
-            lk.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            lk.lock();
+            // Short grace period to collect additional presses before rsyncing.
+            // Interruptible: wakes early if stopped_ is set during the wait.
+            cv_.wait_for(lk, std::chrono::milliseconds(400), [&] { return stopped_; });
+            if (stopped_ && queue_.empty()) break;
 
             batch = {queue_.begin(), queue_.end()};
             queue_.clear();
@@ -600,6 +600,18 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         }
     }
 
+    // Bail out early if the TUI has been closed while we were waiting.
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (stopped_) {
+            for (auto& s : batch) {
+                if (s.status_fn) s.status_fn("");
+                job_log_->active--;
+            }
+            return;
+        }
+    }
+
     if (!do_rsync(project_root_, dest_, [&](const std::string& m){ blog(m); })) {
         // rsync failed — fail all tests in the batch
         for (auto& s : batch) {
@@ -612,6 +624,16 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
     // Submit each job serially, throttled by the slot limit.
     // Acquiring a slot blocks until SLURM has room for another job.
     for (auto& s : batch) {
+        // Skip this job if the TUI was closed between submissions
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (stopped_) {
+                if (s.status_fn) s.status_fn("");
+                job_log_->active--;
+                continue;
+            }
+        }
+
         // Wait for a free slot — show QUEUED if we have to wait
         {
             std::unique_lock<std::mutex> lk(slots_->mtx);
