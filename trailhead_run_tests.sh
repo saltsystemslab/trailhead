@@ -22,7 +22,7 @@ echo "${_BOLD}${_CYAN}TRAILHEAD${_RESET}  ${_BOLD}run-tests${_RESET}  $(git -C "
 # Try git pull; if HEAD changed, re-exec so the new script and binary are used.
 _OLD_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
 echo "==> Checking for updates..."
-if ! git -C "$SCRIPT_DIR" pull --ff-only origin main; then
+if ! git -C "$SCRIPT_DIR" pull --ff-only https://github.com/saltsystemslab/trailhead.git main; then
     echo "==> Could not pull updates (see above). Continuing with current version."
 fi
 _NEW_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
