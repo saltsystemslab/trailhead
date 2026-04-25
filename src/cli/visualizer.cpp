@@ -1016,7 +1016,7 @@ static std::string wizard_create_build(Registry& reg, const std::string& th_dir)
     if (name.empty()) { enter_raw_mode(); return ""; }
 
     std::string dir       = read_line("Build directory", "build");
-    std::string def_cfg   = "cmake -B " + dir + " -DCMAKE_BUILD_TYPE=Release";
+    std::string def_cfg   = "cmake -B " + dir + " -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES={{arch}}";
     std::string configure = read_line("Configure command", def_cfg);
     std::string def_bld   = "cmake --build " + dir + " -j$(nproc)";
     std::string build_cmd = read_line("Build command", def_bld);
