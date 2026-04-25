@@ -1046,7 +1046,7 @@ static std::string wizard_select_build(Registry& reg, const std::string& th_dir)
     };
 
     auto names = rebuild_names();
-    int cursor = 0;
+    int cursor = (names.size() > 1) ? 1 : 0;
     int name_scroll = 0;
     int scroll_ticks = 0;
     while (true) {
