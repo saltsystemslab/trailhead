@@ -1235,9 +1235,12 @@ static int cmd_setup(int argc, char** argv) {
                 ++failed;
             }
         }
+        trailhead::fs::write_file_atomic(sentinel, "");
         if (failed == 0) {
-            trailhead::fs::write_file_atomic(sentinel, "");
             std::cout << trailhead::ansi::color(trailhead::ansi::BGREEN, "Setup complete") << "\n";
+        } else {
+            std::cout << trailhead::ansi::color(trailhead::ansi::BYELLOW,
+                "Setup complete with " + std::to_string(failed) + " failed step(s)") << "\n";
         }
         return failed > 0 ? 1 : 0;
     }
