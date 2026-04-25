@@ -1231,9 +1231,8 @@ static int cmd_setup(int argc, char** argv) {
             if (r.exit_code != 0) {
                 if (!r.stderr_str.empty()) std::cerr << r.stderr_str;
                 std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
-                    "  step failed (exit=" + std::to_string(r.exit_code) + ")\n");
+                    "  step failed (exit=" + std::to_string(r.exit_code) + ") — continuing\n");
                 ++failed;
-                break;
             }
         }
         if (failed == 0) {
