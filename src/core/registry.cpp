@@ -158,8 +158,10 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
             }
         }
 
-        // Store sub-registry's own sbatch_defaults for per-test lookup
+        // Store sub-registry's own sbatch_defaults and setup for per-test lookup
         reg.sub_sbatch_defaults[sub_rel] = sub.sbatch_defaults;
+        if (!sub.setup.empty())
+            reg.sub_setups[sub_rel] = sub.setup;
     }
 }
 

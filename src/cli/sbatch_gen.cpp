@@ -196,6 +196,18 @@ static const SbatchDefaults& effective_defs(const Registry& reg, const TestEntry
     return reg.sbatch_defaults;
 }
 
+// Return the setup steps for a test: sub-registry's own if available, else parent's.
+static const std::vector<std::string>& effective_setup(const Registry& reg, const TestEntry& t) {
+    if (!t.sub_dir.empty()) {
+        auto it = reg.sub_setups.find(t.sub_dir);
+        if (it != reg.sub_setups.end()) return it->second;
+        // Test belongs to a sub-registry that has no setup — don't fall through to parent's setup
+        static const std::vector<std::string> empty;
+        return empty;
+    }
+    return reg.setup;
+}
+
 // Append the sub-dir name to effective_root when a sub-registry build relies on the node
 // rsync_dest (has no build-specific rsync_dest). Returns the sub-dir name used (or "").
 static std::string maybe_append_sub_dir(std::string& effective_root,
@@ -291,7 +303,7 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
             TestEntry t_adj = t;
             t_adj.workdir = adjust_workdir(t.workdir, sub_dir_name);
             script << sbatch_body({&t_adj}, defs, effective_root,
-                                  build_dir, configure_cmd, reg.setup,
+                                  build_dir, configure_cmd, effective_setup(reg, t),
                                   node_ptr ? node_ptr->preamble : std::vector<std::string>{});
 
             out.push_back({t.name + ".sbatch", script.str()});
@@ -453,7 +465,7 @@ std::string generate_test_script(const TestEntry& test,
     TestEntry test_adj = test;
     test_adj.workdir = adjust_workdir(test.workdir, sub_dir_name);
     script << sbatch_body({&test_adj}, defs, effective_root,
-                          build_dir, configure_cmd, reg.setup,
+                          build_dir, configure_cmd, effective_setup(reg, test),
                           node_ptr ? node_ptr->preamble : std::vector<std::string>{});
     return script.str();
 }
