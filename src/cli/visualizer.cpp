@@ -164,11 +164,11 @@ static std::string timing_str(const TestResult* r, int max_width) {
     return out;
 }
 
-static std::string header_row() {
+static std::string header_row(int name_w = COL_NAME) {
     using namespace ansi;
     std::ostringstream o;
     o << BOLD
-      << pad("NAME",   COL_NAME) << " "
+      << pad("NAME",   name_w) << " "
       << pad("BUILD",  COL_NODE) << " "
       << pad("STATUS", COL_STATUS) << " "
       << rpad("PASS", COL_PASS) << " "
@@ -183,13 +183,14 @@ static std::string header_row() {
 static std::string test_row(const TestEntry& t, const TestResult* r,
                               const Registry& reg, bool selected,
                               const std::string& live_status = "",
-                              int name_offset = 0)
+                              int name_offset = 0,
+                              int name_w = COL_NAME)
 {
     using namespace ansi;
     RunStatus status = r ? result_status(*r) : RunStatus::Unknown;
 
-    std::string name_col = selected ? scroll_name(t.name, name_offset, COL_NAME)
-                                     : pad(t.name, COL_NAME);
+    std::string name_col = selected ? scroll_name(t.name, name_offset, name_w)
+                                     : pad(t.name, name_w);
     std::string build_tag = t.build_name;
     if (!t.requires_hw.empty() && t.requires_hw != "any")
         build_tag += " [" + t.requires_hw + "]";
@@ -650,7 +651,7 @@ static int term_cols() {
 // Return a width-char window into `s` starting at `offset`, wrapping with a gap.
 // If s fits in width it is returned unchanged; otherwise a marquee slice is returned.
 static std::string scroll_name(const std::string& s, int offset, int width) {
-    if ((int)s.size() <= width) return s;
+    if ((int)s.size() <= width) return ansi::pad(s, width);
     static const std::string GAP = "   ";
     std::string buf = s + GAP;
     int len = (int)buf.size();
@@ -918,8 +919,9 @@ static std::string wizard_select_hardware(Registry& reg,
             }
             for (int i = 0; i < (int)names.size(); ++i) {
                 if (i == cursor) o << CYAN << BOLD;
-                std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
-                                                 : names[i].substr(0, name_w);
+                std::string disp = (int)names[i].size() > name_w
+                    ? scroll_name(names[i], name_scroll, name_w)
+                    : names[i];
                 o << (i == cursor ? " > " : "   ") << disp;
                 if (names[i] == "local") {
                     o << DIM << "  (this machine, sequential)" << RESET;
@@ -1063,8 +1065,9 @@ static std::string wizard_select_build(Registry& reg, const std::string& th_dir)
             o << hline(60) << "\n\n";
             for (int i = 0; i < (int)names.size(); ++i) {
                 if (i == cursor) o << CYAN << BOLD;
-                std::string disp = (i == cursor) ? scroll_name(names[i], name_scroll, name_w)
-                                                 : names[i].substr(0, name_w);
+                std::string disp = (int)names[i].size() > name_w
+                    ? scroll_name(names[i], name_scroll, name_w)
+                    : names[i];
                 o << (i == cursor ? " > " : "   ") << disp;
                 if (i > 0) {
                     auto it = reg.builds.find(names[i]);
@@ -1173,8 +1176,9 @@ static bool run_add_wizard(Registry& reg,
                     if (choices[i].empty()) {
                         o << "(this project)";
                     } else {
-                        std::string disp = (i == cursor) ? scroll_name(choices[i], name_scroll, name_w)
-                                                         : choices[i].substr(0, name_w);
+                        std::string disp = (int)choices[i].size() > name_w
+                            ? scroll_name(choices[i], name_scroll, name_w)
+                            : choices[i];
                         o << disp;
                     }
                     if (i == cursor) o << RESET;
@@ -1663,9 +1667,14 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         if (!selected_hw.empty())
             o << "  " << color(CYAN, "hw:" + selected_hw);
         o << "\n";
-        o << hline(TOTAL_WIDTH) << "\n";
-        o << header_row() << "\n";
-        o << hline(TOTAL_WIDTH) << "\n";
+        // Actual non-name visible width: column widths + 7 separator spaces.
+        // TOTAL_WIDTH uses +5 (hline), so rows are TOTAL_WIDTH-COL_NAME+2 wide without the name.
+        static const int FIXED_W = COL_NODE + COL_STATUS + COL_PASS + COL_FAIL + COL_TIME + COL_WALL + COL_WHEN + 7;
+        int dyn_name_w = std::max(COL_NAME, term_cols() - FIXED_W - 1);
+        int dyn_total_w = dyn_name_w + FIXED_W;
+        o << hline(dyn_total_w) << "\n";
+        o << header_row(dyn_name_w) << "\n";
+        o << hline(dyn_total_w) << "\n";
 
         if (need_up)
             o << DIM << "  ↑ " << scroll << " more above" << RESET << "\n";
@@ -1676,13 +1685,14 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             const TestResult* r = latest_result(idx, t.name);
             std::string live = job_log ? job_log->get_live(t.name) : "";
             o << test_row(t, r, reg, i == selected, live,
-                          i == selected ? name_scroll : 0) << "\n";
+                          i == selected ? name_scroll : 0,
+                          dyn_name_w) << "\n";
         }
 
         if (need_down)
             o << DIM << "  ↓ " << (total - end) << " more below" << RESET << "\n";
 
-        o << hline(TOTAL_WIDTH) << "\n";
+        o << hline(dyn_total_w) << "\n";
         o << DIM
           << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [p] preview  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [c] clear  [w] wipe builds  [h] hw"
           << RESET << "\n";
@@ -1907,8 +1917,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             }
             // Auto-refresh
             ++ticks;
-            // Advance name marquee every 6 ticks (~600ms) when name is long
-            if (++name_scroll_ticks >= 6) { ++name_scroll; name_scroll_ticks = 0; redraw = true; }
+            // Advance name marquee every 3 ticks (~300ms) when name is long
+            if (++name_scroll_ticks >= 3) { ++name_scroll; name_scroll_ticks = 0; redraw = true; }
             if (ticks >= refresh_every) {
                 idx = load_all_results(results_dir);
                 ticks = 0;

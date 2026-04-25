@@ -15,6 +15,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(pwd)"   # directory the user invoked the script from
 
+# ── Self-update from GitHub ───────────────────────────────────────────────
+_SELF="${BASH_SOURCE[0]}"
+_UPDATE_URL="https://raw.githubusercontent.com/saltsystemslab/trailhead/main/trailhead_run_tests.sh"
+if command -v curl &>/dev/null; then
+    _TMP=$(mktemp)
+    if curl -sf --max-time 5 -o "$_TMP" "$_UPDATE_URL" && [[ -s "$_TMP" ]]; then
+        if ! cmp -s "$_SELF" "$_TMP"; then
+            echo "==> Updating trailhead_run_tests.sh from GitHub..."
+            chmod +x "$_TMP"
+            mv "$_TMP" "$_SELF"
+            exec "$_SELF" "$@"
+        fi
+    fi
+    rm -f "$_TMP"
+fi
+
 NO_BUILD=0
 NO_SETUP=0
 WIPE=0
