@@ -16,20 +16,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(pwd)"   # directory the user invoked the script from
 
 # ── Self-update from GitHub ───────────────────────────────────────────────
-_SELF="${BASH_SOURCE[0]}"
-_UPDATE_URL="https://raw.githubusercontent.com/saltsystemslab/trailhead/main/trailhead_run_tests.sh"
-if command -v curl &>/dev/null; then
-    _TMP=$(mktemp)
-    if curl -sf --max-time 5 -o "$_TMP" "$_UPDATE_URL" && [[ -s "$_TMP" ]]; then
-        if ! cmp -s "$_SELF" "$_TMP"; then
-            echo "==> Updating trailhead_run_tests.sh from GitHub..."
-            chmod +x "$_TMP"
-            mv "$_TMP" "$_SELF"
-            exec "$_SELF" "$@"
-        fi
-    fi
-    rm -f "$_TMP"
+# Try git pull; if HEAD changed, re-exec so the new script and binary are used.
+_OLD_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
+git -C "$SCRIPT_DIR" pull --ff-only origin main --quiet 2>/dev/null || true
+_NEW_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
+if [[ -n "$_OLD_HEAD" && "$_OLD_HEAD" != "$_NEW_HEAD" ]]; then
+    echo "==> Updated to $( git -C "$SCRIPT_DIR" log --oneline -1 2>/dev/null ). Re-running..."
+    exec "$SCRIPT_DIR/trailhead_run_tests.sh" "$@"
 fi
+unset _OLD_HEAD _NEW_HEAD
 
 NO_BUILD=0
 NO_SETUP=0

@@ -68,8 +68,14 @@ std::string node_sbatch_flags(const NodeProfile& node,
 static std::string pending_dir(const std::string& th_dir) {
     return th_dir + "/pending";
 }
+// Replace '/' so sub-registry names ("sub/test") stay flat in the directory.
+static std::string safe_filename(const std::string& name) {
+    std::string f = name;
+    std::replace(f.begin(), f.end(), '/', '-');
+    return f;
+}
 static std::string pending_path(const std::string& th_dir, const std::string& name) {
-    return pending_dir(th_dir) + "/" + name + ".json";
+    return pending_dir(th_dir) + "/" + safe_filename(name) + ".json";
 }
 
 void save_pending_job(const std::string& th_dir, const PendingJob& job) {
@@ -116,7 +122,7 @@ static std::string queued_dir(const std::string& th_dir) {
     return th_dir + "/queued";
 }
 static std::string queued_path(const std::string& th_dir, const std::string& name) {
-    return queued_dir(th_dir) + "/" + name + ".json";
+    return queued_dir(th_dir) + "/" + safe_filename(name) + ".json";
 }
 
 void save_queued_submission(const std::string& th_dir, const QueuedSubmission& qs) {
@@ -616,6 +622,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         std::lock_guard<std::mutex> lk(mtx_);
         if (stopped_) {
             for (auto& s : batch) {
+                // Restore queued file so the job is re-enqueued on next startup.
+                save_queued_submission(th_dir_, {s.test.name, s.node_name});
                 if (s.status_fn) s.status_fn("");
                 job_log_->active--;
             }
@@ -639,6 +647,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (stopped_) {
+                // Restore queued file so the job is re-enqueued on next startup.
+                save_queued_submission(th_dir_, {s.test.name, s.node_name});
                 if (s.status_fn) s.status_fn("");
                 job_log_->active--;
                 continue;
