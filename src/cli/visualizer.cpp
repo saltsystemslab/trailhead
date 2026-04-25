@@ -1565,6 +1565,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     std::cout << ansi::ALT_SCREEN_ON;
     std::cout.flush();
     enter_raw_mode();
+    tcflush(STDIN_FILENO, TCIFLUSH); // discard type-ahead from build/setup output
 
     // Select hardware at startup if nodes are available
     std::string selected_hw;
