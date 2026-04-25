@@ -1631,11 +1631,16 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         int vis_tests = vis - (need_up ? 1 : 0) - (need_down ? 1 : 0);
         if (vis_tests < 1) vis_tests = 1;
         clamp_scroll(vis_tests);
-        // Recompute after clamping
+        // Recompute after clamping — clamping can flip need_up (scroll was 0, now >0),
+        // shrinking vis_tests by 1.  Re-clamp a second time with the corrected count so
+        // the selected row is never pushed outside the visible window by the indicator.
         need_up   = scroll > 0;
         need_down = (scroll + vis_tests) < total;
         vis_tests = vis - (need_up ? 1 : 0) - (need_down ? 1 : 0);
         if (vis_tests < 1) vis_tests = 1;
+        clamp_scroll(vis_tests);
+        need_up   = scroll > 0;
+        need_down = (scroll + vis_tests) < total;
 
         // Buffer the entire frame and write it in one shot to minimise
         // partial-frame flicker over high-latency connections (SSH).
