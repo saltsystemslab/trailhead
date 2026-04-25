@@ -22,7 +22,9 @@ echo "${_BOLD}${_CYAN}TRAILHEAD${_RESET}  ${_BOLD}run-tests${_RESET}  $(git -C "
 # Try git pull; if HEAD changed, re-exec so the new script and binary are used.
 _OLD_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
 echo "==> Checking for updates..."
-git -C "$SCRIPT_DIR" pull --ff-only origin main 2>/dev/null || true
+if ! git -C "$SCRIPT_DIR" pull --ff-only origin main; then
+    echo "==> Could not pull updates (see above). Continuing with current version."
+fi
 _NEW_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
 if [[ -n "$_OLD_HEAD" && "$_OLD_HEAD" != "$_NEW_HEAD" ]]; then
     echo "${_GREEN}==> Updated to: $(git -C "$SCRIPT_DIR" log --oneline -1 2>/dev/null)${_RESET}"
