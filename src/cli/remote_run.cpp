@@ -306,7 +306,8 @@ static bool poll_and_finalize(
     const RemoteDest& dest,
     const std::string& project_root,
     std::function<void(const std::string&)> log_fn,
-    std::function<void(const std::string&)> status_fn)
+    std::function<void(const std::string&)> status_fn,
+    std::function<void()> on_job_done = {})
 {
     auto log = [&](const std::string& msg) {
         if (log_fn) log_fn(msg);
@@ -358,10 +359,15 @@ static bool poll_and_finalize(
             std::chrono::system_clock::now().time_since_epoch()).count();
         if (now - t_submit > 7200LL * 1000) {
             log(ansi::color(ansi::BYELLOW, "watch timeout (2h) — job may still be running"));
+            if (on_job_done) on_job_done();
             set_status("");
             return false;
         }
     }
+
+    // Release the SLURM slot immediately — the job has left the queue, so a new
+    // sbatch can go in now.  Result collection (ssh cat + rsync-back) continues below.
+    if (on_job_done) on_job_done();
 
     int64_t t_end = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -684,8 +690,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         auto slots        = slots_;
 
         std::thread([=]() mutable {
-            poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn);
-            slots->release();
+            poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn,
+                              [slots]{ slots->release(); });
             job_log->active--;
         }).detach();
     }
