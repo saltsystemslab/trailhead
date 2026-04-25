@@ -15,14 +15,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(pwd)"   # directory the user invoked the script from
 
+_BOLD=$'\033[1m'; _CYAN=$'\033[36m'; _GREEN=$'\033[32m'; _RESET=$'\033[0m'
+echo "${_BOLD}${_CYAN}TRAILHEAD${_RESET}  ${_BOLD}run-tests${_RESET}  $(git -C "$SCRIPT_DIR" describe --tags --always 2>/dev/null || true)"
+
 # ── Self-update from GitHub ───────────────────────────────────────────────
 # Try git pull; if HEAD changed, re-exec so the new script and binary are used.
 _OLD_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
-git -C "$SCRIPT_DIR" pull --ff-only origin main --quiet 2>/dev/null || true
+echo "==> Checking for updates..."
+git -C "$SCRIPT_DIR" pull --ff-only origin main 2>/dev/null || true
 _NEW_HEAD=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
 if [[ -n "$_OLD_HEAD" && "$_OLD_HEAD" != "$_NEW_HEAD" ]]; then
-    echo "==> Updated to $( git -C "$SCRIPT_DIR" log --oneline -1 2>/dev/null ). Re-running..."
+    echo "${_GREEN}==> Updated to: $(git -C "$SCRIPT_DIR" log --oneline -1 2>/dev/null)${_RESET}"
+    echo "==> Re-running with new version..."
     exec "$SCRIPT_DIR/trailhead_run_tests.sh" "$@"
+else
+    echo "==> Up to date."
 fi
 unset _OLD_HEAD _NEW_HEAD
 
