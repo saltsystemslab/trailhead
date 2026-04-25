@@ -1611,8 +1611,10 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     };
     rebuild_filtered();
 
-    // Fixed chrome: title(1) + hline(1) + header(1) + hline(1) + hline(1) + keys(1) = 6
-    static constexpr int FIXED_ROWS = 6;
+    // Fixed chrome: title(1) + hline(1) + header(1) + hline(1) + hline(1) + keys(variable)
+    // keys row is 157 visible cols; wraps on terminals narrower than that.
+    static constexpr int FIXED_ROWS_NO_KEYS = 5;
+    static constexpr int FOOTER_VIS_LEN     = 157;
     // Log panel: blank(1) + up to MAX_LINES rows (only reserved when non-empty)
     static constexpr int LOG_PANEL_MAX = 1 + JobLog::MAX_LINES;
 
@@ -1634,7 +1636,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         log_rows = std::min(log_rows, LOG_PANEL_MAX);
 
         // Reserve rows for scroll indicators so clamp_scroll uses the real visible count
-        int vis = std::max(term_rows() - FIXED_ROWS - log_rows - 1, 3);
+        int keys_rows = std::max(1, (FOOTER_VIS_LEN + term_cols() - 1) / term_cols());
+        int vis = std::max(term_rows() - FIXED_ROWS_NO_KEYS - keys_rows - log_rows - 1, 3);
         bool need_up   = scroll > 0;
         bool need_down = (scroll + vis) < total;  // preliminary check; refined below
         // Account for indicator rows in the visible count before clamping
