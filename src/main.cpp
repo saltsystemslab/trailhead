@@ -847,6 +847,7 @@ static int cmd_watch(int argc, char** argv) {
     }
 
     std::function<void(const std::string&, const std::string&)> run_fn;
+    std::function<void(const std::string&)> cancel_fn;
 
     auto job_log = std::make_shared<trailhead::JobLog>();
 
@@ -882,6 +883,8 @@ static int cmd_watch(int argc, char** argv) {
         auto submitter = std::make_shared<trailhead::BatchSubmitter>(
             reg, th_dir, project_root, *remote_dest, job_log, max_concurrent);
 
+        cancel_fn = [submitter](const std::string& name) { submitter->cancel(name); };
+
         run_fn = [&reg = reg, job_log, make_log_fn, submitter, local_runner, th_dir](
                 const std::string& name, const std::string& node_name) {
             const trailhead::TestEntry* test = nullptr;
@@ -912,6 +915,10 @@ static int cmd_watch(int argc, char** argv) {
         // No remote at startup — lazily create BatchSubmitter on first remote submission
         // so that rsync_dest added via the TUI hardware editor is picked up at run time.
         auto lazy_submitter = std::make_shared<std::shared_ptr<trailhead::BatchSubmitter>>();
+
+        cancel_fn = [lazy_submitter](const std::string& name) {
+            if (*lazy_submitter) (*lazy_submitter)->cancel(name);
+        };
 
         run_fn = [&reg = reg, job_log, make_log_fn, local_runner, th_dir, project_root, lazy_submitter](
                 const std::string& name, const std::string& node_name) {
@@ -1054,7 +1061,7 @@ static int cmd_watch(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, project_root, auto_run, repeat);
+    return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, cancel_fn, project_root, auto_run, repeat);
 }
 
 // ── Subcommand: show ──────────────────────────────────────────────────────

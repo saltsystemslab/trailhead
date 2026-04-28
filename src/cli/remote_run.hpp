@@ -11,6 +11,7 @@
 #include <deque>
 #include <thread>
 #include <vector>
+#include <unordered_set>
 
 namespace trailhead {
 
@@ -112,6 +113,9 @@ public:
                  std::function<void(const std::string&)> log_fn,
                  std::function<void(const std::string&)> status_fn);
 
+    // Thread-safe. Marks a test name as cancelled so the worker skips it.
+    void cancel(const std::string& name);
+
 private:
     struct Submission {
         TestEntry test;
@@ -133,6 +137,7 @@ private:
     std::mutex                    mtx_;
     std::condition_variable       cv_;
     std::deque<Submission>        queue_;
+    std::unordered_set<std::string> cancelled_;
     bool                          stopped_ = false;
     std::thread                   worker_;
 };

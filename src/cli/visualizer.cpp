@@ -1,9 +1,11 @@
 #include "visualizer.hpp"
 #include "sbatch_gen.hpp"
 #include "local_run.hpp"
+#include "remote_run.hpp"
 #include "../core/registry.hpp"
 #include "../util/ansi.hpp"
 #include "../util/file_util.hpp"
+#include "../util/process.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -33,7 +35,7 @@ static void enter_raw_mode() {
     if (!isatty(STDIN_FILENO)) return;
     tcgetattr(STDIN_FILENO, &s_orig_term);
     struct termios raw = s_orig_term;
-    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
     raw.c_cc[VMIN]  = 0;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
@@ -401,6 +403,14 @@ static void render_detail(const TestEntry& t, const TestResult* r,
                 if (!k.empty() && k[0] != '_')
                     ln("    " + k + ": " + v);
         }
+    }
+
+    // ── Test output (TH_OUTPUT / TH_OUTPUT_START..STOP) ───────────────────
+    if (r && !r->output_lines.empty()) {
+        ln();
+        ln("  " + std::string(BOLD) + "Output:" + RESET);
+        for (const auto& ol : r->output_lines)
+            ln("    " + ol);
     }
 
     // ── SLURM state ───────────────────────────────────────────────────────
@@ -954,7 +964,7 @@ static std::string wizard_select_hardware(Registry& reg,
             continue;
         }
         scroll_ticks = 0;
-        if (k == 27 || k == 'q') return "";
+        if (k == 27 || k == 'q' || k == 3 /*Ctrl-C*/) return "";
         if ((k == '\r' || k == '\n') && !names.empty()) return names[cursor];
         if (k == 1000 || k == 'k') {
             if (!names.empty()) cursor = (cursor - 1 + (int)names.size()) % (int)names.size();
@@ -1094,7 +1104,7 @@ static std::string wizard_select_build(Registry& reg, const std::string& th_dir)
             continue;
         }
         scroll_ticks = 0;
-        if (k == 27 || k == 'q') return "";
+        if (k == 27 || k == 'q' || k == 3 /*Ctrl-C*/) return "";
         if (k == '\r' || k == '\n') return (cursor == 0) ? "" : names[cursor];
         if (k == 1000 || k == 'k') { cursor = (cursor - 1 + (int)names.size()) % (int)names.size(); name_scroll = 0; }
         if (k == 1001 || k == 'j') { cursor = (cursor + 1) % (int)names.size(); name_scroll = 0; }
@@ -1198,7 +1208,7 @@ static bool run_add_wizard(Registry& reg,
                 continue;
             }
             scroll_ticks = 0;
-            if (k == 27 || k == 'q') { cancelled = true; break; }
+            if (k == 27 || k == 'q' || k == 3 /*Ctrl-C*/) { cancelled = true; break; }
             if (k == '\r' || k == '\n') { dest_sub_dir = choices[cursor]; break; }
             if ((k == 1000 || k == 'k') && cursor > 0) { --cursor; name_scroll = 0; }
             if ((k == 1001 || k == 'j') && cursor + 1 < (int)choices.size()) { ++cursor; name_scroll = 0; }
@@ -1504,6 +1514,70 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
     return true;
 }
 
+// ── Clone-task wizard ─────────────────────────────────────────────────────
+
+// Clone an existing test: copies all fields, prompts for a new name, opens
+// the editor with the existing command so the user can tweak args.
+static bool run_clone_wizard(Registry& reg, int test_idx,
+                              const std::string& th_dir,
+                              const std::string& project_root)
+{
+    const TestEntry& src = reg.tests[test_idx];
+    const std::string test_sub_dir = src.sub_dir;
+
+    std::string eff_th_dir = th_dir;
+    std::string eff_project_root = project_root;
+    Registry sub_reg;
+    Registry* dest_reg = &reg;
+
+    if (!test_sub_dir.empty()) {
+        eff_th_dir       = project_root + "/" + test_sub_dir + "/.trailhead";
+        eff_project_root = project_root + "/" + test_sub_dir;
+        auto loaded = load_registry(eff_th_dir);
+        if (!loaded) { enter_raw_mode(); return false; }
+        sub_reg  = *loaded;
+        dest_reg = &sub_reg;
+    }
+
+    // ── Step 1: new name ─────────────────────────────────────────────────
+    std::string base_name = test_sub_dir.empty() ? src.name : strip_sub_prefix(src.name, test_sub_dir);
+    restore_terminal();
+    std::cout << ansi::CLEAR;
+    std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Clone task\n\n";
+    std::cout << "  New name [" << base_name << "_copy]: ";
+    std::cout.flush();
+
+    std::string name;
+    std::getline(std::cin, name);
+    while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+    while (!name.empty() && name.back()  == ' ') name.pop_back();
+    for (auto& c : name) if (c == ' ') c = '_';
+    if (name.empty()) name = base_name + "_copy";
+
+    // ── Step 2: editor (pre-filled with source cmd) ──────────────────────
+    std::string cmd = wizard_open_editor(name, src.cmd);
+    enter_raw_mode();
+
+    if (cmd.empty()) return false;
+
+    // ── Step 3: create entry (copy all fields, override name + cmd) ──────
+    TestEntry t = src;
+    t.name    = name;
+    t.cmd     = cmd;
+    t.sub_dir = "";  // not serialized; will be set by merge on reload
+    dest_reg->tests.push_back(t);
+
+    save_registry(eff_th_dir, *dest_reg);
+    SbatchOptions opts;
+    opts.split        = true;
+    opts.project_root = eff_project_root;
+    write_sbatch(eff_th_dir, *dest_reg, opts);
+
+    if (!test_sub_dir.empty())
+        reload_merged(reg, th_dir, project_root);
+    return true;
+}
+
 // ── Delete confirmation ────────────────────────────────────────────────────
 
 static bool wizard_confirm_delete(Registry& reg, int test_idx,
@@ -1549,7 +1623,7 @@ static bool wizard_confirm_delete(Registry& reg, int test_idx,
             }
             return true;
         }
-        if (k == 'n' || k == 'N' || k == 27 || k == 'q' || k < 0) return false;
+        if (k == 'n' || k == 'N' || k == 27 || k == 'q' || k == 3 /*Ctrl-C*/ || k < 0) return false;
     }
 }
 
@@ -1558,6 +1632,7 @@ static bool wizard_confirm_delete(Registry& reg, int test_idx,
 int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
               std::shared_ptr<JobLog> job_log,
               std::function<void(const std::string&, const std::string&)> run_fn,
+              std::function<void(const std::string&)> cancel_fn,
               std::string project_root, bool auto_run, int repeat) {
     std::string results_dir = trailhead_dir + "/results";
     fs::mkdir_p(results_dir);
@@ -1590,6 +1665,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     std::vector<std::string> output_lines;
     int total = 0;
     std::vector<int> filtered; // indices into reg.tests, filtered by selected_hw
+    std::string tag_filter;    // empty = show all, else only tests with this tag
 
     // Rebuild the filtered list and update total. Call after hardware change or test add/delete.
     auto rebuild_filtered = [&]() {
@@ -1603,6 +1679,12 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                     if (seen_targets.count(t.target)) continue;
                     seen_targets.insert(t.target);
                 }
+            }
+            if (!tag_filter.empty()) {
+                bool has_tag = false;
+                for (const auto& tg : t.tags)
+                    if (tg == tag_filter) { has_tag = true; break; }
+                if (!has_tag) continue;
             }
             filtered.push_back(i);
         }
@@ -1698,8 +1780,11 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
         o << hline(dyn_total_w) << "\n";
         o << DIM
-          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [p] preview  [R] run all  [r] refresh  [a] add  [e] edit  [d] delete  [c] clear  [w] wipe builds  [h] hw"
-          << RESET << "\n";
+          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [x] cancel  [R] run all  [a] add  [e] edit  [c] clone  [d] delete  [f] filter  [h] hw"
+          << RESET;
+        if (!tag_filter.empty())
+            o << "  " << BOLD << "tag:" << tag_filter << RESET;
+        o << "\n";
 
         // Log panel — fixed at snapshot taken above
         if (!snap.empty()) {
@@ -1776,6 +1861,69 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 std::string hw = wizard_select_hardware(reg, trailhead_dir, project_root);
                 if (!hw.empty()) { selected_hw = hw; selected = 0; scroll = 0; }
                 rebuild_filtered();
+                redraw = true;
+            }
+            if (key == 'f' || key == 'F') {
+                // Collect all unique tags across tests
+                std::vector<std::string> all_tags;
+                for (const auto& t : reg.tests)
+                    for (const auto& tg : t.tags) {
+                        bool dup = false;
+                        for (const auto& a : all_tags) if (a == tg) { dup = true; break; }
+                        if (!dup) all_tags.push_back(tg);
+                    }
+                std::sort(all_tags.begin(), all_tags.end());
+                if (all_tags.empty()) {
+                    if (job_log) job_log->push("No tags defined on any test");
+                } else {
+                    // Cycle: "" → tag1 → tag2 → ... → ""
+                    auto it = std::find(all_tags.begin(), all_tags.end(), tag_filter);
+                    if (it == all_tags.end() || ++it == all_tags.end())
+                        tag_filter.clear();
+                    else
+                        tag_filter = *it;
+                    if (tag_filter.empty()) {
+                        if (job_log) job_log->push("Filter cleared — showing all tests");
+                    } else {
+                        if (job_log) job_log->push("Filter: tag=" + tag_filter);
+                    }
+                    selected = 0; scroll = 0;
+                    rebuild_filtered();
+                }
+                redraw = true;
+            }
+            if ((key == 'x' || key == 'X') && total > 0) {
+                const auto& t = reg.tests[filtered[selected]];
+                std::string live = job_log ? job_log->get_live(t.name) : "";
+                if (live.empty()) {
+                    if (job_log) job_log->push("[" + t.name + "] not running");
+                } else {
+                    std::string tname = t.name;
+                    // Tell the BatchSubmitter to drop it from its queue
+                    if (cancel_fn) cancel_fn(tname);
+                    // Clear queued submission (pre-SLURM: QUEUED/RSYNC)
+                    clear_queued_submission(trailhead_dir, tname);
+                    job_log->set_live(tname, "");
+                    // scancel SLURM job in background to avoid freezing the TUI
+                    auto pending = load_pending_jobs(trailhead_dir);
+                    for (auto& p : pending) {
+                        if (p.name != tname) continue;
+                        clear_pending_job(trailhead_dir, tname);
+                        std::string remote = p.remote;
+                        std::string job_id = p.job_id;
+                        std::thread([job_log, tname, remote, job_id]() {
+                            std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
+                                + remote + " scancel " + job_id;
+                            auto r = proc::run(cmd, {}, {}, 15, "", nullptr, true);
+                            if (r.exit_code == 0)
+                                job_log->push("[" + tname + "] cancelled job " + job_id);
+                            else
+                                job_log->push("[" + tname + "] scancel failed: " + r.stderr_str);
+                        }).detach();
+                        break;
+                    }
+                    if (job_log) job_log->push("[" + tname + "] cancelling...");
+                }
                 redraw = true;
             }
             if ((key == 's' || key == 'S') && total > 0 && run_fn) {
@@ -1863,6 +2011,12 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 idx = load_all_results(results_dir);
                 redraw = true;
             }
+            if (key == 'c' && total > 0) {
+                run_clone_wizard(reg, filtered[selected], trailhead_dir, project_root);
+                rebuild_filtered();
+                idx = load_all_results(results_dir);
+                redraw = true;
+            }
             if ((key == 'd' || key == 'D' || key == 127 /*backspace*/) && total > 0) {
                 if (wizard_confirm_delete(reg, filtered[selected], trailhead_dir, project_root)) {
                     rebuild_filtered();
@@ -1870,7 +2024,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 }
                 redraw = true;
             }
-            if ((key == 'c' || key == 'C') && total > 0) {
+            if (key == 'C' && total > 0) {
                 const std::string& tname = reg.tests[filtered[selected]].name;
                 auto it = idx.find(tname);
                 if (it != idx.end()) {
@@ -1946,7 +2100,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             if (key == 'b' || key == 'B' || key == 27 /*ESC*/) {
                 preview_mode = false;
                 render_main(idx);
-            } else if (key == 'q' || key == 'Q') {
+            } else if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) {
                 break;
             } else if ((key == 's' || key == 'S') && run_fn && total > 0) {
                 preview_mode = false;
@@ -1966,7 +2120,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 std::string live = job_log ? job_log->get_live(t.name) : "";
                 auto live_out = job_log ? job_log->get_live_output(t.name) : std::vector<std::string>{};
                 render_detail(t, r, detail_scroll, live, live_out);
-            } else if (key == 'q' || key == 'Q') {
+            } else if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) {
                 break;
             } else if (key != -1) {
                 if (key == 'j' || key == 1001 /*down*/) ++output_scroll;
@@ -1978,7 +2132,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             if (key == 'b' || key == 'B' || key == 27 /*ESC*/) {
                 detail_mode = false;
                 render_main(idx);
-            } else if (key == 'q' || key == 'Q') {
+            } else if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) {
                 break;
             } else if ((key == 'o' || key == 'O') && total > 0) {
                 const auto& t = reg.tests[filtered[selected]];
@@ -2205,6 +2359,17 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         std::cout << "\n";
     }
     std::cout << "\n";
+
+    // ── TH_OUTPUT blocks ──────────────────────────────────────────────────────
+    for (int i : filtered) {
+        const auto& t = reg.tests[i];
+        const TestResult* latest = latest_result(final_idx, t.name);
+        if (!latest || latest->output_lines.empty()) continue;
+        std::cout << ansi::BOLD << t.name << ansi::RESET << ":\n";
+        for (const auto& ol : latest->output_lines)
+            std::cout << "  " << ol << "\n";
+        std::cout << "\n";
+    }
 
     return any_failed;
 }

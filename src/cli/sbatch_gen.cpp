@@ -121,6 +121,7 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
 
     // Set TRAILHEAD_JOB_ID so reporter.hpp labels results as sbatch-<id>
     o << "export TRAILHEAD_JOB_ID=$SLURM_JOB_ID\n";
+    o << "export TRAILHEAD_ENABLED=1\n";
     if (!project_root.empty())
         o << "cd " << project_root << "\n";
     o << "\n";

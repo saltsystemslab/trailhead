@@ -81,6 +81,7 @@ int run_watch(const std::string& trailhead_dir,
               int interval_ms = 1000,
               std::shared_ptr<JobLog> job_log = nullptr,
               std::function<void(const std::string&, const std::string&)> run_fn = nullptr,
+              std::function<void(const std::string&)> cancel_fn = nullptr,
               std::string project_root = "",
               bool auto_run = false,
               int repeat = 1);

@@ -160,9 +160,19 @@ public:
         return TimingScope(*this, label);
     }
 
+    // Record a pre-computed duration (equivalent of TH_TIME_EMIT)
+    void timing_emit(const std::string& label, double elapsed_ms) {
+        timings_.push_back({label, {}, elapsed_ms, false});
+    }
+
     // ── Metadata ──────────────────────────────────────────────────────
     void meta(const std::string& key, const std::string& value) {
         metadata_[key] = value;
+    }
+
+    // ── Output lines (displayed verbatim in TUI and CSV) ─────────────
+    void output(const std::string& text) {
+        output_lines_.push_back(text);
     }
 
     // ── Flush ─────────────────────────────────────────────────────────
@@ -246,7 +256,14 @@ private:
             first = false;
         }
         if (!metadata_.empty()) o << "\n";
-        o << "  }\n";
+        o << "  },\n";
+        o << "  \"output\": [\n";
+        for (size_t i = 0; i < output_lines_.size(); ++i) {
+            o << "    " << q(output_lines_[i]);
+            if (i + 1 < output_lines_.size()) o << ",";
+            o << "\n";
+        }
+        o << "  ]\n";
         o << "}\n";
         return o.str();
     }
@@ -262,6 +279,7 @@ private:
     bool flushed_ = false;
     std::vector<TimingEntry> timings_;
     std::map<std::string, std::string> metadata_;
+    std::vector<std::string> output_lines_;
 };
 
 } // namespace trailhead

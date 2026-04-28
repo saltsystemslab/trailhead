@@ -27,6 +27,7 @@ struct TestResult {
     int     failed       = 0;
     std::vector<TimingEntry> timings;
     std::unordered_map<std::string,std::string> metadata;
+    std::vector<std::string> output_lines;  // verbatim text from TH_OUTPUT markers
     std::string result_file;   // absolute path to the source JSON
     time_t  file_mtime   = 0;
 };
@@ -82,6 +83,11 @@ inline std::optional<TestResult> parse_result(const std::string& path) {
             for (const auto& [k, v] : meta->as_object())
                 if (v.is_string()) r.metadata[k] = v.as_string();
         }
+        const JsonValue* out_arr = root.get("output");
+        if (out_arr && out_arr->is_array()) {
+            for (const auto& v : out_arr->as_array())
+                if (v.is_string()) r.output_lines.push_back(v.as_string());
+        }
         return r;
     } catch (...) {
         return std::nullopt;
@@ -100,9 +106,20 @@ inline void parse_trailhead_output(
     std::istringstream ss(stdout_str);
     std::string line;
     std::string remaining;
+    bool capturing = false;  // inside output_start..output_stop region
     while (std::getline(ss, line)) {
         // Strip trailing \r
         if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        // Check for region markers first
+        if (line == "TRAILHEAD:output_start") { capturing = true; continue; }
+        if (line == "TRAILHEAD:output_stop")  { capturing = false; continue; }
+
+        // Inside a capture region, grab every line verbatim
+        if (capturing) {
+            out.output_lines.push_back(line);
+            continue;
+        }
 
         if (line.rfind("TRAILHEAD:", 0) != 0) {
             if (remaining_stdout) { remaining += line; remaining += '\n'; }
@@ -120,9 +137,9 @@ inline void parse_trailhead_output(
         }
         if (pos <= line.size()) parts.push_back(line.substr(pos)); // rest (may contain ':')
 
-        if (parts.size() < 3) continue;
+        if (parts.size() < 2) continue;
         const std::string& verb  = parts[1];
-        const std::string& field = parts[2];
+        const std::string  field = parts.size() > 2 ? parts[2] : "";
         const std::string  rest  = parts.size() > 3 ? parts[3] : "";
 
         if (verb == "pass") {
@@ -130,7 +147,6 @@ inline void parse_trailhead_output(
         } else if (verb == "fail") {
             out.failed++;
         } else if (verb == "time") {
-            // field=label, rest=elapsed_ms
             try {
                 TimingEntry te;
                 te.label = field;
@@ -138,8 +154,11 @@ inline void parse_trailhead_output(
                 out.timings.push_back(te);
             } catch (...) {}
         } else if (verb == "meta") {
-            // field=key, rest=value
             out.metadata[field] = rest;
+        } else if (verb == "output") {
+            std::string text = field;
+            if (!rest.empty()) { text += ':'; text += rest; }
+            out.output_lines.push_back(text);
         }
     }
     if (remaining_stdout) *remaining_stdout = remaining;
@@ -195,6 +214,9 @@ inline void save_result(const std::string& results_dir, const TestResult& res) {
     for (const auto& [k, v] : res.metadata)
         meta_obj.push_back({k, JsonValue(v)});
     obj.push_back({"metadata", JsonValue(std::move(meta_obj))});
+    JsonArray out_arr;
+    for (const auto& ln : res.output_lines) out_arr.push_back(JsonValue(ln));
+    obj.push_back({"output", JsonValue(std::move(out_arr))});
     fs::write_file_atomic(path, json_emit(JsonValue(std::move(obj))));
 }
 

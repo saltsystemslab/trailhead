@@ -8,6 +8,16 @@
 #include <set>
 #include <thread>
 #include <mutex>
+
+static void desktop_notify(const std::string& title, const std::string& message) {
+#ifdef __APPLE__
+    std::string cmd = "osascript -e 'display notification \""
+        + message + "\" with title \"" + title + "\"' 2>/dev/null &";
+#else
+    std::string cmd = "notify-send '" + title + "' '" + message + "' 2>/dev/null &";
+#endif
+    (void)::system(cmd.c_str());
+}
 #include <chrono>
 
 namespace trailhead {
@@ -378,7 +388,7 @@ void LocalRunner::run_task(Task& task) {
         if (log && !line.empty()) log(line);
     };
 
-    auto r = proc::run(run_cmd, {}, {}, t.timeout_sec, workdir, on_line, /*use_shell=*/true);
+    auto r = proc::run(run_cmd, {}, {{"TRAILHEAD_ENABLED","1"}}, t.timeout_sec, workdir, on_line, /*use_shell=*/true);
 
     int64_t t_end = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -439,6 +449,8 @@ void LocalRunner::run_task(Task& task) {
     }
 
     if (set_status) set_status("");
+    desktop_notify("trailhead: " + res.name,
+                   res.failed > 0 ? "FAIL" : "PASS");
     job_log_->active--;
 }
 

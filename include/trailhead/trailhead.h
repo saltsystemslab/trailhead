@@ -4,64 +4,68 @@
  * Include this in any test (C or C++). No linking required.
  * Trailhead captures stdout and parses the TRAILHEAD: lines automatically.
  *
- * C usage:
- *   #include "trailhead/trailhead.h"
- *   int main() {
- *       TH_META("gpu", "H200");
- *       TH_TIME_BEGIN("construction");
- *       // ... work ...
- *       TH_TIME_END("construction");
- *       TH_CHECK(result == expected, "correctness");
- *   }
+ * Markers are silent unless enabled by either:
+ *   1. Compile-time: -DTRAILHEAD_ENABLED
+ *   2. Runtime:      TRAILHEAD_ENABLED=1 environment variable
  *
- * C++ usage — RAII timing scope:
- *   {
- *       TH_SCOPE("sort");   // timing_end called automatically at }
- *       std::sort(v.begin(), v.end());
- *   }
- *   TH_CHECK(v.front() == 0, "sorted");
+ * Trailhead sets the env var automatically when running tests, so no
+ * build changes are needed. User builds produce no extra output.
  */
 
 #ifndef TRAILHEAD_H
 #define TRAILHEAD_H
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 
+/* ── Runtime enable check (cached after first call) ────────────────────── */
+
+static inline int _th_enabled(void) {
+#ifdef TRAILHEAD_ENABLED
+    return 1;
+#else
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("TRAILHEAD_ENABLED");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+#endif
+}
+
 /* ── Output protocol ─────────────────────────────────────────────────────
- * Each marker is one line on stdout. Trailhead strips these lines from
- * the captured output and builds a result JSON from them.
- *
  *   TRAILHEAD:pass:<label>
  *   TRAILHEAD:fail:<label>
  *   TRAILHEAD:time:<label>:<elapsed_ms>
  *   TRAILHEAD:meta:<key>:<value>
+ *   TRAILHEAD:output:<text>
+ *   TRAILHEAD:output_start / TRAILHEAD:output_stop
  * ──────────────────────────────────────────────────────────────────────── */
 
 #define TH_PASS(label) \
-    (printf("TRAILHEAD:pass:%s\n", (label)), (void)fflush(stdout))
+    do { if (_th_enabled()) { printf("TRAILHEAD:pass:%s\n", (label)); fflush(stdout); } } while(0)
 
 #define TH_FAIL(label) \
-    (printf("TRAILHEAD:fail:%s\n", (label)), (void)fflush(stdout))
+    do { if (_th_enabled()) { printf("TRAILHEAD:fail:%s\n", (label)); fflush(stdout); } } while(0)
 
 #define TH_CHECK(cond, label) \
-    ((cond) ? TH_PASS(label) : TH_FAIL(label))
+    do { if (cond) TH_PASS(label); else TH_FAIL(label); } while(0)
 
 #define TH_META(key, value) \
-    (printf("TRAILHEAD:meta:%s:%s\n", (key), (value)), (void)fflush(stdout))
+    do { if (_th_enabled()) { printf("TRAILHEAD:meta:%s:%s\n", (key), (value)); fflush(stdout); } } while(0)
 
-/* ── Timing (C, POSIX) ───────────────────────────────────────────────────
- * TH_TIME_BEGIN / TH_TIME_END pair:
- *   TH_TIME_BEGIN("phase1");
- *   // ... work ...
- *   TH_TIME_END("phase1");
- *
- * TH_TIME_EMIT: emit a pre-computed duration in milliseconds:
- *   TH_TIME_EMIT("phase1", 42.5);
- * ──────────────────────────────────────────────────────────────────────── */
+#define TH_OUTPUT(text) \
+    do { if (_th_enabled()) { printf("TRAILHEAD:output:%s\n", (text)); fflush(stdout); } } while(0)
+
+#define TH_OUTPUT_START() \
+    do { if (_th_enabled()) { printf("TRAILHEAD:output_start\n"); fflush(stdout); } } while(0)
+
+#define TH_OUTPUT_STOP() \
+    do { if (_th_enabled()) { printf("TRAILHEAD:output_stop\n"); fflush(stdout); } } while(0)
 
 #define TH_TIME_EMIT(label, elapsed_ms) \
-    (printf("TRAILHEAD:time:%s:%.6f\n", (label), (double)(elapsed_ms)), (void)fflush(stdout))
+    do { if (_th_enabled()) { printf("TRAILHEAD:time:%s:%.6f\n", (label), (double)(elapsed_ms)); fflush(stdout); } } while(0)
 
 /* Internal: declare a timer variable. Uses POSIX clock_gettime. */
 #define _TH_TIMER_VAR(label) _th_t_##label
@@ -87,14 +91,20 @@
 #include <ctime>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace trailhead {
+
+/* Accept both const char* and std::string in macro arguments. */
+inline const char* to_cstr(const char* s)        { return s; }
+inline const char* to_cstr(const std::string& s)  { return s.c_str(); }
 
 struct TimingScope {
     char label[128];
     struct timespec start;
-    TimingScope(const char* lbl) {
-        /* strncpy + null-terminate */
+    bool enabled;
+    TimingScope(const char* lbl) : enabled(_th_enabled()) {
+        if (!enabled) return;
         size_t n = strlen(lbl);
         if (n >= sizeof(label)) n = sizeof(label) - 1;
         memcpy(label, lbl, n);
@@ -102,6 +112,7 @@ struct TimingScope {
         clock_gettime(CLOCK_MONOTONIC, &start);
     }
     ~TimingScope() {
+        if (!enabled) return;
         struct timespec end;
         clock_gettime(CLOCK_MONOTONIC, &end);
         double ms = ((double)(end.tv_sec  - start.tv_sec)  * 1e3)
@@ -118,6 +129,40 @@ struct TimingScope {
 /* TH_SCOPE("label") — declare in a block, timing emitted at } */
 #define TH_SCOPE(label) \
     trailhead::TimingScope _th_scope_##__LINE__(label)
+
+/* ── Redefine macros for C++ to accept both const char* and std::string ── */
+#undef TH_PASS
+#undef TH_FAIL
+#undef TH_CHECK
+#undef TH_META
+#undef TH_TIME_EMIT
+#undef TH_OUTPUT
+#undef TH_OUTPUT_START
+#undef TH_OUTPUT_STOP
+
+#define TH_PASS(label) \
+    do { if (_th_enabled()) { printf("TRAILHEAD:pass:%s\n", trailhead::to_cstr(label)); fflush(stdout); } } while(0)
+
+#define TH_FAIL(label) \
+    do { if (_th_enabled()) { printf("TRAILHEAD:fail:%s\n", trailhead::to_cstr(label)); fflush(stdout); } } while(0)
+
+#define TH_CHECK(cond, label) \
+    do { if (cond) TH_PASS(label); else TH_FAIL(label); } while(0)
+
+#define TH_META(key, value) \
+    do { if (_th_enabled()) { printf("TRAILHEAD:meta:%s:%s\n", trailhead::to_cstr(key), trailhead::to_cstr(value)); fflush(stdout); } } while(0)
+
+#define TH_TIME_EMIT(label, elapsed_ms) \
+    do { if (_th_enabled()) { printf("TRAILHEAD:time:%s:%.6f\n", trailhead::to_cstr(label), (double)(elapsed_ms)); fflush(stdout); } } while(0)
+
+#define TH_OUTPUT(text) \
+    do { if (_th_enabled()) { printf("TRAILHEAD:output:%s\n", trailhead::to_cstr(text)); fflush(stdout); } } while(0)
+
+#define TH_OUTPUT_START() \
+    do { if (_th_enabled()) { printf("TRAILHEAD:output_start\n"); fflush(stdout); } } while(0)
+
+#define TH_OUTPUT_STOP() \
+    do { if (_th_enabled()) { printf("TRAILHEAD:output_stop\n"); fflush(stdout); } } while(0)
 
 #endif /* __cplusplus */
 

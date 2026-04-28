@@ -157,11 +157,10 @@ std::vector<QueuedSubmission> load_queued_submissions(const std::string& th_dir)
 
 // ── Low-level SSH / process helpers ──────────────────────────────────────
 
-static std::string ssh_run(const std::string& remote, const std::string& remote_cmd) {
+static proc::RunResult ssh_run(const std::string& remote, const std::string& remote_cmd) {
     std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 " + remote
                     + " " + remote_cmd;
-    auto r = proc::run(cmd, {}, {}, 120, "", nullptr, true);
-    return r.stdout_str;
+    return proc::run(cmd, {}, {}, 120, "", nullptr, true);
 }
 
 static void write_result_json(const std::string& results_dir, const TestResult& res) {
@@ -191,6 +190,9 @@ static void write_result_json(const std::string& results_dir, const TestResult& 
     for (const auto& [k, v] : res.metadata)
         meta_obj.push_back({k, JsonValue(v)});
     obj.push_back({"metadata", JsonValue(std::move(meta_obj))});
+    JsonArray out_arr;
+    for (const auto& ln : res.output_lines) out_arr.push_back(JsonValue(ln));
+    obj.push_back({"output", JsonValue(std::move(out_arr))});
     fs::write_file_atomic(path, json_emit(JsonValue(std::move(obj))));
 }
 
@@ -301,6 +303,18 @@ static std::string do_sbatch(const TestEntry& test,
     return job_id;
 }
 
+// ── Desktop notification ──────────────────────────────────────────────────
+
+static void desktop_notify(const std::string& title, const std::string& message) {
+#ifdef __APPLE__
+    std::string cmd = "osascript -e 'display notification \""
+        + message + "\" with title \"" + title + "\"' 2>/dev/null &";
+#else
+    std::string cmd = "notify-send '" + title + "' '" + message + "' 2>/dev/null &";
+#endif
+    (void)::system(cmd.c_str());
+}
+
 // ── Step: poll + collect result ───────────────────────────────────────────
 
 static bool poll_and_finalize(
@@ -331,14 +345,31 @@ static bool poll_and_finalize(
         std::this_thread::sleep_for(std::chrono::seconds(5));
 
         std::string sq_cmd = "\"squeue -j " + job_id + " -h -o '%T' 2>/dev/null\"";
-        std::string sq_out = ssh_run(dest.remote, sq_cmd);
+        auto sq_r = ssh_run(dest.remote, sq_cmd);
+        std::string sq_out = sq_r.stdout_str;
         while (!sq_out.empty() && (sq_out.back() == '\n' || sq_out.back() == '\r' || sq_out.back() == ' '))
             sq_out.pop_back();
+
+        // SSH failed — don't interpret empty output as "job finished"
+        if (sq_r.exit_code != 0 || sq_r.timed_out) {
+            if (poll % 6 == 0)
+                log("  job " + job_id + " " + ansi::DIM + "ssh failed, retrying..." + ansi::RESET);
+            continue;
+        }
 
         if (sq_out.empty()) {
             std::string sacct_cmd = "\"sacct -j " + job_id
                 + " -o State,ExitCode,Reason -n --parsable2 2>/dev/null | head -1\"";
-            sacct_line = ssh_run(dest.remote, sacct_cmd);
+            auto sacct_r = ssh_run(dest.remote, sacct_cmd);
+
+            // If sacct SSH also failed, don't assume job is done — keep polling
+            if (sacct_r.exit_code != 0 || sacct_r.timed_out) {
+                if (poll % 6 == 0)
+                    log("  job " + job_id + " " + ansi::DIM + "ssh failed, retrying..." + ansi::RESET);
+                continue;
+            }
+
+            sacct_line = sacct_r.stdout_str;
             while (!sacct_line.empty() && (sacct_line.back() == '\n' || sacct_line.back() == '\r'))
                 sacct_line.pop_back();
 
@@ -363,12 +394,13 @@ static bool poll_and_finalize(
 
         int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        if (now - t_submit > 7200LL * 1000) {
-            log(ansi::color(ansi::BYELLOW, "watch timeout (2h) — job may still be running"));
-            if (on_job_done) on_job_done();
-            set_status("");
-            return false;
-        }
+        //watch timeout disabled - no reason to time
+        // if (now - t_submit > 7200LL * 1000) {
+        //     log(ansi::color(ansi::BYELLOW, "watch timeout (2h) — job may still be running"));
+        //     if (on_job_done) on_job_done();
+        //     set_status("");
+        //     return false;
+        // }
     }
 
     // Brief pause so SLURM's QOS accounting catches up before we submit the next job.
@@ -395,8 +427,8 @@ static bool poll_and_finalize(
     std::string remote_out = remote_project + "/" + subst_job_id(reg.sbatch_defaults.output_pattern);
     std::string remote_err = remote_project + "/" + subst_job_id(reg.sbatch_defaults.error_pattern);
 
-    std::string slurm_stdout = ssh_run(dest.remote, "\"cat " + remote_out + " 2>/dev/null\"");
-    std::string slurm_stderr = ssh_run(dest.remote, "\"cat " + remote_err + " 2>/dev/null\"");
+    std::string slurm_stdout = ssh_run(dest.remote, "\"cat " + remote_out + " 2>/dev/null\"").stdout_str;
+    std::string slurm_stderr = ssh_run(dest.remote, "\"cat " + remote_err + " 2>/dev/null\"").stdout_str;
 
     TestResult res;
     res.name       = test.name;
@@ -462,6 +494,9 @@ static bool poll_and_finalize(
         + results_dir + "/";
     proc::run(rsync_back, {}, {}, 60, "", nullptr, true);
 
+    desktop_notify("trailhead: " + test.name,
+                   res.failed > 0 ? "FAIL" : "PASS");
+
     set_status("");
     return true;
 }
@@ -477,7 +512,7 @@ int query_slurm_job_limit(const std::string& remote,
     for (const auto& part : partitions) {
         if (part.empty()) continue;
         std::string cmd = "\"scontrol show partition " + part + " --oneliner 2>/dev/null\"";
-        std::string out = ssh_run(remote, cmd);
+        std::string out = ssh_run(remote, cmd).stdout_str;
         // Parse "QoS=<name>" from the one-liner output
         auto pos = out.find("QoS=");
         if (pos == std::string::npos) continue;
@@ -500,7 +535,7 @@ int query_slurm_job_limit(const std::string& remote,
     for (const auto& qos : qos_names) {
         std::string cmd = "\"sacctmgr show qos " + qos
             + " format=MaxSubmitJobsPU --parsable2 --noheader 2>/dev/null\"";
-        std::string out = ssh_run(remote, cmd);
+        std::string out = ssh_run(remote, cmd).stdout_str;
         // Strip trailing whitespace/newlines
         while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
             out.pop_back();
@@ -554,6 +589,21 @@ void BatchSubmitter::enqueue(const TestEntry& test,
     cv_.notify_one();
 }
 
+void BatchSubmitter::cancel(const std::string& name) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    // Remove from in-memory queue if still waiting
+    for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+        if (it->test.name == name) {
+            if (it->status_fn) it->status_fn("");
+            job_log_->active--;
+            queue_.erase(it);
+            return;
+        }
+    }
+    // Already picked up by worker — mark for skip in process_batch
+    cancelled_.insert(name);
+}
+
 void BatchSubmitter::worker_loop() {
     while (true) {
         std::vector<Submission> batch;
@@ -594,6 +644,21 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
     // Clear queued submission files — from here the job is in-flight
     for (auto& s : batch)
         clear_queued_submission(th_dir_, s.test.name);
+
+    // Drop cancelled jobs from the batch
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const Submission& s) {
+            if (cancelled_.count(s.test.name)) {
+                cancelled_.erase(s.test.name);
+                if (s.status_fn) s.status_fn("");
+                job_log_->active--;
+                return true;
+            }
+            return false;
+        }), batch.end());
+    }
+    if (batch.empty()) return;
 
     // Set all to RSYNC status while uploading
     for (auto& s : batch)
@@ -653,6 +718,11 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
                 job_log_->active--;
                 continue;
             }
+            if (cancelled_.erase(s.test.name)) {
+                if (s.status_fn) s.status_fn("");
+                job_log_->active--;
+                continue;
+            }
         }
 
         // Wait for a free slot — show QUEUED if we have to wait
@@ -663,6 +733,17 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
                 slots_->cv.wait(lk, [&]{ return slots_->active < slots_->max; });
             }
             slots_->active++;
+        }
+
+        // Re-check cancelled after potentially long slot wait
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (cancelled_.erase(s.test.name)) {
+                slots_->release();
+                if (s.status_fn) s.status_fn("");
+                job_log_->active--;
+                continue;
+            }
         }
 
         int64_t t_submit = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -678,6 +759,20 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
             if (s.status_fn) s.status_fn("");
             job_log_->active--;
             continue;
+        }
+
+        // If cancelled while sbatch was in flight, kill the just-submitted job
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (cancelled_.erase(s.test.name)) {
+                std::string scancel_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
+                    + dest_.remote + " scancel " + job_id;
+                std::thread([scancel_cmd]{ proc::run(scancel_cmd, {}, {}, 15, "", nullptr, true); }).detach();
+                slots_->release();
+                if (s.status_fn) s.status_fn("");
+                job_log_->active--;
+                continue;
+            }
         }
 
         // Save pending state so watch can resume after close
