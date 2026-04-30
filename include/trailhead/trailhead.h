@@ -84,6 +84,46 @@ static inline int _th_enabled(void) {
         TH_TIME_EMIT(#label, _TH_WALL_MS(_TH_TIMER_VAR(label), _th_end_##label)); \
     } while(0)
 
+/* ── Node lock (flock-based) ─────────────────────────────────────────────
+ * Serialize GPU-sensitive sections across parallel test processes on the
+ * same node.  Uses POSIX flock() on a shared file.
+ *
+ *   TH_ACQUIRE_NODE_LOCK()   — blocks until exclusive lock is held
+ *   TH_RELEASE_NODE_LOCK()   — releases the lock
+ *
+ * Lock file: /tmp/trailhead_<nodeid>.lock
+ * Node ID sourced from: SLURMD_NODENAME > SLURM_NODELIST > hostname
+ * Only active when TRAILHEAD_ENABLED — no-op in normal builds.
+ * ──────────────────────────────────────────────────────────────────────── */
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+static int _th_lock_fd = -1;
+
+static inline void _th_acquire_node_lock(void) {
+    if (!_th_enabled()) return;
+    if (_th_lock_fd >= 0) return;
+    const char* node = getenv("SLURMD_NODENAME");
+    if (!node) node = getenv("SLURM_NODELIST");
+    if (!node) node = "local";
+    char path[512];
+    snprintf(path, sizeof(path), "/tmp/trailhead_%s.lock", node);
+    _th_lock_fd = open(path, O_CREAT | O_RDWR, 0666);
+    if (_th_lock_fd < 0) return;
+    flock(_th_lock_fd, LOCK_EX);
+}
+
+static inline void _th_release_node_lock(void) {
+    if (_th_lock_fd < 0) return;
+    flock(_th_lock_fd, LOCK_UN);
+    close(_th_lock_fd);
+    _th_lock_fd = -1;
+}
+
+#define TH_ACQUIRE_NODE_LOCK() _th_acquire_node_lock()
+#define TH_RELEASE_NODE_LOCK() _th_release_node_lock()
+
 /* ── C++ extras ──────────────────────────────────────────────────────────
  * TH_SCOPE("label"): RAII guard that emits timing at end of scope.
  * ──────────────────────────────────────────────────────────────────────── */

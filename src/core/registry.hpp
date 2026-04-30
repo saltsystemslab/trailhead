@@ -87,6 +87,9 @@ struct TestEntry {
     // Hardware requirement hint for display and compatibility warnings.
     // Values: "" or "any" = no constraint, "gpu" = needs GPU, "cpu" = CPU-only
     std::string requires_hw;
+    // When true, this test uses TH_ACQUIRE_NODE_LOCK internally and is safe
+    // to run concurrently with other lock-aware tests on the same node.
+    bool lock = false;
     // Set at load time for tests merged from sub-registries. Not serialized.
     // Relative path from project root to the sub-registry root (e.g. "andes_benchmarks").
     std::string sub_dir;
@@ -223,6 +226,7 @@ inline TestEntry test_from_json(const JsonValue& v) {
     t.build_name   = v.get_str("build");
     t.target       = v.get_str("target");
     t.requires_hw  = v.get_str("requires");
+    t.lock         = v.get_bool("lock", false);
     return t;
 }
 
@@ -240,6 +244,7 @@ inline JsonValue test_to_json(const TestEntry& t) {
     if (!t.target.empty())                  obj.push_back({"target",   t.target});
     if (!t.requires_hw.empty() &&
         t.requires_hw != "any")             obj.push_back({"requires", t.requires_hw});
+    if (t.lock)                             obj.push_back({"lock",     JsonValue(true)});
     return JsonValue(std::move(obj));
 }
 

@@ -400,6 +400,7 @@ static int cmd_add(int argc, char** argv) {
     t.timeout_sec  = args.get_int("timeout", 300);
     t.build_name   = build;
     t.requires_hw  = requires_hw;
+    t.lock         = args.has("lock");
 
     // target: explicit --target, or defaults to test name when build is set,
     // or empty string to disable per-test rebuild
