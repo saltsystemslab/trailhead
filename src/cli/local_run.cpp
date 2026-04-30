@@ -313,7 +313,11 @@ void LocalRunner::enqueue(const TestEntry& test, const Registry& reg,
 }
 
 void LocalRunner::worker_loop() {
-    const unsigned max_parallel = std::max(1u, std::thread::hardware_concurrency());
+    // TH_PARALLEL controls how many lock-aware tests run concurrently.
+    // Default 4: enough to overlap CPU setup without thrashing memory bandwidth.
+    unsigned max_parallel = 16;
+    const char* env = getenv("TH_PARALLEL");
+    if (env) { int v = atoi(env); if (v > 0) max_parallel = (unsigned)v; }
     while (true) {
         std::vector<Task> batch;
         {
