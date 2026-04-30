@@ -313,16 +313,35 @@ void LocalRunner::enqueue(const TestEntry& test, const Registry& reg,
 }
 
 void LocalRunner::worker_loop() {
+    const unsigned max_parallel = std::max(1u, std::thread::hardware_concurrency());
     while (true) {
-        Task task;
+        std::vector<Task> batch;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_.wait(lk, [&] { return stopped_ || !queue_.empty(); });
             if (stopped_ && queue_.empty()) break;
-            task = std::move(queue_.front());
+
+            // Drain a batch: all consecutive lock-aware tests can run together.
+            // A non-lock test runs alone.
+            batch.push_back(std::move(queue_.front()));
             queue_.pop_front();
+            if (batch[0].test.lock) {
+                while (!queue_.empty() && queue_.front().test.lock
+                       && batch.size() < max_parallel) {
+                    batch.push_back(std::move(queue_.front()));
+                    queue_.pop_front();
+                }
+            }
         }
-        run_task(task);
+
+        if (batch.size() == 1) {
+            run_task(batch[0]);
+        } else {
+            std::vector<std::thread> threads;
+            for (auto& task : batch)
+                threads.emplace_back([this, &task] { run_task(task); });
+            for (auto& th : threads) th.join();
+        }
     }
 }
 
