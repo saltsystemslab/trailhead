@@ -76,26 +76,57 @@ std::vector<QueuedSubmission> load_queued_submissions(const std::string& th_dir)
 // max_concurrent limits how many jobs are submitted to SLURM at once.
 // Jobs beyond the limit sit in "QUEUED" status until a slot opens.
 
+// Query the number of jobs the current user has in SLURM (pending, running,
+// completing).  Returns -1 on failure.
+int query_slurm_user_job_count(const std::string& remote);
+
+// Thread-safe set of cancelled test names.  Shared (via shared_ptr) between
+// BatchSubmitter and detached poll threads so cancellation reaches every stage.
+struct CancelSet {
+    std::mutex              mtx;
+    std::condition_variable cv;   // notified on every insert
+    std::unordered_set<std::string> names;
+
+    void insert(const std::string& n) {
+        { std::lock_guard<std::mutex> lk(mtx); names.insert(n); }
+        cv.notify_all();
+    }
+    bool erase(const std::string& n) {
+        std::lock_guard<std::mutex> lk(mtx); return names.erase(n) > 0;
+    }
+    bool contains(const std::string& n) {
+        std::lock_guard<std::mutex> lk(mtx); return names.count(n) > 0;
+    }
+};
+
 // Shared between BatchSubmitter and detached poll threads — keeps the
 // slot count alive even after BatchSubmitter is destroyed.
+//
+// Instead of a purely internal counter, acquire() queries the real SLURM
+// queue so that interactive jobs and jobs from other tools are counted.
 struct SlotTracker {
     std::mutex              mtx;
     std::condition_variable cv;
-    int                     active = 0;
     int                     max;
-    explicit SlotTracker(int m) : max(m) {}
+    std::string             remote;   // ssh target for squeue queries
 
-    // Block until a slot is free, then claim it.
-    void acquire() {
+    SlotTracker(int m, std::string r) : max(m), remote(std::move(r)) {}
+
+    // Block until the real SLURM queue has room, then return true.
+    // Returns false immediately if is_cancelled() fires.
+    bool acquire(std::function<bool()> is_cancelled = {}) {
         std::unique_lock<std::mutex> lk(mtx);
-        cv.wait(lk, [&]{ return active < max; });
-        active++;
+        while (true) {
+            if (is_cancelled && is_cancelled()) return false;
+            int count = query_slurm_user_job_count(remote);
+            if (count >= 0 && count < max) return true;
+            cv.wait_for(lk, std::chrono::seconds(5));
+        }
     }
 
-    // Release a slot and wake one waiter.
+    // Wake waiters so they re-check the queue.
     void release() {
-        { std::lock_guard<std::mutex> lk(mtx); active--; }
-        cv.notify_one();
+        cv.notify_all();
     }
 };
 
@@ -133,11 +164,11 @@ private:
     RemoteDest                    dest_;
     std::shared_ptr<JobLog>       job_log_;
     std::shared_ptr<SlotTracker>  slots_;
+    std::shared_ptr<CancelSet>    cancel_set_;
 
     std::mutex                    mtx_;
     std::condition_variable       cv_;
     std::deque<Submission>        queue_;
-    std::unordered_set<std::string> cancelled_;
     bool                          stopped_ = false;
     std::thread                   worker_;
 };

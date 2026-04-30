@@ -257,6 +257,14 @@ static std::string do_sbatch(const TestEntry& test,
                         + dest.remote + " " + sbatch_cmd;
 
     auto r = proc::run(ssh_cmd, {}, {}, 30, "", nullptr, true);
+
+    // Retry on SSH transport failures (exit 255 = connection reset, timeout, etc.)
+    for (int attempt = 1; r.exit_code == 255 && attempt < 3; ++attempt) {
+        log(std::string(ansi::DIM) + "  ssh failed, retrying (" + std::to_string(attempt) + "/3)..." + ansi::RESET);
+        std::this_thread::sleep_for(std::chrono::seconds(3 * attempt));
+        r = proc::run(ssh_cmd, {}, {}, 30, "", nullptr, true);
+    }
+
     if (r.exit_code != 0) {
         log(ansi::color(ansi::BRED, "sbatch failed (exit=" + std::to_string(r.exit_code) + ")"));
         // sbatch writes errors to stdout or stderr depending on the error type — log both
@@ -327,7 +335,8 @@ static bool poll_and_finalize(
     const std::string& project_root,
     std::function<void(const std::string&)> log_fn,
     std::function<void(const std::string&)> status_fn,
-    std::function<void()> on_job_done = {})
+    std::function<void()> on_job_done = {},
+    std::function<bool()> is_cancelled = {})
 {
     auto log = [&](const std::string& msg) {
         if (log_fn) log_fn(msg);
@@ -341,8 +350,18 @@ static bool poll_and_finalize(
     fs::mkdir_p(results_dir);
 
     std::string sacct_line;
+    bool cancelled = false;
     for (int poll = 0; ; ++poll) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        // ── Cancel check: each poll iteration ────────────────────────────
+        if (is_cancelled && is_cancelled()) {
+            log("  job " + job_id + " " + ansi::color(ansi::BYELLOW, "cancelled — running scancel"));
+            std::string scancel_cmd = "\"scancel " + job_id + " 2>/dev/null\"";
+            ssh_run(dest.remote, scancel_cmd);
+            cancelled = true;
+            break;
+        }
 
         std::string sq_cmd = "\"squeue -j " + job_id + " -h -o '%T' 2>/dev/null\"";
         auto sq_r = ssh_run(dest.remote, sq_cmd);
@@ -404,13 +423,17 @@ static bool poll_and_finalize(
     }
 
     // Brief pause so SLURM's QOS accounting catches up before we submit the next job.
-    // squeue going empty doesn't always mean the slot counter has decremented yet;
-    // without this, rapid succession of completions triggers QOSMaxSubmitJobPerUserLimit.
     std::this_thread::sleep_for(std::chrono::seconds(5));
 
     // Release the SLURM slot — a new sbatch can go in now.
-    // Result collection (ssh cat + rsync-back) continues below.
     if (on_job_done) on_job_done();
+
+    // If cancelled, skip result collection entirely.
+    if (cancelled) {
+        clear_pending_job(th_dir, test.name);
+        set_status("");
+        return false;
+    }
 
     int64_t t_end = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -466,7 +489,7 @@ static bool poll_and_finalize(
         if (!tail.empty()) res.metadata["_output_tail"] = tail;
     }
 
-    if ((res.passed + res.failed == 0) && res.timings.empty()) {
+    if ((res.passed + res.failed == 0) && res.timings.empty() && res.output_lines.empty()) {
         res.failed = 1;
         log(ansi::color(ansi::BYELLOW, "no TRAILHEAD: markers in output — marking as FAIL"));
     }
@@ -550,6 +573,20 @@ int query_slurm_job_limit(const std::string& remote,
     return (limit == INT_MAX) ? fallback : limit;
 }
 
+// ── SLURM user job count ──────────────────────────────────────────────────
+
+int query_slurm_user_job_count(const std::string& remote) {
+    // squeue -u $USER counts all jobs (pending, running, completing) for the
+    // current user.  We use $USER on the remote side so it resolves to the
+    // SSH user's account.
+    auto r = ssh_run(remote, "\"squeue -u \\$USER -h -t PD,R,CG 2>/dev/null | wc -l\"");
+    if (r.exit_code != 0 || r.timed_out) return -1;
+    std::string out = r.stdout_str;
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+        out.pop_back();
+    try { return std::stoi(out); } catch (...) { return -1; }
+}
+
 // ── BatchSubmitter ────────────────────────────────────────────────────────
 
 BatchSubmitter::BatchSubmitter(Registry reg, std::string th_dir,
@@ -561,7 +598,8 @@ BatchSubmitter::BatchSubmitter(Registry reg, std::string th_dir,
     , project_root_(std::move(project_root))
     , dest_(std::move(dest))
     , job_log_(std::move(job_log))
-    , slots_(std::make_shared<SlotTracker>(max_concurrent))
+    , slots_(std::make_shared<SlotTracker>(max_concurrent, dest_.remote))
+    , cancel_set_(std::make_shared<CancelSet>())
     , worker_([this] { worker_loop(); })
 {}
 
@@ -579,6 +617,7 @@ void BatchSubmitter::enqueue(const TestEntry& test,
                               std::function<void(const std::string&)> log_fn,
                               std::function<void(const std::string&)> status_fn)
 {
+    cancel_set_->erase(test.name);
     job_log_->active++;
     if (status_fn) status_fn("QUEUED");
     save_queued_submission(th_dir_, {test.name, node_name});
@@ -590,18 +629,22 @@ void BatchSubmitter::enqueue(const TestEntry& test,
 }
 
 void BatchSubmitter::cancel(const std::string& name) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    // Remove from in-memory queue if still waiting
-    for (auto it = queue_.begin(); it != queue_.end(); ++it) {
-        if (it->test.name == name) {
-            if (it->status_fn) it->status_fn("");
-            job_log_->active--;
-            queue_.erase(it);
-            return;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        // Remove from in-memory queue if still waiting
+        for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+            if (it->test.name == name) {
+                if (it->status_fn) it->status_fn("");
+                job_log_->active--;
+                queue_.erase(it);
+                return;
+            }
         }
     }
-    // Already picked up by worker — mark for skip in process_batch
-    cancelled_.insert(name);
+    // Already picked up by worker or poll thread — mark for skip everywhere
+    cancel_set_->insert(name);
+    // Wake slot acquire in case it's blocking for this job
+    slots_->release();
 }
 
 void BatchSubmitter::worker_loop() {
@@ -641,23 +684,24 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
             if (s.log_fn) s.log_fn(prefix + msg);
     };
 
-    // Clear queued submission files — from here the job is in-flight
-    for (auto& s : batch)
-        clear_queued_submission(th_dir_, s.test.name);
-
-    // Drop cancelled jobs from the batch
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
+    // Helper: drop cancelled jobs from the batch, cleaning up status/active count.
+    auto drop_cancelled = [&]() {
         batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const Submission& s) {
-            if (cancelled_.count(s.test.name)) {
-                cancelled_.erase(s.test.name);
+            if (cancel_set_->erase(s.test.name)) {
                 if (s.status_fn) s.status_fn("");
                 job_log_->active--;
                 return true;
             }
             return false;
         }), batch.end());
-    }
+    };
+
+    // Clear queued submission files — from here the job is in-flight
+    for (auto& s : batch)
+        clear_queued_submission(th_dir_, s.test.name);
+
+    // ── Cancel check: after dequeue ──────────────────────────────────────
+    drop_cancelled();
     if (batch.empty()) return;
 
     // Set all to RSYNC status while uploading
@@ -682,12 +726,15 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         }
     }
 
+    // ── Cancel check: after script gen, before rsync ─────────────────────
+    drop_cancelled();
+    if (batch.empty()) return;
+
     // Bail out early if the TUI has been closed while we were waiting.
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (stopped_) {
             for (auto& s : batch) {
-                // Restore queued file so the job is re-enqueued on next startup.
                 save_queued_submission(th_dir_, {s.test.name, s.node_name});
                 if (s.status_fn) s.status_fn("");
                 job_log_->active--;
@@ -705,45 +752,48 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         return;
     }
 
+    // ── Cancel check: after rsync, before per-job loop ───────────────────
+    drop_cancelled();
+    if (batch.empty()) return;
+
     // Submit each job serially, throttled by the slot limit.
     // Acquiring a slot blocks until SLURM has room for another job.
     for (auto& s : batch) {
-        // Skip this job if the TUI was closed between submissions
+        // ── Cancel check: top of per-job loop ────────────────────────────
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (stopped_) {
-                // Restore queued file so the job is re-enqueued on next startup.
                 save_queued_submission(th_dir_, {s.test.name, s.node_name});
                 if (s.status_fn) s.status_fn("");
                 job_log_->active--;
                 continue;
             }
-            if (cancelled_.erase(s.test.name)) {
-                if (s.status_fn) s.status_fn("");
-                job_log_->active--;
-                continue;
-            }
+        }
+        if (cancel_set_->erase(s.test.name)) {
+            if (s.status_fn) s.status_fn("");
+            job_log_->active--;
+            continue;
         }
 
-        // Wait for a free slot — show QUEUED if we have to wait
-        {
-            std::unique_lock<std::mutex> lk(slots_->mtx);
-            if (slots_->active >= slots_->max) {
-                if (s.status_fn) s.status_fn("QUEUED");
-                slots_->cv.wait(lk, [&]{ return slots_->active < slots_->max; });
-            }
-            slots_->active++;
+        // Wait for a free slot — interruptible by cancel
+        if (s.status_fn) s.status_fn("QUEUED");
+        std::string sname = s.test.name;
+        bool got_slot = slots_->acquire([&]{ return cancel_set_->contains(sname); });
+
+        if (!got_slot) {
+            // Cancelled while waiting for a slot
+            cancel_set_->erase(s.test.name);
+            if (s.status_fn) s.status_fn("");
+            job_log_->active--;
+            continue;
         }
 
-        // Re-check cancelled after potentially long slot wait
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (cancelled_.erase(s.test.name)) {
-                slots_->release();
-                if (s.status_fn) s.status_fn("");
-                job_log_->active--;
-                continue;
-            }
+        // ── Cancel check: after slot acquire ─────────────────────────────
+        if (cancel_set_->erase(s.test.name)) {
+            slots_->release();
+            if (s.status_fn) s.status_fn("");
+            job_log_->active--;
+            continue;
         }
 
         int64_t t_submit = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -754,25 +804,21 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
             s.status_fn ? s.status_fn : [](const std::string&){});
 
         if (job_id.empty()) {
-            // sbatch failed — release the slot we just acquired
             slots_->release();
             if (s.status_fn) s.status_fn("");
             job_log_->active--;
             continue;
         }
 
-        // If cancelled while sbatch was in flight, kill the just-submitted job
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (cancelled_.erase(s.test.name)) {
-                std::string scancel_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
-                    + dest_.remote + " scancel " + job_id;
-                std::thread([scancel_cmd]{ proc::run(scancel_cmd, {}, {}, 15, "", nullptr, true); }).detach();
-                slots_->release();
-                if (s.status_fn) s.status_fn("");
-                job_log_->active--;
-                continue;
-            }
+        // ── Cancel check: after sbatch ───────────────────────────────────
+        if (cancel_set_->erase(s.test.name)) {
+            std::string scancel_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
+                + dest_.remote + " scancel " + job_id;
+            std::thread([scancel_cmd]{ proc::run(scancel_cmd, {}, {}, 15, "", nullptr, true); }).detach();
+            slots_->release();
+            if (s.status_fn) s.status_fn("");
+            job_log_->active--;
+            continue;
         }
 
         // Save pending state so watch can resume after close
@@ -788,7 +834,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         if (s.status_fn) s.status_fn("PENDING");
         if (s.log_fn) s.log_fn("  job " + job_id + " submitted");
 
-        // Spawn poll thread — releases the slot when the job completes
+        // Spawn poll thread — releases the slot when the job completes.
+        // Pass cancel_set so the poll loop can detect cancellation.
         auto test         = s.test;
         auto log_fn       = s.log_fn;
         auto status_fn    = s.status_fn;
@@ -798,10 +845,12 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         auto project_root = project_root_;
         auto job_log      = job_log_;
         auto slots        = slots_;
+        auto cset         = cancel_set_;
 
         std::thread([=]() mutable {
             poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn,
-                              [slots]{ slots->release(); });
+                              [slots]{ slots->release(); },
+                              [cset, name = test.name]{ return cset->contains(name); });
             job_log->active--;
         }).detach();
     }

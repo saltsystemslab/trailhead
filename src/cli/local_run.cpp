@@ -33,10 +33,11 @@ std::vector<std::string> wipe_build_dirs(const Registry& reg, const std::string&
     for (const auto& [bname, bc] : reg.builds) {
         std::string base = project_root;
         if (!bc.sub_dir.empty()) base += "/" + bc.sub_dir;
-        std::string raw = bc.dir.empty() ? "build" : bc.dir;
+        std::string raw = bc.dir.empty() ? ("build_" + bname) : bc.dir;
         candidates.insert(base + "/" + raw);
         for (const auto& [nname, np] : reg.nodes) {
-            std::string bdir = np.build_dir.empty() ? "build_" + nname : np.build_dir;
+            std::string bdir = np.build_dir.empty()
+                ? raw + "_" + nname : np.build_dir;
             candidates.insert(base + "/" + bdir);
         }
     }
@@ -104,7 +105,7 @@ static bool build_one_target(
         else log_fn(msg);
     };
 
-    std::string raw_dir   = bc.dir.empty() ? "build" : bc.dir;
+    std::string raw_dir   = bc.dir.empty() ? ("build_" + bc.name) : bc.dir;
     std::string eff_dir   = bc.sub_dir.empty() ? raw_dir : bc.sub_dir + "/" + raw_dir;
     std::string base_wd   = bc.sub_dir.empty() ? project_root : project_root + "/" + bc.sub_dir;
     std::string bd        = project_root + "/" + eff_dir;
@@ -173,7 +174,7 @@ std::vector<std::string> pre_build_all(
         auto it = reg.builds.find(t.build_name);
         if (it == reg.builds.end()) continue;
         const auto& bc = it->second;
-        std::string raw = bc.dir.empty() ? "build" : bc.dir;
+        std::string raw = bc.dir.empty() ? ("build_" + bc.name) : bc.dir;
         std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
         std::string bd  = project_root + "/" + eff;
         if (seen_dirs.insert(eff).second && !bc.configure_cmd.empty() &&
@@ -204,7 +205,7 @@ std::vector<std::string> pre_build_all(
             const std::string eff = entry.first;
             const BuildConfig bc  = entry.second;
             conf_threads.emplace_back([&, eff, bc]() {
-                std::string raw = bc.dir.empty() ? "build" : bc.dir;
+                std::string raw = bc.dir.empty() ? ("build_" + bc.name) : bc.dir;
                 std::string base_wd = bc.sub_dir.empty()
                     ? project_root : project_root + "/" + bc.sub_dir;
                 std::string configure_cmd = bc.configure_cmd;
@@ -254,7 +255,7 @@ std::vector<std::string> pre_build_all(
             auto bc_it = reg.builds.find(job.build_name);
             if (bc_it == reg.builds.end()) return;
             const auto& bc = bc_it->second;
-            std::string raw = bc.dir.empty() ? "build" : bc.dir;
+            std::string raw = bc.dir.empty() ? ("build_" + bc.name) : bc.dir;
             std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
             std::string build_cmd = "cmake --build " + eff + " --target " + job.target
                                   + " -j" + std::to_string(jobs_each);
@@ -374,7 +375,7 @@ void LocalRunner::run_task(Task& task) {
         workdir = project_root_ + "/" + t.workdir;
     } else if (!t.build_name.empty() && task.build_config) {
         const auto& bc = *task.build_config;
-        std::string raw_dir = bc.dir.empty() ? "build" : bc.dir;
+        std::string raw_dir = bc.dir.empty() ? ("build_" + bc.name) : bc.dir;
         std::string eff_dir = bc.sub_dir.empty() ? raw_dir : bc.sub_dir + "/" + raw_dir;
         workdir = project_root_ + "/" + eff_dir;
         // Strip "raw_dir/" prefix from cmd if present (andes-benchmarks style)
@@ -406,7 +407,7 @@ void LocalRunner::run_task(Task& task) {
     parse_trailhead_output(r.stdout_str, res);
 
     // If no markers, fall back to exit code
-    if (res.passed + res.failed == 0 && res.timings.empty()) {
+    if (res.passed + res.failed == 0 && res.timings.empty() && res.output_lines.empty()) {
         if (r.exit_code == 0) res.passed = 1;
         else                  res.failed = 1;
     }

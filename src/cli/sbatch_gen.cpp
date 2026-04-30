@@ -175,13 +175,12 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
         std::string cmd = str_replace_all(t->cmd, "build/", build_dir + "/");
 
         // When workdir is default and a build is linked, run from inside the build directory.
-        // Strip any "build_dir/" prefix from cmd since we're already there.
+        // Strip build_dir/ references from cmd since we're already cd'd there.
         std::string effective_wd = t->workdir;
         if ((effective_wd.empty() || effective_wd == ".") && !build_dir.empty() && !t->build_name.empty()) {
             effective_wd = build_dir;
-            const std::string prefix = build_dir + "/";
-            if (cmd.rfind(prefix, 0) == 0)
-                cmd = "./" + cmd.substr(prefix.size());
+            cmd = str_replace_all(cmd, "./" + build_dir + "/", "./");
+            cmd = str_replace_all(cmd, build_dir + "/", "./");
         }
 
         if (!effective_wd.empty() && effective_wd != ".") {
@@ -292,12 +291,13 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                     sub_dir_name = maybe_append_sub_dir(effective_root, bit->second, node_rsync);
                 }
             }
-            // Node-specific build dir: explicit setting wins; otherwise default to build_<node>
+            // Node-specific build dir: explicit setting wins; otherwise append node
+            // name to the config's dir to avoid arch collisions across nodes.
             if (node_ptr) {
                 if (!node_ptr->build_dir.empty())
                     build_dir = node_ptr->build_dir;
                 else if (!opts.node_name.empty())
-                    build_dir = "build_" + opts.node_name;
+                    build_dir = build_dir + "_" + opts.node_name;
             }
 
             // No linked build config — fall back to any registered build config
@@ -369,14 +369,15 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
         if (node_ptr) {
             if (!node_ptr->build_dir.empty())
                 build_dir = node_ptr->build_dir;
-            else if (!opts.node_name.empty())
-                build_dir = "build_" + opts.node_name;
+            // else: auto-generate after we know the build config name
         }
         // Pick configure_cmd and remote root from whichever build config is referenced first
+        std::string first_build_name;
         for (const auto& t : reg.tests) {
             if (!t.build_name.empty()) {
                 auto bit = reg.builds.find(t.build_name);
                 if (bit != reg.builds.end()) {
+                    first_build_name = t.build_name;
                     configure_cmd = bit->second.configure_cmd;
                     effective_root = resolve_effective_root(bit->second.rsync_dest, node_rsync,
                                                             opts.project_root, project_name);
@@ -395,6 +396,11 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                     break;
                 }
             }
+        }
+
+        // Auto-generate build dir: append node name to config's dir
+        if (node_ptr && node_ptr->build_dir.empty() && !opts.node_name.empty()) {
+            build_dir = build_dir + "_" + opts.node_name;
         }
 
         if (node_ptr && !node_ptr->cuda_arch.empty())
@@ -476,7 +482,7 @@ std::string generate_test_script(const TestEntry& test,
         if (!node_ptr->build_dir.empty())
             build_dir = node_ptr->build_dir;
         else if (!node_name.empty())
-            build_dir = "build_" + node_name;
+            build_dir = build_dir + "_" + node_name;
     }
     if (configure_cmd.empty()) {
         for (const auto& [bname, bc] : reg.builds) {

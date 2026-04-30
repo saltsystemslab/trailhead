@@ -80,6 +80,11 @@ static int read_key(int timeout_ms) {
     }
 
     if (r >= 3 && buf[0] == 0x1b && buf[1] == '[') {
+        // Check for tilde-terminated sequences first: \x1b[5~ (PgUp), \x1b[6~ (PgDn)
+        if (r >= 4 && buf[3] == '~') {
+            if (buf[2] == '5') return 1004; // Page Up
+            if (buf[2] == '6') return 1005; // Page Down
+        }
         switch (buf[2]) {
             case 'A': return 1000; // Up
             case 'B': return 1001; // Down
@@ -406,12 +411,7 @@ static void render_detail(const TestEntry& t, const TestResult* r,
     }
 
     // ── Test output (TH_OUTPUT / TH_OUTPUT_START..STOP) ───────────────────
-    if (r && !r->output_lines.empty()) {
-        ln();
-        ln("  " + std::string(BOLD) + "Output:" + RESET);
-        for (const auto& ol : r->output_lines)
-            ln("    " + ol);
-    }
+    // Folded into the scrollable output section below.
 
     // ── SLURM state ───────────────────────────────────────────────────────
     if (r) {
@@ -437,15 +437,39 @@ static void render_detail(const TestEntry& t, const TestResult* r,
     {
         bool is_live = !live_status.empty();
         std::vector<std::string> out_lines;
+        int th_output_count = 0;  // lines from TH_OUTPUT — styled differently
 
         if (is_live) {
             out_lines = live_output; // may be empty while still QUEUED
         } else if (r) {
-            auto oit = r->metadata.find("_output_tail");
-            if (oit != r->metadata.end() && !oit->second.empty()) {
-                std::istringstream ss(oit->second);
-                for (std::string l; std::getline(ss, l); )
+            // Include TH_OUTPUT / TH_OUTPUT_START..STOP lines first
+            if (!r->output_lines.empty()) {
+                out_lines.insert(out_lines.end(), r->output_lines.begin(), r->output_lines.end());
+                th_output_count = (int)r->output_lines.size();
+            }
+            // Load full .out sidecar instead of truncated _output_tail
+            std::string out_path = result_output_path(*r);
+            auto content = out_path.empty() ? std::nullopt : fs::read_file(out_path);
+            if (content) {
+                bool in_stderr = false;
+                std::istringstream ss(*content);
+                for (std::string l; std::getline(ss, l); ) {
+                    if (l == "--- stderr ---") { in_stderr = true; continue; }
+                    if (in_stderr) continue;  // hide build stderr (compiler warnings)
                     out_lines.push_back(l);
+                }
+            } else {
+                // Fallback to _output_tail if .out file missing
+                auto oit = r->metadata.find("_output_tail");
+                if (oit != r->metadata.end() && !oit->second.empty()) {
+                    bool in_stderr = false;
+                    std::istringstream ss(oit->second);
+                    for (std::string l; std::getline(ss, l); ) {
+                        if (l == "--- stderr ---") { in_stderr = true; continue; }
+                        if (in_stderr) continue;
+                        out_lines.push_back(l);
+                    }
+                }
             }
         }
 
@@ -501,8 +525,10 @@ static void render_detail(const TestEntry& t, const TestResult* r,
                        + std::to_string(detail_scroll) + " lines above" + RESET);
 
                 int vis_end = std::min(detail_scroll + avail, total_out);
-                for (int i = detail_scroll; i < vis_end; ++i)
-                    ln("    " + std::string(DIM) + out_lines[i] + RESET);
+                for (int i = detail_scroll; i < vis_end; ++i) {
+                    const char* style = (i < th_output_count) ? CYAN : DIM;
+                    ln("    " + std::string(style) + out_lines[i] + RESET);
+                }
 
                 int below = total_out - vis_end;
                 if (!is_live && below > 0)
@@ -571,7 +597,7 @@ static void render_output_log(const std::string& test_name,
     }
 
     o << hline(TOTAL_WIDTH) << "\n";
-    o << DIM << "[b/ESC] back  [j/\xe2\x86\x93] scroll down  [k/\xe2\x86\x91] scroll up  [q] quit" << RESET << "\n";
+    o << DIM << "[b/ESC] back  [j/\xe2\x86\x93] down  [k/\xe2\x86\x91] up  [d/PgDn] page down  [u/PgUp] page up  [q] quit" << RESET << "\n";
     o << ERASE_DOWN;
 
     std::string frame = o.str();
@@ -1337,7 +1363,27 @@ static bool run_add_wizard(Registry& reg,
         enter_raw_mode();
     }
 
-    // ── Step 7: create entry and save ─────────────────────────────────────
+    // ── Step 7: tags ────────────────────────────────────────────────────────
+    std::vector<std::string> tags;
+    {
+        restore_terminal();
+        std::cout << ansi::CLEAR;
+        std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Tags\n\n";
+        std::cout << "  Comma-separated tags (e.g. perf,gpu) []: ";
+        std::cout.flush();
+        std::string tag_in;
+        std::getline(std::cin, tag_in);
+        std::istringstream tss(tag_in);
+        std::string tok;
+        while (std::getline(tss, tok, ',')) {
+            while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+            while (!tok.empty() && tok.back()  == ' ') tok.pop_back();
+            if (!tok.empty()) tags.push_back(tok);
+        }
+        enter_raw_mode();
+    }
+
+    // ── Step 8: create entry and save ─────────────────────────────────────
     dest_reg->tests.erase(std::remove_if(dest_reg->tests.begin(), dest_reg->tests.end(),
         [&](const TestEntry& t){ return t.name == name; }),
         dest_reg->tests.end());
@@ -1349,6 +1395,7 @@ static bool run_add_wizard(Registry& reg,
     t.requires_hw = requires_hw;
     t.target      = target;
     t.workdir     = workdir;
+    t.tags        = tags;
     dest_reg->tests.push_back(t);
 
     save_registry(eff_th_dir, *dest_reg);
@@ -1489,6 +1536,34 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
         enter_raw_mode();
     }
 
+    // ── Step 7: tags (pre-filled) ────────────────────────────────────────
+    std::vector<std::string> tags = test.tags;
+    {
+        std::string current;
+        for (size_t i = 0; i < tags.size(); ++i) {
+            if (i) current += ",";
+            current += tags[i];
+        }
+        restore_terminal();
+        std::cout << ansi::CLEAR;
+        std::cout << ansi::BOLD << "TRAILHEAD" << ansi::RESET << " — Tags\n\n";
+        std::cout << "  Comma-separated tags [" << (current.empty() ? "" : current) << "]: ";
+        std::cout.flush();
+        std::string tag_in;
+        std::getline(std::cin, tag_in);
+        if (!tag_in.empty()) {
+            tags.clear();
+            std::istringstream tss(tag_in);
+            std::string tok;
+            while (std::getline(tss, tok, ',')) {
+                while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+                while (!tok.empty() && tok.back()  == ' ') tok.pop_back();
+                if (!tok.empty()) tags.push_back(tok);
+            }
+        }
+        enter_raw_mode();
+    }
+
     // Remove old sbatch file if name changed
     if (name != test.name) {
         std::string old_sbatch = eff_th_dir + "/sbatch/" + test.name + ".sbatch";
@@ -1502,6 +1577,7 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
     test.build_name  = selected_build;
     test.target      = target;
     test.workdir     = workdir;
+    test.tags        = tags;
 
     save_registry(eff_th_dir, *work_reg);
     SbatchOptions opts;
@@ -1670,16 +1746,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     // Rebuild the filtered list and update total. Call after hardware change or test add/delete.
     auto rebuild_filtered = [&]() {
         filtered.clear();
-        std::unordered_set<std::string> seen_targets; // for local dedup
         for (int i = 0; i < (int)reg.tests.size(); ++i) {
             const auto& t = reg.tests[i];
-            if (selected_hw == "local") {
-                // Local runs each unique cmake target once.
-                if (!t.target.empty()) {
-                    if (seen_targets.count(t.target)) continue;
-                    seen_targets.insert(t.target);
-                }
-            }
             if (!tag_filter.empty()) {
                 bool has_tag = false;
                 for (const auto& tg : t.tags)
@@ -2123,8 +2191,11 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             } else if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) {
                 break;
             } else if (key != -1) {
+                int page = std::max(1, term_rows() - 6);
                 if (key == 'j' || key == 1001 /*down*/) ++output_scroll;
                 else if (key == 'k' || key == 1000 /*up*/) output_scroll = std::max(0, output_scroll - 1);
+                else if (key == 1005 /*PgDn*/ || key == 'd') output_scroll += page;
+                else if (key == 1004 /*PgUp*/ || key == 'u') output_scroll = std::max(0, output_scroll - page);
                 render_output_log(reg.tests[filtered[selected]].name, output_lines, output_scroll);
             }
         } else {
@@ -2148,7 +2219,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                     }
                 }
                 output_mode = true;
-                output_scroll = (int)output_lines.size(); // start at bottom
+                output_scroll = 0; // start at top
                 render_output_log(t.name, output_lines, output_scroll);
             } else {
                 bool detail_redraw = false;
