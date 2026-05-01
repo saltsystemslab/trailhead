@@ -313,39 +313,16 @@ void LocalRunner::enqueue(const TestEntry& test, const Registry& reg,
 }
 
 void LocalRunner::worker_loop() {
-    // TH_PARALLEL controls how many lock-aware tests run concurrently.
-    // Default 4: enough to overlap CPU setup without thrashing memory bandwidth.
-    unsigned max_parallel = 16;
-    const char* env = getenv("TH_PARALLEL");
-    if (env) { int v = atoi(env); if (v > 0) max_parallel = (unsigned)v; }
     while (true) {
-        std::vector<Task> batch;
+        Task task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_.wait(lk, [&] { return stopped_ || !queue_.empty(); });
             if (stopped_ && queue_.empty()) break;
-
-            // Drain a batch: all consecutive lock-aware tests can run together.
-            // A non-lock test runs alone.
-            batch.push_back(std::move(queue_.front()));
+            task = std::move(queue_.front());
             queue_.pop_front();
-            if (batch[0].test.lock) {
-                while (!queue_.empty() && queue_.front().test.lock
-                       && batch.size() < max_parallel) {
-                    batch.push_back(std::move(queue_.front()));
-                    queue_.pop_front();
-                }
-            }
         }
-
-        if (batch.size() == 1) {
-            run_task(batch[0]);
-        } else {
-            std::vector<std::thread> threads;
-            for (auto& task : batch)
-                threads.emplace_back([this, &task] { run_task(task); });
-            for (auto& th : threads) th.join();
-        }
+        run_task(task);
     }
 }
 
