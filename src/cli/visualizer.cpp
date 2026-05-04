@@ -55,44 +55,81 @@ static void restore_terminal() {
 
 // Read a key with a timeout (ms). Returns -1 on timeout, char otherwise.
 // Handles ESC sequences for arrow keys: returns 1000+n for arrows (U=0,D=1,R=2,L=3).
+// Uses a static leftover buffer so that bytes unconsumed from one read are not
+// discarded — preventing partial escape sequences from leaking as bare characters
+// (e.g. 'A' from \x1b[A triggering the add-test wizard when holding the up arrow).
 static int read_key(int timeout_ms) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(STDIN_FILENO, &fds);
-    struct timeval tv;
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    int n = select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
-    if (n <= 0) return -1;
+    static char leftover[8] = {};
+    static int  leftover_len = 0;
 
     char buf[8] = {};
-    ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
-    if (r <= 0) return -1;
+    int  r      = 0;
 
-    // If only ESC arrived, wait briefly for the rest of an arrow-key sequence.
-    // Over SSH, the 3 bytes of \x1b[A can arrive in separate reads.
-    if (r == 1 && buf[0] == 0x1b) {
+    if (leftover_len > 0) {
+        r = leftover_len;
+        memcpy(buf, leftover, leftover_len);
+        leftover_len = 0;
+        // If a lone ESC is in the leftover, try to complete the sequence.
+        if (r == 1 && buf[0] == 0x1b) {
+            fd_set fds2; FD_ZERO(&fds2); FD_SET(STDIN_FILENO, &fds2);
+            struct timeval tv2 = {0, 50000};
+            if (select(STDIN_FILENO + 1, &fds2, nullptr, nullptr, &tv2) > 0)
+                r += (int)read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
+        }
+    } else {
+        fd_set fds;
         FD_ZERO(&fds);
         FD_SET(STDIN_FILENO, &fds);
-        tv.tv_sec = 0; tv.tv_usec = 50000; // 50 ms
-        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0)
-            r += read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
+        struct timeval tv;
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) return -1;
+
+        r = (int)read(STDIN_FILENO, buf, sizeof(buf));
+        if (r <= 0) return -1;
+
+        // If only ESC arrived, wait briefly for the rest of an arrow-key sequence.
+        // Over SSH, the 3 bytes of \x1b[A can arrive in separate reads.
+        if (r == 1 && buf[0] == 0x1b) {
+            FD_ZERO(&fds);
+            FD_SET(STDIN_FILENO, &fds);
+            tv.tv_sec = 0; tv.tv_usec = 50000; // 50 ms
+            if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0)
+                r += (int)read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
+        }
     }
 
+    int key      = -1;
+    int consumed = 1;
+
     if (r >= 3 && buf[0] == 0x1b && buf[1] == '[') {
-        // Check for tilde-terminated sequences first: \x1b[5~ (PgUp), \x1b[6~ (PgDn)
+        // Check for tilde-terminated sequences: \x1b[5~ (PgUp), \x1b[6~ (PgDn)
         if (r >= 4 && buf[3] == '~') {
-            if (buf[2] == '5') return 1004; // Page Up
-            if (buf[2] == '6') return 1005; // Page Down
+            if (buf[2] == '5') { key = 1004; consumed = 4; }
+            if (buf[2] == '6') { key = 1005; consumed = 4; }
         }
-        switch (buf[2]) {
-            case 'A': return 1000; // Up
-            case 'B': return 1001; // Down
-            case 'C': return 1002; // Right
-            case 'D': return 1003; // Left
+        if (key == -1) {
+            switch (buf[2]) {
+                case 'A': key = 1000; consumed = 3; break; // Up
+                case 'B': key = 1001; consumed = 3; break; // Down
+                case 'C': key = 1002; consumed = 3; break; // Right
+                case 'D': key = 1003; consumed = 3; break; // Left
+            }
         }
     }
-    return (unsigned char)buf[0];
+
+    if (key == -1) {
+        key      = (unsigned char)buf[0];
+        consumed = 1;
+    }
+
+    // Save any bytes beyond what we consumed for the next call.
+    if (r > consumed) {
+        leftover_len = r - consumed;
+        memcpy(leftover, buf + consumed, leftover_len);
+    }
+
+    return key;
 }
 
 // ── Rendering helpers ─────────────────────────────────────────────────────
@@ -2151,6 +2188,16 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 refresh_results(results_dir, idx);
                 ticks = 0;
                 redraw = true;
+            }
+            // In auto_run mode, keep the actively running/submitting test in view.
+            if (auto_run && job_log && total > 0) {
+                for (int i = 0; i < total; ++i) {
+                    const std::string live = job_log->get_live(reg.tests[filtered[i]].name);
+                    if (!live.empty() && live != "QUEUED") {
+                        if (selected != i) { selected = i; redraw = true; }
+                        break;
+                    }
+                }
             }
             if (redraw) render_main(idx);
 
