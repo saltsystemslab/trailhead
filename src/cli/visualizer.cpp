@@ -107,10 +107,11 @@ static std::string now_str() {
 
 static std::string status_badge(RunStatus s) {
     switch (s) {
-        case RunStatus::Pass:    return ansi::color(ansi::BGREEN,  " PASS ");
-        case RunStatus::Fail:    return ansi::color(ansi::BRED,    " FAIL ");
-        case RunStatus::Running: return ansi::color(ansi::BYELLOW, " RUN  ");
-        default:                 return ansi::color(ansi::GRAY,    "  --- ");
+        case RunStatus::Pass:      return ansi::color(ansi::BGREEN,  " PASS ");
+        case RunStatus::Fail:      return ansi::color(ansi::BRED,    " FAIL ");
+        case RunStatus::BuildFail: return ansi::color(ansi::MAGENTA, " BFAIL");
+        case RunStatus::Running:   return ansi::color(ansi::BYELLOW, " RUN  ");
+        default:                   return ansi::color(ansi::GRAY,    "  --- ");
     }
 }
 
@@ -217,9 +218,10 @@ static std::string test_row(const TestEntry& t, const TestResult* r,
     } else {
         stat_col   = pad(status_str(status), COL_STATUS);
         switch (status) {
-            case RunStatus::Pass: stat_color = BGREEN; break;
-            case RunStatus::Fail: stat_color = BRED;   break;
-            default:              stat_color = GRAY;   break;
+            case RunStatus::Pass:      stat_color = BGREEN;  break;
+            case RunStatus::Fail:      stat_color = BRED;    break;
+            case RunStatus::BuildFail: stat_color = MAGENTA; break;
+            default:                   stat_color = GRAY;    break;
         }
     }
 
@@ -1892,8 +1894,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
     // Ticks elapsed since last full refresh
     int ticks = 0;
-    int tick_ms = 100; // poll input every 100ms
-    int refresh_every = interval_ms / tick_ms;
+    int tick_ms = (selected_hw == "local") ? 500 : 100;
+    int refresh_every = std::max(1, interval_ms / tick_ms);
 
     while (true) {
         int key = read_key(tick_ms);
@@ -2146,7 +2148,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             // Advance name marquee every 3 ticks (~300ms) when name is long
             if (++name_scroll_ticks >= 3) { ++name_scroll; name_scroll_ticks = 0; redraw = true; }
             if (ticks >= refresh_every) {
-                idx = load_all_results(results_dir);
+                refresh_results(results_dir, idx);
                 ticks = 0;
                 redraw = true;
             }

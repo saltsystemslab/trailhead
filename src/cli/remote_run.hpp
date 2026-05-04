@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/registry.hpp"
+#include "../util/process.hpp"
 #include "visualizer.hpp"
 #include "sbatch_gen.hpp"
 #include <string>
@@ -12,8 +13,42 @@
 #include <thread>
 #include <vector>
 #include <unordered_set>
+#include <chrono>
+#include <atomic>
 
 namespace trailhead {
+
+// ── RemoteChannel ─────────────────────────────────────────────────────────
+// Persistent SSH connection using ControlMaster multiplexing.
+// All SSH operations reuse one socket, eliminating per-call connection overhead.
+// A background heartbeat closes the connection after kIdleSecs of inactivity.
+// Lazily connects on first use; auto-reconnects if the socket disappears.
+class RemoteChannel {
+public:
+    static constexpr int kIdleSecs = 120;
+
+    explicit RemoteChannel(std::string remote);
+    ~RemoteChannel();
+
+    // Run a remote command through the persistent connection.
+    proc::RunResult ssh(const std::string& remote_cmd, int timeout_sec = 120);
+
+    // Path to the ControlMaster socket (used by rsync -e to share the connection).
+    std::string ctrl_path() const;
+
+private:
+    void ensure_connected();
+    void disconnect();
+    void heartbeat_loop();
+
+    std::string  remote_;
+    std::string  ctrl_path_;
+    std::mutex   mtx_;
+    bool         connected_ = false;
+    std::chrono::steady_clock::time_point last_use_;
+    std::atomic<bool> stopped_{false};
+    std::thread  heartbeat_;
+};
 
 struct RemoteDest {
     std::string remote;       // "user@host"
@@ -138,6 +173,10 @@ public:
                    int max_concurrent = 5);
     ~BatchSubmitter();
 
+    // Expose the channel so callers can issue raw SSH commands through the
+    // same persistent connection (e.g. to check server status).
+    std::shared_ptr<RemoteChannel> channel() const { return channel_; }
+
     // Thread-safe. Increments job_log->active and sets initial status.
     void enqueue(const TestEntry& test,
                  const std::string& node_name,
@@ -158,19 +197,20 @@ private:
     void worker_loop();
     void process_batch(std::vector<Submission> batch);
 
-    Registry                      reg_;
-    std::string                   th_dir_;
-    std::string                   project_root_;
-    RemoteDest                    dest_;
-    std::shared_ptr<JobLog>       job_log_;
-    std::shared_ptr<SlotTracker>  slots_;
-    std::shared_ptr<CancelSet>    cancel_set_;
+    Registry                       reg_;
+    std::string                    th_dir_;
+    std::string                    project_root_;
+    RemoteDest                     dest_;
+    std::shared_ptr<JobLog>        job_log_;
+    std::shared_ptr<SlotTracker>   slots_;
+    std::shared_ptr<CancelSet>     cancel_set_;
+    std::shared_ptr<RemoteChannel> channel_;
 
-    std::mutex                    mtx_;
-    std::condition_variable       cv_;
-    std::deque<Submission>        queue_;
-    bool                          stopped_ = false;
-    std::thread                   worker_;
+    std::mutex                     mtx_;
+    std::condition_variable        cv_;
+    std::deque<Submission>         queue_;
+    bool                           stopped_ = false;
+    std::thread                    worker_;
 };
 
 // ── SLURM limit query ─────────────────────────────────────────────────────
@@ -194,7 +234,8 @@ bool remote_submit_and_wait(
     const std::string& project_root,
     const RemoteDest& dest,
     std::function<void(const std::string&)> log_fn,
-    std::function<void(const std::string&)> status_fn = nullptr);
+    std::function<void(const std::string&)> status_fn = nullptr,
+    std::shared_ptr<RemoteChannel> channel = nullptr);
 
 // Resume polling a previously submitted job (skips rsync and sbatch).
 bool resume_job(
@@ -203,6 +244,7 @@ bool resume_job(
     const Registry& reg,
     const std::string& th_dir,
     std::function<void(const std::string&)> log_fn,
-    std::function<void(const std::string&)> status_fn = nullptr);
+    std::function<void(const std::string&)> status_fn = nullptr,
+    std::shared_ptr<RemoteChannel> channel = nullptr);
 
 } // namespace trailhead

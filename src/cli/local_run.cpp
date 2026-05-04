@@ -53,6 +53,59 @@ std::vector<std::string> wipe_build_dirs(const Registry& reg, const std::string&
 
 // ── Shared build helpers ──────────────────────────────────────────────────
 
+// Newest mtime of any source/cmake file under `dir`, skipping `skip_dir`.
+static time_t newest_src_mtime(const std::string& dir, const std::string& skip_dir) {
+    static const char* const kExts[] = {
+        ".cpp", ".hpp", ".cu", ".cuh", ".h", ".c", ".cc", ".cxx", nullptr
+    };
+    time_t newest = 0;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return 0;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        if (ent->d_name[0] == '.') continue;
+        std::string path = dir + "/" + ent->d_name;
+        struct stat st;
+        if (::stat(path.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (!skip_dir.empty() && path == skip_dir) continue;
+            time_t sub = newest_src_mtime(path, skip_dir);
+            if (sub > newest) newest = sub;
+        } else if (S_ISREG(st.st_mode)) {
+            std::string name(ent->d_name);
+            if (name == "CMakeLists.txt") { if (st.st_mtime > newest) newest = st.st_mtime; continue; }
+            size_t dot = name.rfind('.');
+            if (dot == std::string::npos) continue;
+            std::string ext = name.substr(dot);
+            for (int i = 0; kExts[i]; ++i)
+                if (ext == kExts[i]) { if (st.st_mtime > newest) newest = st.st_mtime; break; }
+        }
+    }
+    closedir(d);
+    return newest;
+}
+
+// Mtime of the target binary; searches bd root and one subdir level (e.g. bin/).
+static time_t find_target_mtime(const std::string& bd, const std::string& target) {
+    time_t t = fs::mtime(bd + "/" + target);
+    if (!t) t = fs::mtime(bd + "/" + target + ".exe");
+    if (t) return t;
+    DIR* d = opendir(bd.c_str());
+    if (!d) return 0;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        if (ent->d_name[0] == '.') continue;
+        std::string sub = bd + "/" + ent->d_name;
+        struct stat st;
+        if (::stat(sub.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        time_t t2 = fs::mtime(sub + "/" + target);
+        if (!t2) t2 = fs::mtime(sub + "/" + target + ".exe");
+        if (t2) { closedir(d); return t2; }
+    }
+    closedir(d);
+    return 0;
+}
+
 // Returns CUDA arch digits (e.g. "120"), or "" if detection failed.
 static std::string detect_cuda_arch() {
     for (const char* qcmd : {
@@ -140,6 +193,12 @@ static bool build_one_target(
             safe_log("configure failed (exit=" + std::to_string(cr.exit_code) + ")");
             return false;
         }
+    }
+
+    time_t bin_time = find_target_mtime(bd, target);
+    if (bin_time && newest_src_mtime(base_wd, bd) <= bin_time) {
+        safe_log("build up to date, skipping cmake --build");
+        return true;
     }
 
     unsigned int nj = std::max(1u, std::thread::hardware_concurrency());
@@ -257,6 +316,13 @@ std::vector<std::string> pre_build_all(
             const auto& bc = bc_it->second;
             std::string raw = bc.dir.empty() ? ("build_" + bc.name) : bc.dir;
             std::string eff = bc.sub_dir.empty() ? raw : bc.sub_dir + "/" + raw;
+            std::string bd2      = project_root + "/" + eff;
+            std::string base_wd2 = bc.sub_dir.empty() ? project_root : project_root + "/" + bc.sub_dir;
+            time_t bin_t = find_target_mtime(bd2, job.target);
+            if (bin_t && newest_src_mtime(base_wd2, bd2) <= bin_t) {
+                safe_log("build up to date: " + job.build_name + ":" + job.target);
+                return;
+            }
             std::string build_cmd = "cmake --build " + eff + " --target " + job.target
                                   + " -j" + std::to_string(jobs_each);
             safe_log("building: " + build_cmd);
@@ -352,6 +418,7 @@ void LocalRunner::run_task(Task& task) {
             res.exit_code  = 1;
             res.run_by     = "local";
             res.host       = "localhost";
+            res.metadata["_build_fail"]  = "1";
             res.metadata["_output_tail"] = "build failed — see output above";
             std::string results_dir = th_dir_ + "/results";
             fs::mkdir_p(results_dir);
@@ -438,9 +505,10 @@ void LocalRunner::run_task(Task& task) {
     save_result_output(results_dir, res, full_output);
 
     // Log outcome
-    std::string badge = res.failed > 0
-        ? ansi::color(ansi::BRED,   " FAIL ")
-        : ansi::color(ansi::BGREEN, " PASS ");
+    std::string badge = res.metadata.count("_build_fail")
+        ? ansi::color(ansi::MAGENTA, " BFAIL")
+        : res.failed > 0 ? ansi::color(ansi::BRED,   " FAIL ")
+                         : ansi::color(ansi::BGREEN, " PASS ");
     if (log) {
         log(badge + "  pass=" + std::to_string(res.passed)
             + "  fail=" + std::to_string(res.failed)

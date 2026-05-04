@@ -13,6 +13,7 @@
 #include <deque>
 #include <ctime>
 #include <climits>
+#include <cstdlib>
 
 namespace trailhead {
 
@@ -21,6 +22,98 @@ static std::string last_component(const std::string& path) {
     auto sl = path.rfind('/');
     return (sl != std::string::npos && sl + 1 < path.size())
         ? path.substr(sl + 1) : path;
+}
+
+// ── RemoteChannel ─────────────────────────────────────────────────────────
+
+std::string RemoteChannel::ctrl_path() const { return ctrl_path_; }
+
+RemoteChannel::RemoteChannel(std::string remote)
+    : remote_(std::move(remote))
+    , last_use_(std::chrono::steady_clock::now())
+{
+    // Unique socket path per remote in /tmp
+    ctrl_path_ = "/tmp/trailhead_ctrl_" + remote_ + ".sock";
+    // Replace characters that are invalid in socket paths
+    for (auto& c : ctrl_path_)
+        if (c == '@' || c == ':') c = '_';
+    heartbeat_ = std::thread([this]{ heartbeat_loop(); });
+}
+
+RemoteChannel::~RemoteChannel() {
+    stopped_ = true;
+    heartbeat_.join();
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (connected_) disconnect();
+}
+
+void RemoteChannel::ensure_connected() {
+    // Caller holds mtx_
+    if (connected_) {
+        // Verify socket is still alive
+        std::string check = "ssh -o ControlMaster=no"
+            " -o ControlPath=" + ctrl_path_ +
+            " -o ConnectTimeout=5 -O check " + remote_ + " 2>/dev/null";
+        if (::system(check.c_str()) == 0) return;
+        connected_ = false;
+    }
+    // Start ControlMaster in background
+    std::string cmd = "ssh -fNM"
+        " -o ControlMaster=yes"
+        " -o ControlPath=" + ctrl_path_ +
+        " -o ServerAliveInterval=30"
+        " -o ServerAliveCountMax=3"
+        " -o ConnectTimeout=15"
+        " -o BatchMode=yes"
+        " " + remote_ + " 2>/dev/null";
+    ::system(cmd.c_str());
+    // Brief wait for the socket to appear
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::string check2 = "ssh -o ControlMaster=no"
+            " -o ControlPath=" + ctrl_path_ +
+            " -o ConnectTimeout=5 -O check " + remote_ + " 2>/dev/null";
+        if (::system(check2.c_str()) == 0) { connected_ = true; return; }
+    }
+    // If we couldn't establish, mark as connected anyway and let individual
+    // commands fail naturally (ssh will fall back to fresh connections).
+    connected_ = true;
+}
+
+void RemoteChannel::disconnect() {
+    // Caller holds mtx_
+    std::string cmd = "ssh -o ControlPath=" + ctrl_path_
+        + " -O exit " + remote_ + " 2>/dev/null";
+    ::system(cmd.c_str());
+    connected_ = false;
+}
+
+void RemoteChannel::heartbeat_loop() {
+    while (!stopped_) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        if (stopped_) break;
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!connected_) continue;
+        auto idle = std::chrono::steady_clock::now() - last_use_;
+        if (idle > std::chrono::seconds(kIdleSecs)) {
+            disconnect();
+        }
+    }
+}
+
+proc::RunResult RemoteChannel::ssh(const std::string& remote_cmd, int timeout_sec) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        ensure_connected();
+        last_use_ = std::chrono::steady_clock::now();
+    }
+    std::string cmd = "ssh"
+        " -o ControlMaster=no"
+        " -o ControlPath=" + ctrl_path_ +
+        " -o BatchMode=yes"
+        " -o ConnectTimeout=10"
+        " " + remote_ + " " + remote_cmd;
+    return proc::run(cmd, {}, {}, timeout_sec, "", nullptr, true);
 }
 
 // ── Public helpers ────────────────────────────────────────────────────────
@@ -157,9 +250,13 @@ std::vector<QueuedSubmission> load_queued_submissions(const std::string& th_dir)
 
 // ── Low-level SSH / process helpers ──────────────────────────────────────
 
-static proc::RunResult ssh_run(const std::string& remote, const std::string& remote_cmd) {
-    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 " + remote
-                    + " " + remote_cmd;
+static proc::RunResult ssh_run(const std::string& remote,
+                                const std::string& remote_cmd,
+                                RemoteChannel* channel = nullptr)
+{
+    if (channel) return channel->ssh(remote_cmd);
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
+                    + remote + " " + remote_cmd;
     return proc::run(cmd, {}, {}, 120, "", nullptr, true);
 }
 
@@ -200,7 +297,8 @@ static void write_result_json(const std::string& results_dir, const TestResult& 
 
 static bool do_rsync(const std::string& project_root,
                      const RemoteDest& dest,
-                     const std::function<void(const std::string&)>& log)
+                     const std::function<void(const std::string&)>& log,
+                     RemoteChannel* /*channel*/ = nullptr)
 {
     // rsync_dest is the *parent* directory; append the project name so the
     // repo lands at remote_path/project_name/ rather than directly in remote_path/
@@ -210,6 +308,10 @@ static bool do_rsync(const std::string& project_root,
     log(ansi::BOLD + std::string("rsync") + ansi::RESET
         + "  " + project_root + " → " + dest.remote + ":" + remote_dest);
 
+    // rsync manages its own SSH connection — do not route through the ControlMaster
+    // socket.  The socket may not be established yet and stale-socket errors cause
+    // rsync to hang.  The ControlMaster benefit applies to short-lived SSH commands
+    // (sbatch, squeue, sacct); rsync's connection cost is negligible by comparison.
     std::string cmd = "rsync -az --exclude='.trailhead/results/' "
         + project_root + "/ "
         + dest.remote + ":" + remote_dest + "/";
@@ -225,6 +327,19 @@ static bool do_rsync(const std::string& project_root,
     return true;
 }
 
+// ── QOS error detection ───────────────────────────────────────────────────
+
+static bool is_qos_error(const std::string& output) {
+    static const char* markers[] = {
+        "QOSMaxJobsPerUserLimit", "QOSGrpJobsLimit", "AssocMaxJobsLimit",
+        "Exceeded QOS", "QOS limit", "job limit", "SubmitPluginSpecificData",
+        nullptr
+    };
+    for (int i = 0; markers[i]; ++i)
+        if (output.find(markers[i]) != std::string::npos) return true;
+    return false;
+}
+
 // ── Step: submit one sbatch job → job_id ("" on failure) ─────────────────
 
 static std::string do_sbatch(const TestEntry& test,
@@ -234,7 +349,8 @@ static std::string do_sbatch(const TestEntry& test,
                               const std::string& project_root,
                               const std::string& th_dir,
                               const std::function<void(const std::string&)>& log,
-                              const std::function<void(const std::string&)>& set_status)
+                              const std::function<void(const std::string&)>& set_status,
+                              RemoteChannel* channel = nullptr)
 {
     const NodeProfile* node = nullptr;
     if (!node_name.empty()) {
@@ -253,16 +369,29 @@ static std::string do_sbatch(const TestEntry& test,
     std::string remote_project = dest.remote_path + "/" + last_component(project_root);
     std::string sbatch_cmd = "\"cd " + remote_project
                            + " && sbatch" + flags + " " + script + "\"";
-    std::string ssh_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
-                        + dest.remote + " " + sbatch_cmd;
 
-    auto r = proc::run(ssh_cmd, {}, {}, 30, "", nullptr, true);
-
-    // Retry on SSH transport failures (exit 255 = connection reset, timeout, etc.)
-    for (int attempt = 1; r.exit_code == 255 && attempt < 3; ++attempt) {
-        log(std::string(ansi::DIM) + "  ssh failed, retrying (" + std::to_string(attempt) + "/3)..." + ansi::RESET);
-        std::this_thread::sleep_for(std::chrono::seconds(3 * attempt));
-        r = proc::run(ssh_cmd, {}, {}, 30, "", nullptr, true);
+    proc::RunResult r;
+    // Retry on SSH transport failures (255) or QOS limit errors, with backoff.
+    static const int kMaxRetries = 5;
+    static const int kQosBaseBackoffSec = 30;
+    int qos_retries = 0;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        if (attempt > 0)
+            std::this_thread::sleep_for(std::chrono::seconds(
+                r.exit_code == 255 ? 3 * attempt : kQosBaseBackoffSec * attempt));
+        r = ssh_run(dest.remote, sbatch_cmd, channel);
+        if (r.exit_code == 0) break;
+        std::string combined = r.stdout_str + r.stderr_str;
+        if (r.exit_code == 255) {
+            log(std::string(ansi::DIM) + "  ssh failed, retrying (" + std::to_string(attempt+1)
+                + "/" + std::to_string(kMaxRetries) + ")..." + ansi::RESET);
+        } else if (is_qos_error(combined)) {
+            ++qos_retries;
+            if (qos_retries == 1)
+                log(ansi::color(ansi::BYELLOW, "  QOS limit reached — backing off and retrying..."));
+        } else {
+            break; // non-retriable sbatch error
+        }
     }
 
     if (r.exit_code != 0) {
@@ -336,7 +465,8 @@ static bool poll_and_finalize(
     std::function<void(const std::string&)> log_fn,
     std::function<void(const std::string&)> status_fn,
     std::function<void()> on_job_done = {},
-    std::function<bool()> is_cancelled = {})
+    std::function<bool()> is_cancelled = {},
+    RemoteChannel* channel = nullptr)
 {
     auto log = [&](const std::string& msg) {
         if (log_fn) log_fn(msg);
@@ -358,13 +488,13 @@ static bool poll_and_finalize(
         if (is_cancelled && is_cancelled()) {
             log("  job " + job_id + " " + ansi::color(ansi::BYELLOW, "cancelled — running scancel"));
             std::string scancel_cmd = "\"scancel " + job_id + " 2>/dev/null\"";
-            ssh_run(dest.remote, scancel_cmd);
+            ssh_run(dest.remote, scancel_cmd, channel);
             cancelled = true;
             break;
         }
 
         std::string sq_cmd = "\"squeue -j " + job_id + " -h -o '%T' 2>/dev/null\"";
-        auto sq_r = ssh_run(dest.remote, sq_cmd);
+        auto sq_r = ssh_run(dest.remote, sq_cmd, channel);
         std::string sq_out = sq_r.stdout_str;
         while (!sq_out.empty() && (sq_out.back() == '\n' || sq_out.back() == '\r' || sq_out.back() == ' '))
             sq_out.pop_back();
@@ -379,7 +509,7 @@ static bool poll_and_finalize(
         if (sq_out.empty()) {
             std::string sacct_cmd = "\"sacct -j " + job_id
                 + " -o State,ExitCode,Reason -n --parsable2 2>/dev/null | head -1\"";
-            auto sacct_r = ssh_run(dest.remote, sacct_cmd);
+            auto sacct_r = ssh_run(dest.remote, sacct_cmd, channel);
 
             // If sacct SSH also failed, don't assume job is done — keep polling
             if (sacct_r.exit_code != 0 || sacct_r.timed_out) {
@@ -398,6 +528,9 @@ static bool poll_and_finalize(
 
             if (sacct_state == "COMPLETED" || sacct_state.empty())
                 log("  job " + job_id + " finished");
+            else if (sacct_state == "PREEMPTED" || sacct_state == "NODE_FAIL")
+                log(ansi::color(ansi::BYELLOW, "  job " + job_id + " " + sacct_state
+                    + " — consider re-submitting"));
             else
                 log(ansi::color(ansi::BRED, "  job " + job_id + " ended: ") + sacct_line);
             break;
@@ -450,8 +583,8 @@ static bool poll_and_finalize(
     std::string remote_out = remote_project + "/" + subst_job_id(reg.sbatch_defaults.output_pattern);
     std::string remote_err = remote_project + "/" + subst_job_id(reg.sbatch_defaults.error_pattern);
 
-    std::string slurm_stdout = ssh_run(dest.remote, "\"cat " + remote_out + " 2>/dev/null\"").stdout_str;
-    std::string slurm_stderr = ssh_run(dest.remote, "\"cat " + remote_err + " 2>/dev/null\"").stdout_str;
+    std::string slurm_stdout = ssh_run(dest.remote, "\"cat " + remote_out + " 2>/dev/null\"", channel).stdout_str;
+    std::string slurm_stderr = ssh_run(dest.remote, "\"cat " + remote_err + " 2>/dev/null\"", channel).stdout_str;
 
     TestResult res;
     res.name       = test.name;
@@ -503,9 +636,10 @@ static bool poll_and_finalize(
     }
     clear_pending_job(th_dir, test.name);
 
-    std::string badge = res.failed > 0
-        ? ansi::color(ansi::BRED,   " FAIL ")
-        : ansi::color(ansi::BGREEN, " PASS ");
+    std::string badge = res.metadata.count("_build_fail")
+        ? ansi::color(ansi::MAGENTA, " BFAIL")
+        : res.failed > 0 ? ansi::color(ansi::BRED,   " FAIL ")
+                         : ansi::color(ansi::BGREEN, " PASS ");
     log(badge + "  pass=" + std::to_string(res.passed)
         + "  fail=" + std::to_string(res.failed)
         + "  wall=" + fs::format_duration_ms(res.wall_ms));
@@ -600,6 +734,7 @@ BatchSubmitter::BatchSubmitter(Registry reg, std::string th_dir,
     , job_log_(std::move(job_log))
     , slots_(std::make_shared<SlotTracker>(max_concurrent, dest_.remote))
     , cancel_set_(std::make_shared<CancelSet>())
+    , channel_(std::make_shared<RemoteChannel>(dest_.remote))
     , worker_([this] { worker_loop(); })
 {}
 
@@ -741,9 +876,41 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
             }
             return;
         }
+
+        // ── #5: Fold in any submissions that arrived while we generated scripts.
+        // They share this rsync call — no second upload needed.
+        if (!queue_.empty()) {
+            for (auto& s : queue_) {
+                cancel_set_->erase(s.test.name);
+                clear_queued_submission(th_dir_, s.test.name);
+                batch.push_back(std::move(s));
+            }
+            queue_.clear();
+        }
     }
 
-    if (!do_rsync(project_root_, dest_, [&](const std::string& m){ blog(m); })) {
+    // Regenerate scripts for any newly added items (they weren't covered above)
+    {
+        SbatchOptions script_opts;
+        script_opts.split        = true;
+        script_opts.project_root = project_root_;
+        for (int i = n; i < (int)batch.size(); ++i) {
+            auto& s = batch[i];
+            if (s.node_name.empty()) continue;
+            std::string content = generate_test_script(s.test, s.node_name, reg_, script_opts);
+            if (!content.empty()) {
+                std::string path = th_dir_ + "/sbatch/" + s.test.name + ".sbatch";
+                auto slash = path.rfind('/');
+                if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
+                fs::write_file_atomic(path, content);
+            }
+            if (s.status_fn) s.status_fn("RSYNC");
+        }
+    }
+    n = (int)batch.size();
+    (void)n; // updated size for logging
+
+    if (!do_rsync(project_root_, dest_, [&](const std::string& m){ blog(m); }, channel_.get())) {
         // rsync failed — fail all tests in the batch
         for (auto& s : batch) {
             if (s.status_fn) s.status_fn("");
@@ -801,7 +968,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
 
         std::string job_id = do_sbatch(s.test, s.node_name, reg_, dest_, project_root_, th_dir_,
             s.log_fn ? s.log_fn : [](const std::string&){},
-            s.status_fn ? s.status_fn : [](const std::string&){});
+            s.status_fn ? s.status_fn : [](const std::string&){},
+            channel_.get());
 
         if (job_id.empty()) {
             slots_->release();
@@ -835,7 +1003,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         if (s.log_fn) s.log_fn("  job " + job_id + " submitted");
 
         // Spawn poll thread — releases the slot when the job completes.
-        // Pass cancel_set so the poll loop can detect cancellation.
+        // Pass cancel_set and the shared channel so the poll loop can detect
+        // cancellation and reuse the persistent SSH connection.
         auto test         = s.test;
         auto log_fn       = s.log_fn;
         auto status_fn    = s.status_fn;
@@ -846,11 +1015,13 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         auto job_log      = job_log_;
         auto slots        = slots_;
         auto cset         = cancel_set_;
+        auto ch           = channel_;
 
         std::thread([=]() mutable {
             poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn,
                               [slots]{ slots->release(); },
-                              [cset, name = test.name]{ return cset->contains(name); });
+                              [cset, name = test.name]{ return cset->contains(name); },
+                              ch.get());
             job_log->active--;
         }).detach();
     }
@@ -865,21 +1036,23 @@ bool remote_submit_and_wait(
     const std::string& project_root,
     const RemoteDest& dest,
     std::function<void(const std::string&)> log_fn,
-    std::function<void(const std::string&)> status_fn)
+    std::function<void(const std::string&)> status_fn,
+    std::shared_ptr<RemoteChannel> channel)
 {
     auto log = [&](const std::string& msg) {
         if (log_fn) log_fn(msg);
         else { std::cout << msg << "\n"; std::cout.flush(); }
     };
     auto set_status = [&](const std::string& s) { if (status_fn) status_fn(s); };
+    RemoteChannel* ch = channel.get();
 
     set_status("RSYNC");
-    if (!do_rsync(project_root, dest, log)) { set_status(""); return false; }
+    if (!do_rsync(project_root, dest, log, ch)) { set_status(""); return false; }
 
     int64_t t_submit = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    std::string job_id = do_sbatch(test, "", reg, dest, project_root, th_dir, log, set_status);
+    std::string job_id = do_sbatch(test, "", reg, dest, project_root, th_dir, log, set_status, ch);
     if (job_id.empty()) return false;
 
     PendingJob pj;
@@ -894,7 +1067,8 @@ bool remote_submit_and_wait(
     set_status("PENDING");
     log("  job " + job_id + " submitted");
 
-    return poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn);
+    return poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn,
+                             {}, {}, ch);
 }
 
 // ── Resume a previously submitted job ────────────────────────────────────
@@ -905,13 +1079,15 @@ bool resume_job(
     const Registry& reg,
     const std::string& th_dir,
     std::function<void(const std::string&)> log_fn,
-    std::function<void(const std::string&)> status_fn)
+    std::function<void(const std::string&)> status_fn,
+    std::shared_ptr<RemoteChannel> channel)
 {
     RemoteDest dest{pending.remote, pending.remote_path};
     if (log_fn) log_fn("  resuming job " + pending.job_id);
     if (status_fn) status_fn("PENDING");
     return poll_and_finalize(pending.job_id, pending.started_at,
-                             test, reg, th_dir, dest, pending.project_root, log_fn, status_fn);
+                             test, reg, th_dir, dest, pending.project_root, log_fn, status_fn,
+                             {}, {}, channel.get());
 }
 
 } // namespace trailhead

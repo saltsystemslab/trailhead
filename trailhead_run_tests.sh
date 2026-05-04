@@ -54,8 +54,12 @@ if [[ $NO_BUILD -eq 0 ]]; then
     # Detect parallelism
     NCPU=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
-    echo "==> Configuring trailhead..."
-    cmake -B "$SCRIPT_DIR/build" -DCMAKE_BUILD_TYPE=Release -S "$SCRIPT_DIR"
+    # Skip configure if cache exists and CMakeLists.txt hasn't changed since.
+    if [[ ! -f "$SCRIPT_DIR/build/CMakeCache.txt" ]] || \
+       [[ "$SCRIPT_DIR/CMakeLists.txt" -nt "$SCRIPT_DIR/build/CMakeCache.txt" ]]; then
+        echo "==> Configuring trailhead..."
+        cmake -B "$SCRIPT_DIR/build" -DCMAKE_BUILD_TYPE=Release -S "$SCRIPT_DIR"
+    fi
 
     echo "==> Building trailhead (${NCPU} jobs)..."
     cmake --build "$SCRIPT_DIR/build" -j"$NCPU"

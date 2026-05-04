@@ -140,36 +140,66 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
 
     // Project setup: submodule init, dataset downloads, etc.
     // Guarded by .trailhead/setup_done so it only runs once per remote workspace.
-    // Delete that file (or run with --force-setup) to re-run.
+    // If no "---" barrier is present, each step runs sequentially (safe default).
+    // Adding barriers opts in to parallelism: steps between two barriers run
+    // concurrently, each barrier waits for its stage to finish.
     if (!setup.empty()) {
         o << "if [ ! -f .trailhead/setup_done ]; then\n";
+
+        bool has_barrier = false;
         for (const auto& s : setup)
-            o << "  " << s << "\n";
+            if (s == "---") { has_barrier = true; break; }
+
+        if (!has_barrier) {
+            // Sequential mode: emit each step as-is (preserves pre-barrier behaviour).
+            for (const auto& s : setup)
+                o << "  " << s << "\n";
+        } else {
+            // Barrier mode: group by "---"; each group runs in parallel.
+            std::vector<std::vector<std::string>> stages;
+            stages.push_back({});
+            for (const auto& s : setup) {
+                if (s == "---") stages.push_back({});
+                else stages.back().push_back(s);
+            }
+            for (const auto& stage : stages) {
+                if (stage.empty()) continue;
+                if (stage.size() == 1) {
+                    o << "  " << stage[0] << "\n";
+                } else {
+                    for (const auto& s : stage)
+                        o << "  " << s << " &\n";
+                    o << "  wait\n";
+                }
+            }
+        }
+
         o << "  touch .trailhead/setup_done\n";
         o << "fi\n\n";
     }
 
     // Configure step: run cmake on the compute node so it auto-detects GPU arch.
     // For cmake ".." (run-from-build-dir) form, cd into the build dir first.
+    // On failure, emit TRAILHEAD:build_fail so the TUI surfaces it distinctly.
     if (!configure_cmd.empty() && !build_dir.empty()) {
         std::string cfg = str_replace_all(configure_cmd, "-B build", "-B " + build_dir);
         bool from_build = cfg.size() >= 3 && cfg.substr(cfg.size() - 3) == " ..";
-        // Check for the build system file (not just CMakeCache.txt) so a partial
-        // configure that left no Makefile/build.ninja still triggers a re-run.
+        o << "if [ ! -f " << build_dir << "/Makefile ] && [ ! -f " << build_dir << "/build.ninja ]; then\n";
         if (from_build) {
-            o << "([ -f " << build_dir << "/Makefile ] || [ -f " << build_dir << "/build.ninja ]) || "
-              << "(mkdir -p " << build_dir << " && cd " << build_dir << " && " << cfg << ")\n\n";
+            o << "  mkdir -p " << build_dir << " && (cd " << build_dir << " && " << cfg << ")\n";
         } else {
-            o << "([ -f " << build_dir << "/Makefile ] || [ -f " << build_dir << "/build.ninja ]) || "
-              << cfg << "\n\n";
+            o << "  " << cfg << "\n";
         }
+        o << "  if [ $? -ne 0 ]; then echo \"TRAILHEAD:build_fail\"; exit 1; fi\n";
+        o << "fi\n\n";
     }
 
     for (const TestEntry* t : tests) {
         o << "# " << (t->label.empty() ? t->name : t->label) << "\n";
         // If test has a cmake target, rebuild it in the node's build dir
         if (!t->build_name.empty() && !t->target.empty()) {
-            o << "cmake --build " << build_dir << " --target " << t->target << "\n";
+            o << "cmake --build " << build_dir << " --target " << t->target
+              << " || { echo \"TRAILHEAD:build_fail\"; exit 1; }\n";
         }
         // Substitute build dir in the run cmd (e.g. "build/tests/foo" → "build_h200/tests/foo")
         std::string cmd = str_replace_all(t->cmd, "build/", build_dir + "/");

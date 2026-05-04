@@ -32,9 +32,10 @@ struct TestResult {
     time_t  file_mtime   = 0;
 };
 
-enum class RunStatus { Unknown, Pass, Fail, Running };
+enum class RunStatus { Unknown, Pass, Fail, BuildFail, Running };
 
 inline RunStatus result_status(const TestResult& r) {
+    if (r.metadata.count("_build_fail"))   return RunStatus::BuildFail;
     if (r.failed > 0 || r.exit_code != 0) return RunStatus::Fail;
     if (r.passed > 0 || r.wall_ms > 0)    return RunStatus::Pass;
     return RunStatus::Unknown;
@@ -42,10 +43,11 @@ inline RunStatus result_status(const TestResult& r) {
 
 inline std::string status_str(RunStatus s) {
     switch (s) {
-        case RunStatus::Pass:    return "PASS";
-        case RunStatus::Fail:    return "FAIL";
-        case RunStatus::Running: return "RUNNING";
-        default:                 return "---";
+        case RunStatus::Pass:      return "PASS";
+        case RunStatus::Fail:      return "FAIL";
+        case RunStatus::BuildFail: return "BFAIL";
+        case RunStatus::Running:   return "RUNNING";
+        default:                   return "---";
     }
 }
 
@@ -146,6 +148,9 @@ inline void parse_trailhead_output(
             out.passed++;
         } else if (verb == "fail") {
             out.failed++;
+        } else if (verb == "build_fail") {
+            out.metadata["_build_fail"] = "1";
+            out.failed++;
         } else if (verb == "time") {
             try {
                 TimingEntry te;
@@ -233,12 +238,31 @@ inline ResultIndex load_all_results(const std::string& results_dir) {
         if (!r) continue;
         idx[r->name].push_back(*r);
     }
-    // Sort each list by started_at
     for (auto& [name, vec] : idx) {
         std::sort(vec.begin(), vec.end(),
             [](const TestResult& a, const TestResult& b) { return a.started_at < b.started_at; });
     }
     return idx;
+}
+
+// Incremental refresh: only parse files newer than last scan.
+// Keeps a static cache of known files and their mtimes.
+inline void refresh_results(const std::string& results_dir, ResultIndex& idx) {
+    static ::std::unordered_map<::std::string, time_t> seen;
+    for (const auto& path : fs::list_files_recursive(results_dir, ".json")) {
+        time_t mt = fs::mtime(path);
+        auto it = seen.find(path);
+        if (it != seen.end() && it->second == mt) continue;
+        seen[path] = mt;
+        auto r = parse_result(path);
+        if (!r) continue;
+        auto& vec = idx[r->name];
+        vec.erase(::std::remove_if(vec.begin(), vec.end(),
+            [&](const TestResult& t) { return t.started_at == r->started_at; }), vec.end());
+        vec.push_back(*r);
+        ::std::sort(vec.begin(), vec.end(),
+            [](const TestResult& a, const TestResult& b) { return a.started_at < b.started_at; });
+    }
 }
 
 // Get the most recent result for a test name

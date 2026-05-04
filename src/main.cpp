@@ -9,12 +9,15 @@
 #include "util/ansi.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
@@ -1135,23 +1138,299 @@ static int cmd_clean(int argc, char** argv) {
     return 0;
 }
 
+
+// Subcommand: download
+// Chunked parallel download with resume support via curl byte-range requests.
+// Usage: trailhead download <url> [--output <file>] [--parallel <n>] [--chunk-size <mb>]
+
+static int cmd_download(int argc, char** argv) {
+    if (argc < 3) {
+        std::cout << "Usage: trailhead download <url> [--output <file>] [--parallel <n>] [--chunk-size <mb>]\n"
+                     "\n"
+                     "Downloads a file in parallel chunks with resume support.\n"
+                     "If the server does not support range requests, falls back to a single download.\n"
+                     "Re-running after a failure resumes from the last completed chunk.\n"
+                     "\n"
+                     "Options:\n"
+                     "  --output <file>     Output filename (default: last URL component)\n"
+                     "  --parallel <n>      Concurrent chunks (default: 4)\n"
+                     "  --chunk-size <mb>   Chunk size in MB (default: 32)\n";
+        return 0;
+    }
+
+    Args args = Args::parse(argc, argv, 3);
+    std::string url(argv[2]);
+    int parallel = args.get_int("parallel", 4);
+    int chunk_mb = args.get_int("chunk-size", 32);
+
+    // Derive default output filename from URL
+    std::string output = args.get("output");
+    if (output.empty()) {
+        auto slash = url.rfind('/');
+        auto qmark = url.find('?');
+        output = (slash != std::string::npos)
+            ? url.substr(slash + 1, qmark == std::string::npos ? std::string::npos : qmark - slash - 1)
+            : "download.out";
+        if (output.empty()) output = "download.out";
+    }
+
+    // Scratch directory for chunks alongside the output file
+    std::string out_dir;
+    {
+        auto sl = output.rfind('/');
+        out_dir = (sl != std::string::npos) ? output.substr(0, sl) : ".";
+    }
+    std::string basename  = output.substr(output.rfind('/') + 1);
+    std::string chunk_dir = out_dir + "/.trailhead_chunks_" + basename;
+    std::string state_path = chunk_dir + "/state.json";
+
+    // Step 1: HEAD request -- get Content-Length and Accept-Ranges
+    std::string head_cmd = "curl -sIL --max-time 30 \"" + url + "\"";
+    auto head_r = trailhead::proc::run(head_cmd, {}, {}, 35, "", nullptr, true);
+    int64_t content_len  = -1;
+    bool    accept_ranges = false;
+    {
+        std::istringstream ss(head_r.stdout_str);
+        for (std::string line; std::getline(ss, line); ) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::string lower = line;
+            for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+            if (lower.rfind("content-length:", 0) == 0) {
+                try { content_len = std::stoll(line.substr(15)); } catch (...) {}
+            }
+            if (lower.rfind("accept-ranges:", 0) == 0 && lower.find("none") == std::string::npos)
+                accept_ranges = true;
+        }
+    }
+
+    // Fall back to a single streaming download when the server does not support ranges
+    if (content_len <= 0 || !accept_ranges) {
+        std::cout << "  server does not support range requests -- single-threaded download\n";
+        std::string cmd = "curl -L --progress-bar --output \"" + output + "\" \"" + url + "\"";
+        auto r = trailhead::proc::run(cmd, {}, {}, 3600, "", nullptr, true);
+        if (r.exit_code != 0) {
+            std::cerr << trailhead::ansi::color(trailhead::ansi::BRED, "download failed\n");
+            return 1;
+        }
+        std::cout << trailhead::ansi::color(trailhead::ansi::BGREEN, "done") << "  " << output << "\n";
+        return 0;
+    }
+
+    int64_t chunk_bytes = (int64_t)chunk_mb * 1024 * 1024;
+    int n_chunks = (int)((content_len + chunk_bytes - 1) / chunk_bytes);
+    if (parallel > n_chunks) parallel = n_chunks;
+
+    std::cout << trailhead::ansi::BOLD << "download" << trailhead::ansi::RESET
+              << "  " << url << "\n"
+              << "  size=" << (content_len / (1024 * 1024)) << "MB"
+              << "  chunks=" << n_chunks << "  parallel=" << parallel << "\n";
+
+    trailhead::fs::mkdir_p(chunk_dir);
+
+    // Step 2: load + validate existing state.
+    // State stores url, content_len, and chunk_bytes used when it was written.
+    // If any of those differ (file updated, different --chunk-size), discard it.
+    std::vector<int> done(n_chunks, 0);
+    {
+        auto txt = trailhead::fs::read_file(state_path);
+        bool state_valid = false;
+        if (txt) {
+            try {
+                auto root = trailhead::json_parse(*txt);
+                state_valid =
+                    root.get_str("url")         == url            &&
+                    root.get_int("content_len") == content_len    &&
+                    root.get_int("chunk_bytes") == (int64_t)chunk_bytes;
+                if (state_valid) {
+                    const auto* chunks = root.get("chunks");
+                    if (chunks && chunks->is_array()) {
+                        for (const auto& v : chunks->as_array()) {
+                            int idx = (int)v.get_int("i", -1);
+                            if (idx < 0 || idx >= n_chunks) continue;
+                            if (!v.get_bool("done", false)) continue;
+                            // Verify the chunk file actually has the right byte count
+                            std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(idx);
+                            int64_t exp_start = (int64_t)idx * chunk_bytes;
+                            int64_t exp_size  = std::min(chunk_bytes, content_len - exp_start);
+                            struct stat st;
+                            if (::stat(chunk_path.c_str(), &st) == 0 &&
+                                (int64_t)st.st_size == exp_size)
+                                done[idx] = 1;
+                            // else: missing or partial -- re-download
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+        if (!state_valid && txt) {
+            std::cout << trailhead::ansi::DIM
+                      << "  state mismatch (URL or chunk size changed) -- starting fresh\n"
+                      << trailhead::ansi::RESET;
+            for (int i = 0; i < n_chunks; ++i)
+                ::unlink((chunk_dir + "/chunk_" + std::to_string(i)).c_str());
+        }
+    }
+
+    std::atomic<int> total_done{0};
+    for (int d : done) if (d) ++total_done;
+    if (total_done > 0)
+        std::cout << "  resuming: " << total_done.load() << "/" << n_chunks
+                  << " chunks already complete\n";
+
+    // Saves state atomically; caller holds mtx while reading `done`, but the
+    // actual file write happens with the lock released to avoid holding it
+    // during disk I/O.  We copy the snapshot under the lock, then write outside.
+    auto save_state = [&](std::vector<int> snapshot) {
+        trailhead::JsonObject root;
+        root.push_back({"url",         url});
+        root.push_back({"content_len", trailhead::JsonValue(content_len)});
+        root.push_back({"chunk_bytes", trailhead::JsonValue((int64_t)chunk_bytes)});
+        trailhead::JsonArray arr;
+        for (int i = 0; i < n_chunks; ++i) {
+            trailhead::JsonObject obj;
+            obj.push_back({"i",    trailhead::JsonValue((int64_t)i)});
+            obj.push_back({"done", trailhead::JsonValue(snapshot[i] != 0)});
+            arr.push_back(trailhead::JsonValue(std::move(obj)));
+        }
+        root.push_back({"chunks", trailhead::JsonValue(std::move(arr))});
+        trailhead::fs::write_file_atomic(state_path,
+            trailhead::json_emit(trailhead::JsonValue(std::move(root))));
+    };
+
+    // Step 3: download missing chunks -- all waves, collect all failures.
+    // We do NOT stop on the first failed wave; remaining waves still run so
+    // as many chunks as possible succeed.  Re-running resumes from failures.
+    std::mutex mtx;
+    std::vector<int> todo;
+    for (int i = 0; i < n_chunks; ++i) if (!done[i]) todo.push_back(i);
+
+    std::vector<int> failed_chunks;
+
+    while (!todo.empty()) {
+        int wave_size = std::min(parallel, (int)todo.size());
+        std::vector<int> wave(todo.begin(), todo.begin() + wave_size);
+        todo.erase(todo.begin(), todo.begin() + wave_size);
+
+        std::vector<std::thread> threads;
+        for (int idx : wave) {
+            threads.emplace_back([&, idx]() {
+                int64_t start    = (int64_t)idx * chunk_bytes;
+                int64_t end      = std::min(start + chunk_bytes - 1, content_len - 1);
+                int64_t exp_size = end - start + 1;
+                std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(idx);
+
+                std::string cmd = "curl -fsSL --retry 3 --retry-delay 2 --range "
+                    + std::to_string(start) + "-" + std::to_string(end)
+                    + " --output \"" + chunk_path + "\" \"" + url + "\"";
+                auto r = trailhead::proc::run(cmd, {}, {}, 600, "", nullptr, true);
+
+                // Verify the downloaded file has exactly the expected byte count.
+                // A size mismatch means a truncated transfer even if curl exited 0.
+                bool ok = false;
+                if (r.exit_code == 0) {
+                    struct stat st;
+                    ok = (::stat(chunk_path.c_str(), &st) == 0 &&
+                          (int64_t)st.st_size == exp_size);
+                }
+
+                std::vector<int> snapshot;
+                {
+                    std::lock_guard<std::mutex> g(mtx);
+                    if (ok) {
+                        done[idx] = 1;
+                        int nd = ++total_done;
+                        std::cout << "  chunk " << (idx+1) << "/" << n_chunks
+                                  << "  " << nd << " done  "
+                                  << (nd * 100 / n_chunks) << "%\n";
+                        std::cout.flush();
+                        snapshot = done; // copy under lock for state write
+                    } else {
+                        ::unlink(chunk_path.c_str()); // remove partial file
+                        failed_chunks.push_back(idx);
+                        std::string reason = (r.exit_code != 0)
+                            ? " (curl exit=" + std::to_string(r.exit_code) + ")"
+                            : " (size mismatch)";
+                        std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
+                            "  chunk " + std::to_string(idx+1) + " failed" + reason + "\n");
+                    }
+                }
+                if (ok) save_state(std::move(snapshot));
+            });
+        }
+        for (auto& t : threads) t.join();
+        // Continue remaining waves regardless of failures.
+    }
+
+    if (!failed_chunks.empty()) {
+        std::cerr << trailhead::ansi::color(trailhead::ansi::BYELLOW,
+            std::to_string(failed_chunks.size()) + " chunk(s) failed. Re-run to resume.\n");
+        return 1;
+    }
+
+    // Step 4: stream-concatenate chunks into the output file.
+    // Uses a fixed copy buffer to avoid loading an entire chunk into memory.
+    std::cout << "  assembling " << n_chunks << " chunks -> " << output << "\n";
+    std::cout.flush();
+    {
+        static constexpr size_t kCopyBuf = 4 * 1024 * 1024;
+        std::vector<char> buf(kCopyBuf);
+        std::ofstream out(output, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
+                "cannot open output: " + output + "\n");
+            return 1;
+        }
+        for (int i = 0; i < n_chunks; ++i) {
+            std::string chunk_path = chunk_dir + "/chunk_" + std::to_string(i);
+            std::ifstream in(chunk_path, std::ios::binary);
+            if (!in) {
+                std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
+                    "missing chunk file: " + chunk_path + "\n");
+                return 1;
+            }
+            while (in.read(buf.data(), (std::streamsize)buf.size()) || in.gcount() > 0)
+                out.write(buf.data(), in.gcount());
+            if (out.fail()) {
+                std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
+                    "write error assembling output\n");
+                return 1;
+            }
+        }
+    }
+
+    // Cleanup chunk directory
+    for (int i = 0; i < n_chunks; ++i)
+        ::unlink((chunk_dir + "/chunk_" + std::to_string(i)).c_str());
+    ::unlink(state_path.c_str());
+    ::rmdir(chunk_dir.c_str());
+
+    std::cout << trailhead::ansi::color(trailhead::ansi::BGREEN, "done") << "  " << output
+              << "  (" << (content_len / (1024 * 1024)) << "MB)\n";
+    return 0;
+}
+
+
 // ── Subcommand: setup ─────────────────────────────────────────────────────
 
 static int cmd_setup(int argc, char** argv) {
     if (argc < 3) {
         std::cout << "Usage:\n"
                      "  trailhead setup add <command>      # append a setup step\n"
+                     "  trailhead setup barrier             # add a parallel barrier\n"
                      "  trailhead setup list                # show all setup steps\n"
                      "  trailhead setup remove <index>      # remove step by index (0-based)\n"
                      "  trailhead setup run [--force]       # run locally (skipped if already done)\n"
                      "\n"
-                     "Setup steps run once per workspace, guarded by .trailhead/setup_done.\n"
-                     "On remote: the sentinel is created after the first successful sbatch run.\n"
+                     "Steps between barriers run in parallel; barriers synchronize.\n"
+                     "Setup runs once per workspace, guarded by .trailhead/setup_done.\n"
+                     "On remote: sentinel is created after the first successful sbatch run.\n"
                      "Locally: use --force to re-run even if the sentinel exists.\n"
                      "\n"
                      "Example:\n"
                      "  trailhead setup add \"git submodule update --init --recursive\"\n"
-                     "  trailhead setup add \"wget -nc https://example.com/data.tar.gz\"\n";
+                     "  trailhead setup barrier\n"
+                     "  trailhead setup add \"trailhead download https://example.com/data.tar.gz -o data.tar.gz\"\n"
+                     "  trailhead setup add \"trailhead download https://example.com/model.bin -o model.bin\"\n";
         return 0;
     }
     std::string action(argv[2]);
@@ -1163,8 +1442,20 @@ static int cmd_setup(int argc, char** argv) {
             std::cout << trailhead::ansi::DIM << "No setup steps defined.\n" << trailhead::ansi::RESET;
             return 0;
         }
-        for (int i = 0; i < (int)reg.setup.size(); ++i)
-            std::cout << "[" << i << "] " << reg.setup[i] << "\n";
+        for (int i = 0; i < (int)reg.setup.size(); ++i) {
+            if (reg.setup[i] == "---")
+                std::cout << "[" << i << "] " << trailhead::ansi::dim("--- barrier ---") << "\n";
+            else
+                std::cout << "[" << i << "] " << reg.setup[i] << "\n";
+        }
+        return 0;
+    }
+
+    if (action == "barrier") {
+        reg.setup.push_back("---");
+        trailhead::save_registry(th_dir, reg);
+        std::cout << trailhead::ansi::BGREEN << "Added barrier" << trailhead::ansi::RESET
+                  << " (steps above/below this line run in parallel)\n";
         return 0;
     }
 
@@ -1228,21 +1519,67 @@ static int cmd_setup(int argc, char** argv) {
             return 0;
         }
 
-        int failed = 0;
-        for (int i = 0; i < (int)reg.setup.size(); ++i) {
-            std::cout << trailhead::ansi::BOLD << "[" << (i+1) << "/" << reg.setup.size() << "]"
-                      << trailhead::ansi::RESET << " " << reg.setup[i] << "\n";
-            std::cout.flush();
-            auto r = trailhead::proc::run(reg.setup[i], {}, {}, 300, workdir,
-                [](const std::string& line){ std::cout << "  " << line << "\n"; },
-                /*use_shell=*/true);
-            if (r.exit_code != 0) {
-                if (!r.stderr_str.empty()) std::cerr << r.stderr_str;
-                std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
-                    "  step failed (exit=" + std::to_string(r.exit_code) + ") — continuing\n");
-                ++failed;
+        // If no barrier is present, each step is its own stage (sequential, safe default).
+        // Adding barriers opts in to parallelism: steps in a stage run concurrently.
+        bool has_barrier = false;
+        for (const auto& s : reg.setup)
+            if (s == "---") { has_barrier = true; break; }
+
+        std::vector<std::vector<std::string>> stages;
+        if (!has_barrier) {
+            for (const auto& s : reg.setup)
+                stages.push_back({s});
+        } else {
+            stages.push_back({});
+            for (const auto& s : reg.setup) {
+                if (s == "---") stages.push_back({});
+                else stages.back().push_back(s);
             }
         }
+
+        int failed = 0;
+        int step_idx = 0;
+        int total_steps = 0;
+        for (const auto& st : stages) total_steps += (int)st.size();
+
+        for (int si = 0; si < (int)stages.size(); ++si) {
+            const auto& stage = stages[si];
+            if (stage.empty()) continue;
+            bool parallel = stage.size() > 1;
+            if (parallel)
+                std::cout << trailhead::ansi::DIM << "  [parallel stage " << si << "]\n"
+                          << trailhead::ansi::RESET;
+
+            std::vector<int> results(stage.size(), 0);
+            std::vector<std::thread> threads;
+            std::mutex out_mtx;
+            for (int i = 0; i < (int)stage.size(); ++i) {
+                int global_idx = step_idx + i + 1;
+                std::cout << trailhead::ansi::BOLD << "[" << global_idx << "/" << total_steps << "]"
+                          << trailhead::ansi::RESET << " " << stage[i] << (parallel ? " &" : "") << "\n";
+                std::cout.flush();
+                threads.emplace_back([&, i, global_idx]() {
+                    auto r = trailhead::proc::run(stage[i], {}, {}, 600, workdir,
+                        [&out_mtx](const std::string& line){
+                            std::lock_guard<std::mutex> g(out_mtx);
+                            std::cout << "  " << line << "\n";
+                        },
+                        /*use_shell=*/true);
+                    results[i] = r.exit_code;
+                    if (r.exit_code != 0) {
+                        std::lock_guard<std::mutex> g(out_mtx);
+                        if (!r.stderr_str.empty()) std::cerr << r.stderr_str;
+                        std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
+                            "  step [" + std::to_string(global_idx) + "] failed (exit="
+                            + std::to_string(r.exit_code) + ")\n");
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+            for (int r : results) if (r != 0) ++failed;
+            step_idx += (int)stage.size();
+        }
+
         trailhead::fs::write_file_atomic(sentinel, "");
         if (failed == 0) {
             std::cout << trailhead::ansi::color(trailhead::ansi::BGREEN, "Setup complete") << "\n";
@@ -1350,9 +1687,12 @@ static void print_usage() {
     std::cout << "  show  [name]                  Print latest result details\n";
     std::cout << "  clean [--days <n>] [--dry-run] Remove old result files\n";
     std::cout << "  setup add <cmd>               Add a one-time project setup step\n";
+    std::cout << "  setup barrier                 Add a parallel barrier between setup steps\n";
     std::cout << "  setup list                    List setup steps\n";
     std::cout << "  setup remove <index>          Remove a setup step by index\n";
     std::cout << "  setup run                     Run all setup steps locally\n";
+    std::cout << "  download <url> [--output <f>] [--parallel <n>] [--chunk-size <mb>]\n";
+    std::cout << "                                Resumable parallel download via curl chunks\n";
     std::cout << "  sub add <path>                Add a sub-registry (e.g. a git submodule)\n";
     std::cout << "  sub list                      List declared sub-registries\n";
     std::cout << "  sub remove <path>             Remove a sub-registry declaration\n";
@@ -1391,6 +1731,7 @@ int main(int argc, char** argv) {
     if (cmd == "clean")        return cmd_clean(argc, argv);
     if (cmd == "setup")        return cmd_setup(argc, argv);
     if (cmd == "sub")          return cmd_sub(argc, argv);
+    if (cmd == "download")     return cmd_download(argc, argv);
     if (cmd == "--help" || cmd == "help" || cmd == "-h") { print_usage(); return 0; }
 
     std::cerr << "Unknown command: " << cmd << ". Run 'trailhead help' for usage.\n";
