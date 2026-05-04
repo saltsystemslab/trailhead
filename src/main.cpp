@@ -1009,34 +1009,29 @@ static int cmd_watch(int argc, char** argv) {
         }
     }
 
-    // Re-enqueue submissions that were waiting (QUEUED/RSYNC) when watch last closed
-    if (remote_dest) {
+    bool auto_run = args.flag("run-all");
+    int repeat    = args.get_int("repeat", 1);
+
+    // Re-enqueue submissions that were waiting (QUEUED/RSYNC) when watch last closed.
+    // In auto_run mode, start fresh: discard any stale queued files rather than
+    // replaying them into the new session.
+    {
         auto queued = trailhead::load_queued_submissions(th_dir);
         for (const auto& qs : queued) {
+            if (auto_run) {
+                trailhead::clear_queued_submission(th_dir, qs.name);
+                continue;
+            }
+            bool local_only = !remote_dest && qs.node_name != "local";
             bool found = false;
             for (const auto& t : reg.tests)
                 if (t.name == qs.name) { found = true; break; }
-            if (!found) {
+            if (!found || local_only) {
                 trailhead::clear_queued_submission(th_dir, qs.name);
                 continue;
             }
             job_log->push("[" + qs.name + "] re-queuing from previous session");
             run_fn(qs.name, qs.node_name);
-        }
-    } else if (local_runner && run_fn) {
-        // No remote — restore any local jobs that were queued when watch last closed
-        auto queued = trailhead::load_queued_submissions(th_dir);
-        for (const auto& qs : queued) {
-            if (qs.node_name != "local") continue;
-            bool found = false;
-            for (const auto& t : reg.tests)
-                if (t.name == qs.name) { found = true; break; }
-            if (!found) {
-                trailhead::clear_queued_submission(th_dir, qs.name);
-                continue;
-            }
-            job_log->push("[" + qs.name + "] re-queuing local from previous session");
-            run_fn(qs.name, "local");
         }
     }
 
@@ -1048,9 +1043,6 @@ static int cmd_watch(int argc, char** argv) {
             std::cout << "Wiped " << removed.size() << " build director"
                       << (removed.size() == 1 ? "y" : "ies") << "\n";
     }
-
-    bool auto_run = args.flag("run-all");
-    int repeat = args.get_int("repeat", 1);
 
     // Pre-build all cmake targets before starting the TUI, so tests run immediately.
     if (auto_run && local_runner) {
@@ -1065,7 +1057,15 @@ static int cmd_watch(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    return trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, cancel_fn, project_root, auto_run, repeat);
+    int rc = trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, cancel_fn, project_root, auto_run, repeat);
+
+    // Clear any queued submissions that didn't get to run (e.g. interrupted mid-session).
+    if (auto_run) {
+        for (const auto& qs : trailhead::load_queued_submissions(th_dir))
+            trailhead::clear_queued_submission(th_dir, qs.name);
+    }
+
+    return rc;
 }
 
 // ── Subcommand: show ──────────────────────────────────────────────────────
