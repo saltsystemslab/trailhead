@@ -5,10 +5,11 @@
 namespace trailhead::ansi {
 
 // Reset / styles
-constexpr const char* RESET  = "\033[0m";
-constexpr const char* BOLD   = "\033[1m";
-constexpr const char* DIM    = "\033[2m";
-constexpr const char* ITALIC = "\033[3m";
+constexpr const char* RESET   = "\033[0m";
+constexpr const char* BOLD    = "\033[1m";
+constexpr const char* DIM     = "\033[2m";
+constexpr const char* ITALIC  = "\033[3m";
+constexpr const char* REVERSE = "\033[7m";   // swap fg/bg (selection highlight)
 
 // Foreground colors
 constexpr const char* RED     = "\033[31m";

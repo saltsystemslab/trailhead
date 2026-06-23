@@ -1,9 +1,77 @@
 #include "sbatch_gen.hpp"
+#include "datasets_runtime.hpp"
 #include "../util/file_util.hpp"
 #include <sstream>
 #include <algorithm>
+#include <map>
+#include <set>
 
 namespace trailhead {
+
+// Classify a setup command into an execution phase by its leading verb. Lower
+// phases run first. Returns -1 for anything unrecognised (callers then keep
+// such steps strictly sequential to be safe).
+//   0 prep · 1 download · 2 extract · 3 move/install · 4 cleanup
+static int setup_phase(const std::string& cmd) {
+    size_t b = cmd.find_first_not_of(" \t");
+    if (b == std::string::npos) return -1;
+    size_t e = cmd.find_first_of(" \t", b);
+    std::string tok = cmd.substr(b, e == std::string::npos ? std::string::npos : e - b);
+    if (auto sl = tok.rfind('/'); sl != std::string::npos) tok = tok.substr(sl + 1);
+
+    auto is = [&](std::initializer_list<const char*> opts) {
+        for (const char* o : opts) if (tok == o) return true;
+        return false;
+    };
+    if (is({"mkdir"}))                                                    return 0;
+    if (is({"curl", "wget", "aria2c", "git"}))                            return 1;
+    if (is({"unzip", "tar", "gunzip", "gzip", "bunzip2", "bzip2",
+            "xz", "unxz", "zstd", "unzstd", "7z", "7za"}))                return 2;
+    if (is({"mv", "cp", "install", "ln"}))                                return 3;
+    if (is({"rm", "rmdir"}))                                              return 4;
+    return -1;
+}
+
+std::vector<std::vector<std::pair<int, std::string>>>
+plan_setup_stages(const std::vector<std::string>& setup) {
+    std::vector<std::vector<std::pair<int, std::string>>> stages;
+
+    bool has_barrier = std::find(setup.begin(), setup.end(), "---") != setup.end();
+
+    // Index non-barrier items in original order — these indices are stable for
+    // a given setup list, so per-item sentinels/locks line up across chunks.
+    std::vector<std::pair<int, std::string>> items;
+    { int idx = 0; for (const auto& s : setup) if (s != "---") items.push_back({idx++, s}); }
+    if (items.empty()) return stages;
+
+    if (has_barrier) {
+        // Manual barriers: split on "---", dropping empty groups.
+        stages.push_back({});
+        int idx = 0;
+        for (const auto& s : setup) {
+            if (s == "---") { stages.push_back({}); continue; }
+            stages.back().push_back({idx++, s});
+        }
+        stages.erase(std::remove_if(stages.begin(), stages.end(),
+            [](const auto& v) { return v.empty(); }), stages.end());
+        return stages;
+    }
+
+    // Auto mode: only group by phase if every step is recognised; otherwise
+    // run sequentially so an unknown command's ordering is never broken.
+    bool all_known = std::all_of(items.begin(), items.end(),
+        [](const auto& it) { return setup_phase(it.second) >= 0; });
+    if (!all_known) {
+        for (const auto& it : items) stages.push_back({it});
+        return stages;
+    }
+
+    // std::map keeps phases ordered; insertion order within a phase is preserved.
+    std::map<int, std::vector<std::pair<int, std::string>>> buckets;
+    for (const auto& it : items) buckets[setup_phase(it.second)].push_back(it);
+    for (auto& [_, vec] : buckets) stages.push_back(std::move(vec));
+    return stages;
+}
 
 // Emit #SBATCH header lines for a node profile merged with sbatch_defaults
 static std::string sbatch_headers(const NodeProfile& node,
@@ -34,7 +102,9 @@ static std::string sbatch_headers(const NodeProfile& node,
     line_int("nodes",         node.nodes,         0);
     line_int("ntasks",        node.ntasks,        0);
     line_int("cpus-per-task", node.cpus_per_task, 0);
-    line("time",    node.time);
+    // Always emit --time so an empty profile time can't fall through to the QOS
+    // DefaultTime (often only minutes); default to 1h.
+    o << "#SBATCH --time=" << (node.time.empty() ? "01:00:00" : node.time) << "\n";
     if (!node.account.empty()) line("account", node.account);
     line("output",  defs.output_pattern);
     line("error",   defs.error_pattern);
@@ -100,7 +170,9 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
                                 const std::vector<std::string>& setup = {},
                                 const std::vector<std::string>& node_preamble = {},
                                 const std::string& parent_project = {},
-                                const std::vector<std::string>& parent_setup = {})
+                                const std::vector<std::string>& parent_setup = {},
+                                const std::vector<std::string>& extra_targets = {},
+                                int build_jobs = 1)
 {
     std::ostringstream o;
 
@@ -122,8 +194,20 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
     // Set TRAILHEAD_JOB_ID so reporter.hpp labels results as sbatch-<id>
     o << "export TRAILHEAD_JOB_ID=$SLURM_JOB_ID\n";
     o << "export TRAILHEAD_ENABLED=1\n";
+    if (!build_dir.empty())
+        o << "export TRAILHEAD_BUILD_DIR=" << build_dir << "\n";
     if (!project_root.empty())
         o << "cd " << project_root << "\n";
+
+    // Source dataset helpers if any test in this script lists a dataset.
+    // The runtime is a no-op if .trailhead/datasets/<name>/ is absent (e.g.
+    // when this script is submitted manually without running the dataset
+    // init pre-step), so wrapping is always safe.
+    bool any_datasets = false;
+    for (const TestEntry* t : tests)
+        if (!t->datasets.empty()) { any_datasets = true; break; }
+    if (any_datasets)
+        o << "[ -f .trailhead/lib/datasets.sh ] && source .trailhead/lib/datasets.sh\n";
     o << "\n";
 
     // Root project setup: run before own setup for sub-registry tests that depend on it.
@@ -140,67 +224,86 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
 
     // Project setup: submodule init, dataset downloads, etc.
     // Guarded by .trailhead/setup_done so it only runs once per remote workspace.
-    // If no "---" barrier is present, each step runs sequentially (safe default).
-    // Adding barriers opts in to parallelism: steps between two barriers run
-    // concurrently, each barrier waits for its stage to finish.
+    // Steps are grouped into stages by plan_setup_stages(): explicit "---"
+    // barriers split manually, otherwise recognised dataset-prep verbs are
+    // phased (downloads in parallel, then extracts, then moves), and anything
+    // unrecognised stays strictly sequential.
     if (!setup.empty()) {
         o << "if [ ! -f .trailhead/setup_done ]; then\n";
-
-        bool has_barrier = false;
-        for (const auto& s : setup)
-            if (s == "---") { has_barrier = true; break; }
-
-        if (!has_barrier) {
-            // Sequential mode: emit each step as-is (preserves pre-barrier behaviour).
-            for (const auto& s : setup)
-                o << "  " << s << "\n";
-        } else {
-            // Barrier mode: group by "---"; each group runs in parallel.
-            std::vector<std::vector<std::string>> stages;
-            stages.push_back({});
-            for (const auto& s : setup) {
-                if (s == "---") stages.push_back({});
-                else stages.back().push_back(s);
-            }
-            for (const auto& stage : stages) {
-                if (stage.empty()) continue;
-                if (stage.size() == 1) {
-                    o << "  " << stage[0] << "\n";
-                } else {
-                    for (const auto& s : stage)
-                        o << "  " << s << " &\n";
-                    o << "  wait\n";
-                }
+        for (const auto& stage : plan_setup_stages(setup)) {
+            if (stage.size() == 1) {
+                // Tolerate a non-zero exit (e.g. `mkdir datasets` when it already
+                // exists) so a non-idempotent step doesn't abort the whole job
+                // under `set -e`; log it instead and continue.
+                o << "  " << stage[0].second
+                  << " || echo \"[trailhead] setup step exited $? (continuing)\"\n";
+            } else {
+                for (const auto& [_, cmd] : stage)
+                    o << "  " << cmd << " &\n";
+                o << "  wait\n";   // bare `wait` returns 0, so a bg failure won't trip set -e
             }
         }
-
         o << "  touch .trailhead/setup_done\n";
         o << "fi\n\n";
     }
 
-    // Configure step: run cmake on the compute node so it auto-detects GPU arch.
-    // For cmake ".." (run-from-build-dir) form, cd into the build dir first.
-    // On failure, emit TRAILHEAD:build_fail so the TUI surfaces it distinctly.
-    if (!configure_cmd.empty() && !build_dir.empty()) {
-        std::string cfg = str_replace_all(configure_cmd, "-B build", "-B " + build_dir);
-        bool from_build = cfg.size() >= 3 && cfg.substr(cfg.size() - 3) == " ..";
-        o << "if [ ! -f " << build_dir << "/Makefile ] && [ ! -f " << build_dir << "/build.ninja ]; then\n";
-        if (from_build) {
-            o << "  mkdir -p " << build_dir << " && (cd " << build_dir << " && " << cfg << ")\n";
-        } else {
-            o << "  " << cfg << "\n";
+    // Build phase: configure + cmake --build. Multiple per-test jobs can land on
+    // the same node and share this build tree, so serialise the whole phase with
+    // an flock keyed by the build dir — concurrent cmake/ninja runs on one tree
+    // otherwise corrupt the cache and race on object files ("file lock held" /
+    // stale file errors). The lock lives in the current project's .trailhead, so
+    // parent and sub-registry build trees get independent locks. The check for an
+    // already-configured tree and the per-target builds all run inside the lock,
+    // so only one job configures and only one builds a given target at a time.
+    if (!build_dir.empty()) {
+        std::string lock_key = build_dir;
+        for (auto& c : lock_key) if (c == '/') c = '_';
+        o << "mkdir -p .trailhead\n";
+        o << "exec 200>\".trailhead/build_" << lock_key << ".lock\"\n";
+        // Bounded wait: a stale lock (e.g. a prior holder killed at the SLURM
+        // time limit, or flock-over-NFS not releasing) must not make us block
+        // forever and hit our own time limit. After the wait we proceed anyway —
+        // the configure check below is idempotent and the build is incremental.
+        o << "flock -w \"${TRAILHEAD_BUILD_LOCK_WAIT:-600}\" 200 "
+             "|| echo \"[trailhead] build lock wait timed out — proceeding\"\n";
+
+        // Configure once (auto-detects GPU arch on the compute node). For the
+        // cmake ".." run-from-build-dir form, cd into the build dir first.
+        if (!configure_cmd.empty()) {
+            std::string cfg = str_replace_all(configure_cmd, "-B build", "-B " + build_dir);
+            bool from_build = cfg.size() >= 3 && cfg.substr(cfg.size() - 3) == " ..";
+            o << "if [ ! -f " << build_dir << "/Makefile ] && [ ! -f " << build_dir << "/build.ninja ]; then\n";
+            if (from_build)
+                o << "  mkdir -p " << build_dir << " && (cd " << build_dir << " && " << cfg << ")\n";
+            else
+                o << "  " << cfg << "\n";
+            o << "  if [ $? -ne 0 ]; then echo \"TRAILHEAD:build_fail\"; flock -u 200; exit 1; fi\n";
+            o << "fi\n";
         }
-        o << "  if [ $? -ne 0 ]; then echo \"TRAILHEAD:build_fail\"; exit 1; fi\n";
-        o << "fi\n\n";
+
+        // Build dataset-required targets (converters, etc.) plus each test's
+        // target, deduplicated. Done up front under the lock so the per-test
+        // loop below only runs binaries — no build commands touch the tree once
+        // the lock is released.
+        std::vector<std::string> build_targets;
+        std::set<std::string> seen_tgt;
+        for (const auto& tgt : extra_targets)
+            if (seen_tgt.insert(tgt).second) build_targets.push_back(tgt);
+        for (const TestEntry* t : tests)
+            if (!t->build_name.empty() && !t->target.empty()
+                && seen_tgt.insert(t->target).second)
+                build_targets.push_back(t->target);
+        int j = std::max(1, build_jobs);
+        for (const auto& tgt : build_targets)
+            o << "cmake --build " << build_dir << " --target " << tgt
+              << " -j " << j
+              << " || { echo \"TRAILHEAD:build_fail\"; flock -u 200; exit 1; }\n";
+
+        o << "flock -u 200\n\n";
     }
 
     for (const TestEntry* t : tests) {
         o << "# " << (t->label.empty() ? t->name : t->label) << "\n";
-        // If test has a cmake target, rebuild it in the node's build dir
-        if (!t->build_name.empty() && !t->target.empty()) {
-            o << "cmake --build " << build_dir << " --target " << t->target
-              << " || { echo \"TRAILHEAD:build_fail\"; exit 1; }\n";
-        }
         // Substitute build dir in the run cmd (e.g. "build/tests/foo" → "build_h200/tests/foo")
         std::string cmd = str_replace_all(t->cmd, "build/", build_dir + "/");
 
@@ -213,11 +316,34 @@ static std::string sbatch_body(const std::vector<const TestEntry*>& tests,
             cmd = str_replace_all(cmd, build_dir + "/", "./");
         }
 
+        // Datasets: ensure before, finish-with-refcount-cleanup after. `|| true`
+        // so set -e doesn't trip on a transient flock or missing helper.
+        for (const auto& d : t->datasets)
+            o << "declare -F th_ds_ensure >/dev/null && th_ds_ensure "
+              << d << " || true\n";
+
+        // Run the test, capturing exit code so finish always executes even
+        // when the test (or surrounding `set -e`) would otherwise abort.
+        if (!t->datasets.empty()) o << "_th_rc=0\n";
         if (!effective_wd.empty() && effective_wd != ".") {
-            o << "(\n  cd " << effective_wd << "\n  " << cmd << "\n)\n\n";
+            if (!t->datasets.empty())
+                o << "( cd " << effective_wd << " && " << cmd << " ) || _th_rc=$?\n";
+            else
+                o << "(\n  cd " << effective_wd << "\n  " << cmd << "\n)\n";
         } else {
-            o << cmd << "\n\n";
+            if (!t->datasets.empty())
+                o << "( " << cmd << " ) || _th_rc=$?\n";
+            else
+                o << cmd << "\n";
         }
+
+        if (!t->datasets.empty()) {
+            for (const auto& d : t->datasets)
+                o << "declare -F th_ds_finish >/dev/null && th_ds_finish "
+                  << d << " " << t->name << " || true\n";
+            o << "[ \"$_th_rc\" -eq 0 ] || true   # don't propagate test failure to set-e\n";
+        }
+        o << "\n";
     }
 
     return o.str();
@@ -363,10 +489,16 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
                 parent_setup_vec = reg.setup;
             }
 
+            // Datasets used by this single test contribute requires_targets.
+            std::vector<std::string> extra_tgts =
+                required_build_targets(reg, {t.name});
+
             script << sbatch_body({&t_adj}, defs, effective_root,
                                   build_dir, configure_cmd, effective_setup(reg, t),
                                   node_ptr ? node_ptr->preamble : std::vector<std::string>{},
-                                  parent_project, parent_setup_vec);
+                                  parent_project, parent_setup_vec,
+                                  extra_tgts,
+                                  node_ptr ? node_ptr->cpus_per_task : 1);
 
             out.push_back({t.name + ".sbatch", script.str()});
         }
@@ -436,10 +568,17 @@ generate_sbatch(const Registry& reg, const SbatchOptions& opts)
         if (node_ptr && !node_ptr->cuda_arch.empty())
             configure_cmd = str_replace_all(configure_cmd, "{{arch}}", node_ptr->cuda_arch);
         std::vector<const TestEntry*> ptrs;
-        for (const auto& t : reg.tests) ptrs.push_back(&t);
+        std::vector<std::string> all_names;
+        for (const auto& t : reg.tests) {
+            ptrs.push_back(&t);
+            all_names.push_back(t.name);
+        }
+        std::vector<std::string> extra_tgts = required_build_targets(reg, all_names);
         script << sbatch_body(ptrs, reg.sbatch_defaults, effective_root,
                               build_dir, configure_cmd, reg.setup,
-                              node_ptr ? node_ptr->preamble : std::vector<std::string>{});
+                              node_ptr ? node_ptr->preamble : std::vector<std::string>{},
+                              {}, {}, extra_tgts,
+                              node_ptr ? node_ptr->cpus_per_task : 1);
 
         out.push_back({"run_all.sbatch", script.str()});
     }
@@ -547,10 +686,13 @@ std::string generate_test_script(const TestEntry& test,
         parent_setup_vec = reg.setup;
     }
 
+    std::vector<std::string> extra_tgts = required_build_targets(reg, {test.name});
+
     script << sbatch_body({&test_adj}, defs, effective_root,
                           build_dir, configure_cmd, effective_setup(reg, test),
                           node_ptr ? node_ptr->preamble : std::vector<std::string>{},
-                          parent_project, parent_setup_vec);
+                          parent_project, parent_setup_vec, extra_tgts,
+                          node_ptr ? node_ptr->cpus_per_task : 1);
     return script.str();
 }
 

@@ -41,7 +41,13 @@ RemoteChannel::RemoteChannel(std::string remote)
 }
 
 RemoteChannel::~RemoteChannel() {
-    stopped_ = true;
+    // Signal the heartbeat to wake from its sleep immediately so exit is fast
+    // (the join below would otherwise block until the next 10s tick).
+    {
+        std::lock_guard<std::mutex> lk(hb_mtx_);
+        stopped_ = true;
+    }
+    hb_cv_.notify_all();
     heartbeat_.join();
     std::lock_guard<std::mutex> lk(mtx_);
     if (connected_) disconnect();
@@ -57,6 +63,10 @@ void RemoteChannel::ensure_connected() {
         if (::system(check.c_str()) == 0) return;
         connected_ = false;
     }
+    // Remove any stale socket. After an unexpected master death the socket FILE
+    // lingers, and `ssh -fNM` refuses to start ("ControlSocket already exists,
+    // disabling multiplexing") — so without this the connection never recovers.
+    ::remove(ctrl_path_.c_str());
     // Start ControlMaster in background
     std::string cmd = "ssh -fNM"
         " -o ControlMaster=yes"
@@ -80,6 +90,36 @@ void RemoteChannel::ensure_connected() {
     connected_ = true;
 }
 
+void RemoteChannel::force_reconnect() {
+    // Caller holds mtx_. Called when a command failed with exit 255 (SSH
+    // transport error) despite the master appearing up — typically a "zombie"
+    // master (process alive, but its TCP connection is dead), which `-O check`
+    // alone cannot detect, or a network blip mid-batch.
+    //
+    // Debounce: if a peer thread already rebuilt the master within the last few
+    // seconds, don't tear it down again — just verify it and reuse. Without this,
+    // a dropped connection during a many-chunk run sends every poller into a
+    // rebuild at once, each ::remove()-ing the socket the previous one just
+    // created, so the connection thrashes and never stabilises (the symptom:
+    // jobs finish on the cluster but the run never reconnects to notice).
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_reconnect_ < std::chrono::seconds(3)) {
+        std::string check = "ssh -o ControlMaster=no"
+            " -o ControlPath=" + ctrl_path_ +
+            " -o ConnectTimeout=5 -O check " + remote_ + " 2>/dev/null";
+        if (::system(check.c_str()) == 0) { connected_ = true; return; }
+    }
+    // Explicitly evict the (possibly zombie) master and drop its socket, then
+    // rebuild from scratch — `-O check` would have kept the zombie alive.
+    std::string ex = "ssh -o ControlPath=" + ctrl_path_
+        + " -O exit " + remote_ + " 2>/dev/null";
+    ::system(ex.c_str());
+    ::remove(ctrl_path_.c_str());
+    connected_ = false;
+    ensure_connected();
+    last_reconnect_ = std::chrono::steady_clock::now();
+}
+
 void RemoteChannel::disconnect() {
     // Caller holds mtx_
     std::string cmd = "ssh -o ControlPath=" + ctrl_path_
@@ -90,7 +130,11 @@ void RemoteChannel::disconnect() {
 
 void RemoteChannel::heartbeat_loop() {
     while (!stopped_) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        {
+            std::unique_lock<std::mutex> hb_lk(hb_mtx_);
+            hb_cv_.wait_for(hb_lk, std::chrono::seconds(10),
+                            [this]{ return stopped_.load(); });
+        }
         if (stopped_) break;
         std::lock_guard<std::mutex> lk(mtx_);
         if (!connected_) continue;
@@ -102,18 +146,42 @@ void RemoteChannel::heartbeat_loop() {
 }
 
 proc::RunResult RemoteChannel::ssh(const std::string& remote_cmd, int timeout_sec) {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        ensure_connected();
-        last_use_ = std::chrono::steady_clock::now();
-    }
     std::string cmd = "ssh"
         " -o ControlMaster=no"
         " -o ControlPath=" + ctrl_path_ +
         " -o BatchMode=yes"
         " -o ConnectTimeout=10"
         " " + remote_ + " " + remote_cmd;
-    return proc::run(cmd, {}, {}, timeout_sec, "", nullptr, true);
+
+    // Up to 3 attempts. A dropped link surfaces two ways:
+    //   • exit 255 — SSH transport error (clean failure). Reconnect and retry.
+    //   • timeout  — the command HANGS, which through a multiplexed socket means
+    //     a "zombie" master (process alive, TCP dead). `-O check` can't see this,
+    //     so without forcing a teardown here every later poll hangs the same way
+    //     and the run never reconnects even though the cluster is reachable. We
+    //     rebuild the master so the NEXT call is healthy, but do NOT retry the
+    //     command in-place — it may have side effects (e.g. sbatch). Idempotent
+    //     pollers (squeue/sacct) retry on their own next tick against a fresh
+    //     connection.
+    proc::RunResult r;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (attempt > 0) force_reconnect();    // 255 last time → rebuild a dead/zombie master
+            else             ensure_connected();
+            last_use_ = std::chrono::steady_clock::now();
+        }
+        r = proc::run(cmd, {}, {}, timeout_sec, "", nullptr, true);
+        if (r.timed_out) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            force_reconnect();
+            break;
+        }
+        if (r.exit_code != 255) break;             // success or non-transport error
+        if (attempt + 1 < 3)
+            std::this_thread::sleep_for(std::chrono::seconds(2 * (attempt + 1)));
+    }
+    return r;
 }
 
 // ── Public helpers ────────────────────────────────────────────────────────
@@ -167,8 +235,32 @@ static std::string safe_filename(const std::string& name) {
     std::replace(f.begin(), f.end(), '/', '-');
     return f;
 }
-static std::string pending_path(const std::string& th_dir, const std::string& name) {
-    return pending_dir(th_dir) + "/" + safe_filename(name) + ".json";
+
+// Per-test sbatch script filename (under .trailhead/sbatch/). When a node is
+// known, fold it into the name so the same test submitted to two nodes at once
+// gets two scripts rather than clobbering one with the other's body — each node
+// has its own build dir and #SBATCH headers. Sub-registry test names keep their
+// '/' so the script still lands in the matching subdirectory.
+static std::string test_script_file(const std::string& test_name,
+                                    const std::string& node_name) {
+    std::string f = test_name;
+    if (!node_name.empty()) {
+        std::string nn = node_name;
+        std::replace(nn.begin(), nn.end(), '/', '_');
+        f += "__" + nn;
+    }
+    return f + ".sbatch";
+}
+// Per-(test,node) record path. The node is folded in so the same test in flight
+// on two nodes keeps two separate files.
+static std::string scoped_record(const std::string& name, const std::string& node) {
+    std::string f = safe_filename(name);
+    if (!node.empty()) f += "__" + safe_filename(node);
+    return f + ".json";
+}
+static std::string pending_path(const std::string& th_dir, const std::string& name,
+                                const std::string& node) {
+    return pending_dir(th_dir) + "/" + scoped_record(name, node);
 }
 
 void save_pending_job(const std::string& th_dir, const PendingJob& job) {
@@ -179,13 +271,15 @@ void save_pending_job(const std::string& th_dir, const PendingJob& job) {
     obj.push_back({"remote",       job.remote});
     obj.push_back({"remote_path",  job.remote_path});
     obj.push_back({"project_root", job.project_root});
+    obj.push_back({"node_name",    job.node_name});
     obj.push_back({"started_at",   JsonValue(job.started_at)});
-    fs::write_file_atomic(pending_path(th_dir, job.name),
+    fs::write_file_atomic(pending_path(th_dir, job.name, job.node_name),
                           json_emit(JsonValue(std::move(obj))));
 }
 
-void clear_pending_job(const std::string& th_dir, const std::string& name) {
-    ::remove(pending_path(th_dir, name).c_str());
+void clear_pending_job(const std::string& th_dir, const std::string& name,
+                       const std::string& node) {
+    ::remove(pending_path(th_dir, name, node).c_str());
 }
 
 std::vector<PendingJob> load_pending_jobs(const std::string& th_dir) {
@@ -201,6 +295,7 @@ std::vector<PendingJob> load_pending_jobs(const std::string& th_dir) {
             j.remote       = val.get_str("remote",       "");
             j.remote_path  = val.get_str("remote_path",  "");
             j.project_root = val.get_str("project_root", "");
+            j.node_name    = val.get_str("node_name",    "");
             j.started_at   = val.get_int("started_at",   0);
             if (!j.name.empty() && !j.job_id.empty() && !j.remote.empty())
                 out.push_back(std::move(j));
@@ -214,8 +309,9 @@ std::vector<PendingJob> load_pending_jobs(const std::string& th_dir) {
 static std::string queued_dir(const std::string& th_dir) {
     return th_dir + "/queued";
 }
-static std::string queued_path(const std::string& th_dir, const std::string& name) {
-    return queued_dir(th_dir) + "/" + safe_filename(name) + ".json";
+static std::string queued_path(const std::string& th_dir, const std::string& name,
+                               const std::string& node) {
+    return queued_dir(th_dir) + "/" + scoped_record(name, node);
 }
 
 void save_queued_submission(const std::string& th_dir, const QueuedSubmission& qs) {
@@ -223,12 +319,13 @@ void save_queued_submission(const std::string& th_dir, const QueuedSubmission& q
     JsonObject obj;
     obj.push_back({"name",      qs.name});
     obj.push_back({"node_name", qs.node_name});
-    fs::write_file_atomic(queued_path(th_dir, qs.name),
+    fs::write_file_atomic(queued_path(th_dir, qs.name, qs.node_name),
                           json_emit(JsonValue(std::move(obj))));
 }
 
-void clear_queued_submission(const std::string& th_dir, const std::string& name) {
-    ::remove(queued_path(th_dir, name).c_str());
+void clear_queued_submission(const std::string& th_dir, const std::string& name,
+                             const std::string& node) {
+    ::remove(queued_path(th_dir, name, node).c_str());
 }
 
 std::vector<QueuedSubmission> load_queued_submissions(const std::string& th_dir) {
@@ -252,45 +349,20 @@ std::vector<QueuedSubmission> load_queued_submissions(const std::string& th_dir)
 
 static proc::RunResult ssh_run(const std::string& remote,
                                 const std::string& remote_cmd,
-                                RemoteChannel* channel = nullptr)
+                                RemoteChannel* channel = nullptr,
+                                int timeout_sec = 120)
 {
-    if (channel) return channel->ssh(remote_cmd);
+    if (channel) return channel->ssh(remote_cmd, timeout_sec);
     std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
                     + remote + " " + remote_cmd;
-    return proc::run(cmd, {}, {}, 120, "", nullptr, true);
+    return proc::run(cmd, {}, {}, timeout_sec, "", nullptr, true);
 }
 
+// Persist a result. Delegates to result_store::save_result so the on-disk
+// schema (including the `node` field used for per-hardware filtering) stays in
+// one place — a second hand-rolled writer here previously dropped new fields.
 static void write_result_json(const std::string& results_dir, const TestResult& res) {
-    std::string path = results_dir + "/" + res.name + "_"
-                     + std::to_string(res.started_at) + ".json";
-    { auto sl = path.rfind('/'); if (sl != std::string::npos) fs::mkdir_p(path.substr(0, sl)); }
-    JsonObject obj;
-    obj.push_back({"version",    JsonValue((int64_t)1)});
-    obj.push_back({"name",       res.name});
-    obj.push_back({"host",       res.host});
-    obj.push_back({"run_by",     res.run_by});
-    obj.push_back({"started_at", JsonValue(res.started_at)});
-    obj.push_back({"ended_at",   JsonValue(res.ended_at)});
-    obj.push_back({"wall_ms",    JsonValue(res.wall_ms)});
-    obj.push_back({"exit_code",  JsonValue((int64_t)res.exit_code)});
-    obj.push_back({"passed",     JsonValue((int64_t)res.passed)});
-    obj.push_back({"failed",     JsonValue((int64_t)res.failed)});
-    JsonArray timings_arr;
-    for (const auto& te : res.timings) {
-        JsonObject te_obj;
-        te_obj.push_back({"label",      te.label});
-        te_obj.push_back({"elapsed_ms", JsonValue(te.elapsed_ms)});
-        timings_arr.push_back(JsonValue(std::move(te_obj)));
-    }
-    obj.push_back({"timings", JsonValue(std::move(timings_arr))});
-    JsonObject meta_obj;
-    for (const auto& [k, v] : res.metadata)
-        meta_obj.push_back({k, JsonValue(v)});
-    obj.push_back({"metadata", JsonValue(std::move(meta_obj))});
-    JsonArray out_arr;
-    for (const auto& ln : res.output_lines) out_arr.push_back(JsonValue(ln));
-    obj.push_back({"output", JsonValue(std::move(out_arr))});
-    fs::write_file_atomic(path, json_emit(JsonValue(std::move(obj))));
+    save_result(results_dir, res);
 }
 
 // ── Step: rsync project → remote ─────────────────────────────────────────
@@ -350,7 +422,8 @@ static std::string do_sbatch(const TestEntry& test,
                               const std::string& th_dir,
                               const std::function<void(const std::string&)>& log,
                               const std::function<void(const std::string&)>& set_status,
-                              RemoteChannel* channel = nullptr)
+                              RemoteChannel* channel = nullptr,
+                              const std::function<bool()>& is_aborted = {})
 {
     const NodeProfile* node = nullptr;
     if (!node_name.empty()) {
@@ -360,7 +433,7 @@ static std::string do_sbatch(const TestEntry& test,
 
     std::string job_name = reg.sbatch_defaults.job_name_prefix + "-" + test.name;
     std::string flags    = node ? node_sbatch_flags(*node, reg.sbatch_defaults, job_name) : "";
-    std::string script   = ".trailhead/sbatch/" + test.name + ".sbatch";
+    std::string script   = ".trailhead/sbatch/" + test_script_file(test.name, node_name);
 
     set_status("SUBMIT");
     log(ansi::BOLD + std::string("sbatch") + ansi::RESET + " " + script
@@ -376,9 +449,16 @@ static std::string do_sbatch(const TestEntry& test,
     static const int kQosBaseBackoffSec = 30;
     int qos_retries = 0;
     for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-        if (attempt > 0)
-            std::this_thread::sleep_for(std::chrono::seconds(
-                r.exit_code == 255 ? 3 * attempt : kQosBaseBackoffSec * attempt));
+        if (is_aborted && is_aborted()) return "";
+        if (attempt > 0) {
+            // Interruptible backoff: poll the abort flag every 500ms so shutdown
+            // doesn't wait out a full QOS/SSH retry delay.
+            int wait_s = (r.exit_code == 255 ? 3 * attempt : kQosBaseBackoffSec * attempt);
+            for (int slept = 0; slept < wait_s * 2; ++slept) {
+                if (is_aborted && is_aborted()) return "";
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
         r = ssh_run(dest.remote, sbatch_cmd, channel);
         if (r.exit_code == 0) break;
         std::string combined = r.stdout_str + r.stderr_str;
@@ -414,6 +494,7 @@ static std::string do_sbatch(const TestEntry& test,
             res.ended_at   = now;
             res.run_by     = "sbatch-failed";
             res.host       = dest.remote;
+            res.node       = node_name;
             res.failed     = 1;
             std::string output = "sbatch failed (exit=" + std::to_string(r.exit_code) + ")\n";
             if (!r.stdout_str.empty()) output += r.stdout_str;
@@ -458,6 +539,7 @@ static bool poll_and_finalize(
     const std::string& job_id,
     int64_t t_submit,
     const TestEntry& test,
+    const std::string& node_name,
     const Registry& reg,
     const std::string& th_dir,
     const RemoteDest& dest,
@@ -563,7 +645,7 @@ static bool poll_and_finalize(
 
     // If cancelled, skip result collection entirely.
     if (cancelled) {
-        clear_pending_job(th_dir, test.name);
+        clear_pending_job(th_dir, test.name, node_name);
         set_status("");
         return false;
     }
@@ -593,6 +675,7 @@ static bool poll_and_finalize(
     res.wall_ms    = t_end - t_submit;
     res.run_by     = "sbatch-" + job_id;
     res.host       = dest.remote;
+    res.node       = node_name;
 
     std::string remaining;
     parse_trailhead_output(slurm_stdout, res, &remaining);
@@ -634,7 +717,12 @@ static bool poll_and_finalize(
             full_out += "\n--- stderr ---\n" + slurm_stderr;
         save_result_output(results_dir, res, full_out);
     }
-    clear_pending_job(th_dir, test.name);
+    clear_pending_job(th_dir, test.name, node_name);
+
+    // The slurm stdout/err are captured into the result above — remove them from
+    // the remote so its .trailhead doesn't accumulate slurm-*.out/.err per run.
+    ssh_run(dest.remote, "\"rm -f " + remote_out + " " + remote_err + " 2>/dev/null\"",
+            channel, 20);
 
     std::string badge = res.metadata.count("_build_fail")
         ? ansi::color(ansi::MAGENTA, " BFAIL")
@@ -669,7 +757,7 @@ int query_slurm_job_limit(const std::string& remote,
     for (const auto& part : partitions) {
         if (part.empty()) continue;
         std::string cmd = "\"scontrol show partition " + part + " --oneliner 2>/dev/null\"";
-        std::string out = ssh_run(remote, cmd).stdout_str;
+        std::string out = ssh_run(remote, cmd, nullptr, 20).stdout_str;
         // Parse "QoS=<name>" from the one-liner output
         auto pos = out.find("QoS=");
         if (pos == std::string::npos) continue;
@@ -692,7 +780,7 @@ int query_slurm_job_limit(const std::string& remote,
     for (const auto& qos : qos_names) {
         std::string cmd = "\"sacctmgr show qos " + qos
             + " format=MaxSubmitJobsPU --parsable2 --noheader 2>/dev/null\"";
-        std::string out = ssh_run(remote, cmd).stdout_str;
+        std::string out = ssh_run(remote, cmd, nullptr, 20).stdout_str;
         // Strip trailing whitespace/newlines
         while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
             out.pop_back();
@@ -709,11 +797,33 @@ int query_slurm_job_limit(const std::string& remote,
 
 // ── SLURM user job count ──────────────────────────────────────────────────
 
-int query_slurm_user_job_count(const std::string& remote) {
+int query_slurm_user_job_count(const std::string& remote,
+                               const std::string& partition,
+                               const std::string& gpu_type) {
     // squeue -u $USER counts all jobs (pending, running, completing) for the
     // current user.  We use $USER on the remote side so it resolves to the
-    // SSH user's account.
-    auto r = ssh_run(remote, "\"squeue -u \\$USER -h -t PD,R,CG 2>/dev/null | wc -l\"");
+    // SSH user's account.  When a partition is given, restrict the count to it
+    // (-p).  When a gpu_type is given, further restrict to jobs whose requested
+    // gres names that GPU type — so two GPU types sharing one partition get
+    // independent budgets.
+    std::string part_flag = partition.empty() ? "" : (" -p " + partition);
+    std::string cmd;
+    if (gpu_type.empty()) {
+        cmd = "\"squeue -u \\$USER" + part_flag
+            + " -h -t PD,R,CG 2>/dev/null | wc -l\"";
+    } else {
+        // %b is the per-node gres/TRES field, e.g. "gpu:h200:1" (older SLURM)
+        // or "gres/gpu:h200=1" (TRES form). Match "gpu:<type>" up to its
+        // count separator so "h200" doesn't match "h2000". grep -c exits 1 on
+        // zero matches, so `|| true` keeps the pipeline's exit code at 0 while
+        // preserving the printed "0".
+        cmd = "\"squeue -u \\$USER" + part_flag
+            + " -h -o '%b' -t PD,R,CG 2>/dev/null"
+            + " | grep -Ec 'gpu:" + gpu_type + "[:=]' || true\"";
+    }
+    // Short timeout: this runs in the slot-acquire loop on the (joined) worker
+    // thread, so a slow/hung squeue must not stall shutdown for the full 120s.
+    auto r = ssh_run(remote, cmd, nullptr, 20);
     if (r.exit_code != 0 || r.timed_out) return -1;
     std::string out = r.stdout_str;
     while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
@@ -732,18 +842,25 @@ BatchSubmitter::BatchSubmitter(Registry reg, std::string th_dir,
     , project_root_(std::move(project_root))
     , dest_(std::move(dest))
     , job_log_(std::move(job_log))
-    , slots_(std::make_shared<SlotTracker>(max_concurrent, dest_.remote))
+    , default_max_(max_concurrent)
     , cancel_set_(std::make_shared<CancelSet>())
     , channel_(std::make_shared<RemoteChannel>(dest_.remote))
     , worker_([this] { worker_loop(); })
 {}
 
 BatchSubmitter::~BatchSubmitter() {
+    aborting_ = true;   // bail out of do_sbatch retry backoff
     {
         std::lock_guard<std::mutex> lk(mtx_);
         stopped_ = true;
     }
     cv_.notify_all();
+    // Abort any in-flight slot waits so the worker stops polling squeue and
+    // exits promptly instead of blocking shutdown until a SLURM slot frees.
+    {
+        std::lock_guard<std::mutex> lk(slots_mtx_);
+        for (auto& [_, st] : slots_by_scope_) st->abort();
+    }
     if (worker_.joinable()) worker_.join();
 }
 
@@ -752,7 +869,7 @@ void BatchSubmitter::enqueue(const TestEntry& test,
                               std::function<void(const std::string&)> log_fn,
                               std::function<void(const std::string&)> status_fn)
 {
-    cancel_set_->erase(test.name);
+    cancel_set_->erase(test.name, node_name);
     job_log_->active++;
     if (status_fn) status_fn("QUEUED");
     save_queued_submission(th_dir_, {test.name, node_name});
@@ -763,12 +880,13 @@ void BatchSubmitter::enqueue(const TestEntry& test,
     cv_.notify_one();
 }
 
-void BatchSubmitter::cancel(const std::string& name) {
+void BatchSubmitter::cancel(const std::string& name, const std::string& node) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        // Remove from in-memory queue if still waiting
+        // Remove from in-memory queue if still waiting (match the exact (test,node)
+        // submission so a sibling run on another node keeps going).
         for (auto it = queue_.begin(); it != queue_.end(); ++it) {
-            if (it->test.name == name) {
+            if (it->test.name == name && it->node_name == node) {
                 if (it->status_fn) it->status_fn("");
                 job_log_->active--;
                 queue_.erase(it);
@@ -777,9 +895,63 @@ void BatchSubmitter::cancel(const std::string& name) {
         }
     }
     // Already picked up by worker or poll thread — mark for skip everywhere
-    cancel_set_->insert(name);
-    // Wake slot acquire in case it's blocking for this job
-    slots_->release();
+    cancel_set_->insert(name, node);
+    // Wake any blocking slot acquire (across all scopes) so it re-checks
+    // cancellation. We don't know which scope the cancelled job belongs to.
+    std::lock_guard<std::mutex> lk(slots_mtx_);
+    for (auto& [_, st] : slots_by_scope_) st->release();
+}
+
+// Resolve (creating on first use) the SlotTracker for a node profile's scope.
+// A scope is one "machine" = (partition, GPU type): partition is the unit
+// SLURM's MaxSubmitJobsPU applies to, and the GPU type distinguishes two
+// profiles that share a partition but request different gres. When a profile
+// has neither, we fall back to its name. The per-scope job limit is resolved
+// here — synchronously, on this worker thread, before the scope's first job is
+// scheduled — so jobs are never throttled by a stale guess. The result is
+// cached so the SLURM query runs once per GPU type.
+std::shared_ptr<SlotTracker> BatchSubmitter::slots_for(const std::string& node_name) {
+    std::string partition, gpu_type, key;
+    auto it = reg_.nodes.find(node_name);
+    if (it != reg_.nodes.end()) {
+        const NodeProfile& np = it->second;
+        partition = np.partition;
+        gpu_type  = np.gpu_type;
+    }
+    if (!partition.empty() || !gpu_type.empty())
+        key = "p:" + partition + "|g:" + gpu_type;
+    else
+        key = "n:" + node_name;
+
+    {
+        std::lock_guard<std::mutex> lk(slots_mtx_);
+        auto found = slots_by_scope_.find(key);
+        if (found != slots_by_scope_.end()) return found->second;
+    }
+
+    // Query the real per-partition limit WITHOUT holding slots_mtx_ — the SSH
+    // round-trip must not block cancel()/abort() on the UI/shutdown path.
+    // fallback=-1 lets us distinguish a resolved limit from the default.
+    int  max_jobs = default_max_.load();
+    bool resolved = false;
+    if (!partition.empty()) {
+        int q = query_slurm_job_limit(dest_.remote, {partition}, -1);
+        if (q > 0) { max_jobs = q; resolved = true; }
+    }
+
+    std::lock_guard<std::mutex> lk(slots_mtx_);
+    auto found = slots_by_scope_.find(key);   // re-check after the unlocked query
+    if (found != slots_by_scope_.end()) return found->second;
+    auto st = std::make_shared<SlotTracker>(max_jobs, dest_.remote, partition, gpu_type);
+    slots_by_scope_[key] = st;
+    if (job_log_) {
+        std::string scope = !gpu_type.empty() ? gpu_type
+                          : (!partition.empty() ? partition : node_name);
+        job_log_->push("[trailhead] " + scope + ": max concurrent jobs = "
+                       + std::to_string(max_jobs)
+                       + (resolved ? "" : " (default)"));
+    }
+    return st;
 }
 
 void BatchSubmitter::worker_loop() {
@@ -822,7 +994,7 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
     // Helper: drop cancelled jobs from the batch, cleaning up status/active count.
     auto drop_cancelled = [&]() {
         batch.erase(std::remove_if(batch.begin(), batch.end(), [&](const Submission& s) {
-            if (cancel_set_->erase(s.test.name)) {
+            if (cancel_set_->erase(s.test.name, s.node_name)) {
                 if (s.status_fn) s.status_fn("");
                 job_log_->active--;
                 return true;
@@ -833,7 +1005,7 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
 
     // Clear queued submission files — from here the job is in-flight
     for (auto& s : batch)
-        clear_queued_submission(th_dir_, s.test.name);
+        clear_queued_submission(th_dir_, s.test.name, s.node_name);
 
     // ── Cancel check: after dequeue ──────────────────────────────────────
     drop_cancelled();
@@ -853,7 +1025,7 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
             if (s.node_name.empty()) continue;
             std::string content = generate_test_script(s.test, s.node_name, reg_, script_opts);
             if (!content.empty()) {
-                std::string path = th_dir_ + "/sbatch/" + s.test.name + ".sbatch";
+                std::string path = th_dir_ + "/sbatch/" + test_script_file(s.test.name, s.node_name);
                 auto slash = path.rfind('/');
                 if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
                 fs::write_file_atomic(path, content);
@@ -881,8 +1053,8 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         // They share this rsync call — no second upload needed.
         if (!queue_.empty()) {
             for (auto& s : queue_) {
-                cancel_set_->erase(s.test.name);
-                clear_queued_submission(th_dir_, s.test.name);
+                cancel_set_->erase(s.test.name, s.node_name);
+                clear_queued_submission(th_dir_, s.test.name, s.node_name);
                 batch.push_back(std::move(s));
             }
             queue_.clear();
@@ -899,7 +1071,7 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
             if (s.node_name.empty()) continue;
             std::string content = generate_test_script(s.test, s.node_name, reg_, script_opts);
             if (!content.empty()) {
-                std::string path = th_dir_ + "/sbatch/" + s.test.name + ".sbatch";
+                std::string path = th_dir_ + "/sbatch/" + test_script_file(s.test.name, s.node_name);
                 auto slash = path.rfind('/');
                 if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
                 fs::write_file_atomic(path, content);
@@ -936,28 +1108,31 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
                 continue;
             }
         }
-        if (cancel_set_->erase(s.test.name)) {
+        if (cancel_set_->erase(s.test.name, s.node_name)) {
             if (s.status_fn) s.status_fn("");
             job_log_->active--;
             continue;
         }
 
-        // Wait for a free slot — interruptible by cancel
+        // Wait for a free slot — interruptible by cancel. The slot budget is
+        // per scope (partition / GPU type), so jobs queued for other machines
+        // don't count against this one.
+        auto slots = slots_for(s.node_name);
         if (s.status_fn) s.status_fn("QUEUED");
-        std::string sname = s.test.name;
-        bool got_slot = slots_->acquire([&]{ return cancel_set_->contains(sname); });
+        std::string sname = s.test.name, snode = s.node_name;
+        bool got_slot = slots->acquire([&]{ return cancel_set_->contains(sname, snode); });
 
         if (!got_slot) {
             // Cancelled while waiting for a slot
-            cancel_set_->erase(s.test.name);
+            cancel_set_->erase(s.test.name, s.node_name);
             if (s.status_fn) s.status_fn("");
             job_log_->active--;
             continue;
         }
 
         // ── Cancel check: after slot acquire ─────────────────────────────
-        if (cancel_set_->erase(s.test.name)) {
-            slots_->release();
+        if (cancel_set_->erase(s.test.name, s.node_name)) {
+            slots->release();
             if (s.status_fn) s.status_fn("");
             job_log_->active--;
             continue;
@@ -969,21 +1144,22 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         std::string job_id = do_sbatch(s.test, s.node_name, reg_, dest_, project_root_, th_dir_,
             s.log_fn ? s.log_fn : [](const std::string&){},
             s.status_fn ? s.status_fn : [](const std::string&){},
-            channel_.get());
+            channel_.get(),
+            [this]{ return aborting_.load(); });
 
         if (job_id.empty()) {
-            slots_->release();
+            slots->release();
             if (s.status_fn) s.status_fn("");
             job_log_->active--;
             continue;
         }
 
         // ── Cancel check: after sbatch ───────────────────────────────────
-        if (cancel_set_->erase(s.test.name)) {
+        if (cancel_set_->erase(s.test.name, s.node_name)) {
             std::string scancel_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
                 + dest_.remote + " scancel " + job_id;
             std::thread([scancel_cmd]{ proc::run(scancel_cmd, {}, {}, 15, "", nullptr, true); }).detach();
-            slots_->release();
+            slots->release();
             if (s.status_fn) s.status_fn("");
             job_log_->active--;
             continue;
@@ -996,6 +1172,7 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         pj.remote       = dest_.remote;
         pj.remote_path  = dest_.remote_path;
         pj.project_root = project_root_;
+        pj.node_name    = s.node_name;
         pj.started_at   = t_submit;
         save_pending_job(th_dir_, pj);
 
@@ -1006,6 +1183,7 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         // Pass cancel_set and the shared channel so the poll loop can detect
         // cancellation and reuse the persistent SSH connection.
         auto test         = s.test;
+        auto node_name    = s.node_name;
         auto log_fn       = s.log_fn;
         auto status_fn    = s.status_fn;
         auto reg          = reg_;
@@ -1013,14 +1191,13 @@ void BatchSubmitter::process_batch(std::vector<Submission> batch) {
         auto dest         = dest_;
         auto project_root = project_root_;
         auto job_log      = job_log_;
-        auto slots        = slots_;
         auto cset         = cancel_set_;
         auto ch           = channel_;
 
         std::thread([=]() mutable {
-            poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn,
+            poll_and_finalize(job_id, t_submit, test, node_name, reg, th_dir, dest, project_root, log_fn, status_fn,
                               [slots]{ slots->release(); },
-                              [cset, name = test.name]{ return cset->contains(name); },
+                              [cset, name = test.name, node = node_name]{ return cset->contains(name, node); },
                               ch.get());
             job_log->active--;
         }).detach();
@@ -1067,8 +1244,8 @@ bool remote_submit_and_wait(
     set_status("PENDING");
     log("  job " + job_id + " submitted");
 
-    return poll_and_finalize(job_id, t_submit, test, reg, th_dir, dest, project_root, log_fn, status_fn,
-                             {}, {}, ch);
+    return poll_and_finalize(job_id, t_submit, test, /*node_name=*/"", reg, th_dir, dest, project_root,
+                             log_fn, status_fn, {}, {}, ch);
 }
 
 // ── Resume a previously submitted job ────────────────────────────────────
@@ -1086,8 +1263,8 @@ bool resume_job(
     if (log_fn) log_fn("  resuming job " + pending.job_id);
     if (status_fn) status_fn("PENDING");
     return poll_and_finalize(pending.job_id, pending.started_at,
-                             test, reg, th_dir, dest, pending.project_root, log_fn, status_fn,
-                             {}, {}, channel.get());
+                             test, pending.node_name, reg, th_dir, dest, pending.project_root,
+                             log_fn, status_fn, {}, {}, channel.get());
 }
 
 } // namespace trailhead

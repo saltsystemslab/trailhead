@@ -60,6 +60,33 @@ struct NodeProfile {
     std::unordered_map<std::string,std::string> extra;
 };
 
+// ── DataSet ──────────────────────────────────────────────────────────────
+// A pre-test resource (e.g. a downloaded matrix). Each test that needs it
+// references the dataset by name. Trailhead lazily fetches the dataset on
+// first use, refcounts how many of the *currently selected* tests still
+// depend on it, and removes `path` (and any `cache_paths`) when the last
+// consumer finishes — so total disk usage is bounded by the in-flight set,
+// not the full corpus.
+struct DataSet {
+    std::string              name;
+    std::string              fetch_cmd;        // shell snippet; assumed idempotent
+    std::string              path;             // primary path to remove on cleanup
+    std::vector<std::string> cache_paths;      // additional paths to wipe (caches, tmp files)
+    // DAG edges:
+    //   depends_on        — other datasets that must be ensured before this
+    //                        one's fetch runs; cleanup cascades through them.
+    //   requires_targets  — cmake targets that must be built before fetch_cmd
+    //                        is invoked (e.g. a converter binary). Target names
+    //                        are not namespaced — for sub-registry datasets they
+    //                        live in the sub-registry's own build context (see
+    //                        sub_dir).
+    std::vector<std::string> depends_on;
+    std::vector<std::string> requires_targets;
+    // Set at load time for datasets merged from sub-registries (mirrors
+    // BuildConfig.sub_dir / TestEntry.sub_dir). Not serialized.
+    std::string              sub_dir;
+};
+
 // ── Global sbatch defaults ────────────────────────────────────────────────
 struct SbatchDefaults {
     std::string output_pattern  = ".trailhead/slurm-%j.out";
@@ -90,6 +117,9 @@ struct TestEntry {
     // When true, this test uses TH_ACQUIRE_NODE_LOCK internally and is safe
     // to run concurrently with other lock-aware tests on the same node.
     bool lock = false;
+    // Names of DataSet entries this test consumes. Each is fetched on first
+    // use and removed once every selected test that lists it has finished.
+    std::vector<std::string> datasets;
     // Set at load time for tests merged from sub-registries. Not serialized.
     // Relative path from project root to the sub-registry root (e.g. "andes_benchmarks").
     std::string sub_dir;
@@ -100,6 +130,7 @@ struct Registry {
     int version = 1;
     std::unordered_map<std::string, BuildConfig>  builds;
     std::unordered_map<std::string, NodeProfile>  nodes;
+    std::unordered_map<std::string, DataSet>      datasets;
     SbatchDefaults sbatch_defaults;
     std::vector<TestEntry> tests;
     // One-time project setup commands: run before cmake configure in every
@@ -227,6 +258,7 @@ inline TestEntry test_from_json(const JsonValue& v) {
     t.target       = v.get_str("target");
     t.requires_hw  = v.get_str("requires");
     t.lock         = v.get_bool("lock", false);
+    t.datasets     = v.get_str_array("datasets");
     return t;
 }
 
@@ -245,6 +277,38 @@ inline JsonValue test_to_json(const TestEntry& t) {
     if (!t.requires_hw.empty() &&
         t.requires_hw != "any")             obj.push_back({"requires", t.requires_hw});
     if (t.lock)                             obj.push_back({"lock",     JsonValue(true)});
+    if (!t.datasets.empty()) {
+        JsonArray ds;
+        for (const auto& d : t.datasets) ds.push_back(JsonValue(d));
+        obj.push_back({"datasets", JsonValue(std::move(ds))});
+    }
+    return JsonValue(std::move(obj));
+}
+
+inline DataSet dataset_from_json(const std::string& name, const JsonValue& v) {
+    DataSet d;
+    d.name             = name;
+    d.fetch_cmd        = v.get_str("fetch_cmd");
+    d.path             = v.get_str("path");
+    d.cache_paths      = v.get_str_array("cache_paths");
+    d.depends_on       = v.get_str_array("depends_on");
+    d.requires_targets = v.get_str_array("requires_targets");
+    return d;
+}
+
+inline JsonValue dataset_to_json(const DataSet& d) {
+    JsonObject obj;
+    if (!d.fetch_cmd.empty()) obj.push_back({"fetch_cmd", d.fetch_cmd});
+    if (!d.path.empty())      obj.push_back({"path",      d.path});
+    auto add_arr = [&](const std::string& k, const std::vector<std::string>& v) {
+        if (v.empty()) return;
+        JsonArray a;
+        for (const auto& s : v) a.push_back(JsonValue(s));
+        obj.push_back({k, JsonValue(std::move(a))});
+    };
+    add_arr("cache_paths",      d.cache_paths);
+    add_arr("depends_on",       d.depends_on);
+    add_arr("requires_targets", d.requires_targets);
     return JsonValue(std::move(obj));
 }
 

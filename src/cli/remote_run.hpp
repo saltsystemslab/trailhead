@@ -9,8 +9,12 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <deque>
+#include <map>
+#include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_set>
 #include <chrono>
@@ -38,6 +42,9 @@ public:
 
 private:
     void ensure_connected();
+    // Tear down a dead/zombie master and rebuild it, debounced so concurrent
+    // callers don't clobber each other's freshly-established socket.
+    void force_reconnect();
     void disconnect();
     void heartbeat_loop();
 
@@ -46,7 +53,10 @@ private:
     std::mutex   mtx_;
     bool         connected_ = false;
     std::chrono::steady_clock::time_point last_use_;
+    std::chrono::steady_clock::time_point last_reconnect_{};
     std::atomic<bool> stopped_{false};
+    std::mutex              hb_mtx_;   // guards the heartbeat sleep
+    std::condition_variable hb_cv_;    // signalled on stop to end the sleep early
     std::thread  heartbeat_;
 };
 
@@ -82,11 +92,15 @@ struct PendingJob {
     std::string remote;
     std::string remote_path;
     std::string project_root;
+    std::string node_name;   // node profile the job was submitted to
     int64_t     started_at = 0;
 };
 
 void save_pending_job(const std::string& th_dir, const PendingJob& job);
-void clear_pending_job(const std::string& th_dir, const std::string& name);
+// Clears the pending record for a specific (test, node) — the same test can be
+// in flight on two nodes at once, each with its own file.
+void clear_pending_job(const std::string& th_dir, const std::string& name,
+                       const std::string& node);
 std::vector<PendingJob> load_pending_jobs(const std::string& th_dir);
 
 // ── Queued submission persistence ─────────────────────────────────────────
@@ -100,7 +114,9 @@ struct QueuedSubmission {
 };
 
 void save_queued_submission(const std::string& th_dir, const QueuedSubmission& qs);
-void clear_queued_submission(const std::string& th_dir, const std::string& name);
+// Clears the queued record for a specific (test, node).
+void clear_queued_submission(const std::string& th_dir, const std::string& name,
+                             const std::string& node);
 std::vector<QueuedSubmission> load_queued_submissions(const std::string& th_dir);
 
 // ── BatchSubmitter ────────────────────────────────────────────────────────
@@ -112,25 +128,34 @@ std::vector<QueuedSubmission> load_queued_submissions(const std::string& th_dir)
 // Jobs beyond the limit sit in "QUEUED" status until a slot opens.
 
 // Query the number of jobs the current user has in SLURM (pending, running,
-// completing).  Returns -1 on failure.
-int query_slurm_user_job_count(const std::string& remote);
+// completing).  Returns -1 on failure.  When `partition` is non-empty the
+// count is restricted to that partition; when `gpu_type` is non-empty it is
+// further restricted to jobs whose requested gres includes that GPU type.
+// Together they scope the count to one "machine", so jobs on other partitions
+// or GPU types (even within the same partition) don't count against this
+// scope's slot budget.
+int query_slurm_user_job_count(const std::string& remote,
+                               const std::string& partition = "",
+                               const std::string& gpu_type  = "");
 
-// Thread-safe set of cancelled test names.  Shared (via shared_ptr) between
-// BatchSubmitter and detached poll threads so cancellation reaches every stage.
+// Thread-safe set of cancelled (test, node) submissions. Keyed by node too so
+// cancelling a test on one processor doesn't cancel the same test running on
+// another. Shared (via shared_ptr) between BatchSubmitter and detached poll
+// threads so cancellation reaches every stage.
 struct CancelSet {
     std::mutex              mtx;
     std::condition_variable cv;   // notified on every insert
-    std::unordered_set<std::string> names;
+    std::set<std::pair<std::string, std::string>> keys;
 
-    void insert(const std::string& n) {
-        { std::lock_guard<std::mutex> lk(mtx); names.insert(n); }
+    void insert(const std::string& n, const std::string& node) {
+        { std::lock_guard<std::mutex> lk(mtx); keys.insert({n, node}); }
         cv.notify_all();
     }
-    bool erase(const std::string& n) {
-        std::lock_guard<std::mutex> lk(mtx); return names.erase(n) > 0;
+    bool erase(const std::string& n, const std::string& node) {
+        std::lock_guard<std::mutex> lk(mtx); return keys.erase({n, node}) > 0;
     }
-    bool contains(const std::string& n) {
-        std::lock_guard<std::mutex> lk(mtx); return names.count(n) > 0;
+    bool contains(const std::string& n, const std::string& node) {
+        std::lock_guard<std::mutex> lk(mtx); return keys.count({n, node}) > 0;
     }
 };
 
@@ -139,21 +164,33 @@ struct CancelSet {
 //
 // Instead of a purely internal counter, acquire() queries the real SLURM
 // queue so that interactive jobs and jobs from other tools are counted.
+//
+// One SlotTracker exists per scope (SLURM partition / GPU type). Each tracker
+// only counts jobs in its own partition, so a backlog of pending jobs on one
+// machine never throttles submissions to a different machine.
 struct SlotTracker {
     std::mutex              mtx;
     std::condition_variable cv;
     int                     max;
-    std::string             remote;   // ssh target for squeue queries
+    std::string             remote;     // ssh target for squeue queries
+    std::string             partition;  // squeue scope; empty = all partitions
+    std::string             gpu_type;   // gres scope; empty = any gres
+    std::atomic<bool>       aborted{false};  // set on shutdown to release waiters
 
-    SlotTracker(int m, std::string r) : max(m), remote(std::move(r)) {}
+    SlotTracker(int m, std::string r, std::string part = "", std::string gpu = "")
+        : max(m), remote(std::move(r)), partition(std::move(part)),
+          gpu_type(std::move(gpu)) {}
 
     // Block until the real SLURM queue has room, then return true.
-    // Returns false immediately if is_cancelled() fires.
+    // Returns false immediately if is_cancelled() fires or the tracker is
+    // aborted (e.g. the TUI is closing) so shutdown doesn't wait for a SLURM
+    // slot to free.
     bool acquire(std::function<bool()> is_cancelled = {}) {
         std::unique_lock<std::mutex> lk(mtx);
         while (true) {
+            if (aborted.load()) return false;
             if (is_cancelled && is_cancelled()) return false;
-            int count = query_slurm_user_job_count(remote);
+            int count = query_slurm_user_job_count(remote, partition, gpu_type);
             if (count >= 0 && count < max) return true;
             cv.wait_for(lk, std::chrono::seconds(5));
         }
@@ -163,6 +200,12 @@ struct SlotTracker {
     void release() {
         cv.notify_all();
     }
+
+    // Permanently release all waiters (returns false from acquire).
+    void abort() {
+        aborted.store(true);
+        cv.notify_all();
+    }
 };
 
 class BatchSubmitter {
@@ -170,7 +213,7 @@ public:
     BatchSubmitter(Registry reg, std::string th_dir,
                    std::string project_root, RemoteDest dest,
                    std::shared_ptr<JobLog> job_log,
-                   int max_concurrent = 5);
+                   int max_concurrent = 4);
     ~BatchSubmitter();
 
     // Expose the channel so callers can issue raw SSH commands through the
@@ -183,8 +226,9 @@ public:
                  std::function<void(const std::string&)> log_fn,
                  std::function<void(const std::string&)> status_fn);
 
-    // Thread-safe. Marks a test name as cancelled so the worker skips it.
-    void cancel(const std::string& name);
+    // Thread-safe. Marks a (test, node) submission as cancelled so the worker
+    // skips it — leaving the same test running on other nodes untouched.
+    void cancel(const std::string& name, const std::string& node);
 
 private:
     struct Submission {
@@ -197,14 +241,26 @@ private:
     void worker_loop();
     void process_batch(std::vector<Submission> batch);
 
+    // Resolve (creating on first use) the SlotTracker for a node profile's
+    // scope. Jobs in different scopes (partitions / GPU types) are throttled
+    // independently, so a queue on one machine doesn't block another.
+    std::shared_ptr<SlotTracker> slots_for(const std::string& node_name);
+
     Registry                       reg_;
     std::string                    th_dir_;
     std::string                    project_root_;
     RemoteDest                     dest_;
     std::shared_ptr<JobLog>        job_log_;
-    std::shared_ptr<SlotTracker>   slots_;
+    std::atomic<int>               default_max_;   // fallback per-scope limit
+    std::atomic<bool>              aborting_{false}; // set on shutdown to bail fast
     std::shared_ptr<CancelSet>     cancel_set_;
     std::shared_ptr<RemoteChannel> channel_;
+
+    // Per-scope slot trackers, keyed by partition/GPU-type. Guarded by
+    // slots_mtx_ since cancel() (UI thread) and slots_for() (worker thread)
+    // both touch it.
+    std::mutex                                                    slots_mtx_;
+    std::map<std::string, std::shared_ptr<SlotTracker>>           slots_by_scope_;
 
     std::mutex                     mtx_;
     std::condition_variable        cv_;
@@ -219,7 +275,7 @@ private:
 // if the cluster has no configured limit / the query fails.
 int query_slurm_job_limit(const std::string& remote,
                            const std::vector<std::string>& partitions,
-                           int fallback = 5);
+                           int fallback = 4);
 
 // ── Job submission / resume ───────────────────────────────────────────────
 

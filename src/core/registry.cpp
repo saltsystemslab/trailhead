@@ -41,6 +41,14 @@ Registry registry_from_json(const JsonValue& root) {
     // Setup commands
     reg.setup = root.get_str_array("setup");
 
+    // Datasets map
+    const JsonValue* ds_val = root.get("datasets");
+    if (ds_val && ds_val->is_object()) {
+        for (const auto& [name, dv] : ds_val->as_object()) {
+            reg.datasets[name] = dataset_from_json(name, dv);
+        }
+    }
+
     // Sub-registry paths
     reg.sub_registries = root.get_str_array("sub_registries");
 
@@ -81,6 +89,14 @@ JsonValue registry_to_json(const Registry& reg) {
     JsonArray setup_arr;
     for (const auto& s : reg.setup) setup_arr.push_back(JsonValue(s));
     root.push_back({"setup", JsonValue(std::move(setup_arr))});
+
+    // Datasets — skip entries that came from sub-registries (prefixed name
+    // contains '/'), matching the build serialisation behaviour above.
+    JsonObject ds_obj;
+    for (const auto& [name, ds] : reg.datasets)
+        if (name.find('/') == std::string::npos)
+            ds_obj.push_back({name, dataset_to_json(ds)});
+    root.push_back({"datasets", JsonValue(std::move(ds_obj))});
 
     // Sub-registry paths
     JsonArray sub_arr;
@@ -135,6 +151,29 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
             }
         }
 
+        // Merge datasets — namespace by sub_name to avoid collisions, qualify
+        // paths so they resolve from the parent project root, rewrite
+        // intra-sub-registry depends_on references to the new prefixed keys,
+        // and tag with sub_dir so the runtime can dispatch the fetch from the
+        // sub-registry's directory and build requires_targets in the right
+        // build context.
+        for (const auto& [dname, ds] : sub.datasets) {
+            std::string key = sub_name + "/" + dname;
+            if (reg.datasets.count(key)) continue;
+            DataSet merged = ds;
+            merged.name    = key;
+            merged.sub_dir = sub_rel;
+            if (!merged.path.empty())
+                merged.path = sub_rel + "/" + merged.path;
+            for (auto& cp : merged.cache_paths)
+                if (!cp.empty()) cp = sub_rel + "/" + cp;
+            for (auto& dep : merged.depends_on)
+                dep = sub_name + "/" + dep;
+            // requires_targets stay as raw cmake target names — they live in
+            // the sub-registry's build context (sub_dir + the build's dir).
+            reg.datasets[key] = std::move(merged);
+        }
+
         // Merge tests
         for (auto t : sub.tests) {
             t.name     = sub_name + "/" + t.name;
@@ -143,6 +182,9 @@ void merge_sub_registries(Registry& reg, const std::string& project_root) {
             // Remap non-trivial workdirs to be relative to project root
             if (!t.workdir.empty() && t.workdir != ".")
                 t.workdir = sub_rel + "/" + t.workdir;
+            // Prefix dataset references so they match the merged dataset keys.
+            for (auto& d : t.datasets)
+                d = sub_name + "/" + d;
             reg.tests.push_back(std::move(t));
         }
 

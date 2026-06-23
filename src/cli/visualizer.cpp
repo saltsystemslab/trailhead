@@ -58,24 +58,31 @@ static void restore_terminal() {
 // Uses a static leftover buffer so that bytes unconsumed from one read are not
 // discarded — preventing partial escape sequences from leaking as bare characters
 // (e.g. 'A' from \x1b[A triggering the add-test wizard when holding the up arrow).
+// Unread bytes from a previous read_key() call. File-scope (not function-local)
+// so flush_input() can clear them when a modal prompt opens.
+static char s_key_leftover[64] = {};
+static int  s_key_leftover_len = 0;
+
+// Discard buffered keystrokes — both read_key's leftover and the kernel's unread
+// tty input — so a modal prompt (add/edit wizard, hardware picker) isn't driven
+// by keys pressed before it opened. Without this, fast scrolling can leave a
+// half-finished arrow sequence buffered that the wizard reads as a bare ESC and
+// instantly cancels on.
+static void flush_input() {
+    s_key_leftover_len = 0;
+    tcflush(STDIN_FILENO, TCIFLUSH);
+}
+
 static int read_key(int timeout_ms) {
-    static char leftover[8] = {};
-    static int  leftover_len = 0;
+    // Buffer comfortably larger than one escape sequence so a fast key-repeat
+    // stream rarely has a read() boundary land in the middle of "\x1b[A".
+    char buf[64] = {};
+    int  r       = 0;
 
-    char buf[8] = {};
-    int  r      = 0;
-
-    if (leftover_len > 0) {
-        r = leftover_len;
-        memcpy(buf, leftover, leftover_len);
-        leftover_len = 0;
-        // If a lone ESC is in the leftover, try to complete the sequence.
-        if (r == 1 && buf[0] == 0x1b) {
-            fd_set fds2; FD_ZERO(&fds2); FD_SET(STDIN_FILENO, &fds2);
-            struct timeval tv2 = {0, 50000};
-            if (select(STDIN_FILENO + 1, &fds2, nullptr, nullptr, &tv2) > 0)
-                r += (int)read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
-        }
+    if (s_key_leftover_len > 0) {
+        r = s_key_leftover_len;
+        memcpy(buf, s_key_leftover, s_key_leftover_len);
+        s_key_leftover_len = 0;
     } else {
         fd_set fds;
         FD_ZERO(&fds);
@@ -87,16 +94,29 @@ static int read_key(int timeout_ms) {
 
         r = (int)read(STDIN_FILENO, buf, sizeof(buf));
         if (r <= 0) return -1;
+    }
 
-        // If only ESC arrived, wait briefly for the rest of an arrow-key sequence.
-        // Over SSH, the 3 bytes of \x1b[A can arrive in separate reads.
-        if (r == 1 && buf[0] == 0x1b) {
-            FD_ZERO(&fds);
-            FD_SET(STDIN_FILENO, &fds);
-            tv.tv_sec = 0; tv.tv_usec = 50000; // 50 ms
-            if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0)
-                r += (int)read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
-        }
+    // If buf begins an escape sequence but doesn't yet hold a complete one, wait
+    // briefly for the rest before parsing. Critical for fast scrolling: an 8-/64-
+    // byte read can split "\x1b[A" after the '[', and without completion the
+    // leftover "\x1b[" is read as ESC + '[' while the orphaned trailing 'A' then
+    // arrives as a bare key — opening the add-test wizard. Over SSH the 3 bytes
+    // can likewise arrive in separate reads.
+    auto incomplete = [&]() {
+        if (r < 1 || buf[0] != 0x1b) return false;       // not an escape sequence
+        if (r == 1) return true;                          // just ESC
+        if (buf[1] != '[') return false;                  // ESC + other (e.g. Alt-key)
+        if (r == 2) return true;                          // ESC '[' — need final byte
+        if (r == 3 && (buf[2] == '5' || buf[2] == '6')) return true; // need '~' (PgUp/PgDn)
+        return false;
+    };
+    for (int tries = 0; tries < 4 && incomplete() && r < (int)sizeof(buf); ++tries) {
+        fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
+        struct timeval tv = {0, 50000}; // 50 ms
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) break;
+        int n = (int)read(STDIN_FILENO, buf + r, sizeof(buf) - r);
+        if (n <= 0) break;
+        r += n;
     }
 
     int key      = -1;
@@ -125,8 +145,8 @@ static int read_key(int timeout_ms) {
 
     // Save any bytes beyond what we consumed for the next call.
     if (r > consumed) {
-        leftover_len = r - consumed;
-        memcpy(leftover, buf + consumed, leftover_len);
+        s_key_leftover_len = r - consumed;
+        memcpy(s_key_leftover, buf + consumed, s_key_leftover_len);
     }
 
     return key;
@@ -229,7 +249,8 @@ static std::string test_row(const TestEntry& t, const TestResult* r,
                               const Registry& reg, bool selected,
                               const std::string& live_status = "",
                               int name_offset = 0,
-                              int name_w = COL_NAME)
+                              int name_w = COL_NAME,
+                              int batch_mark = -1)  // -1 hide, 0 unchecked, 1 checked
 {
     using namespace ansi;
     RunStatus status = r ? result_status(*r) : RunStatus::Unknown;
@@ -263,6 +284,8 @@ static std::string test_row(const TestEntry& t, const TestResult* r,
     }
 
     std::ostringstream row;
+    if (batch_mark >= 0)
+        row << (batch_mark > 0 ? color(BGREEN, "[x] ") : dim("[ ] "));
     if (selected) row << CYAN << BOLD;
     row << name_col << " " << dim(node_col) << " "
         << color(stat_color, stat_col) << " "
@@ -738,6 +761,36 @@ static std::string scroll_name(const std::string& s, int offset, int width) {
     return out;
 }
 
+// Truncate `s` to at most `max_width` *visible* columns, preserving ANSI escape
+// sequences (which take no width) and dropping any printable overflow. Used for
+// the log panel so a long message can't wrap onto a second terminal row, which
+// would throw off the frame's row accounting and scroll the header off-screen.
+static std::string truncate_display(const std::string& s, int max_width) {
+    if (max_width < 0) max_width = 0;
+    std::string out;
+    int vis = 0;
+    bool had_ansi = false;
+    for (size_t i = 0; i < s.size(); ) {
+        if (s[i] == '\x1b') {                       // ANSI escape: copy verbatim
+            size_t j = i + 1;
+            if (j < s.size() && s[j] == '[') {
+                ++j;
+                while (j < s.size() && !(s[j] >= 0x40 && s[j] <= 0x7e)) ++j;
+                if (j < s.size()) ++j;              // include the final byte
+            }
+            out.append(s, i, j - i);
+            had_ansi = true;
+            i = j;
+        } else {
+            if (vis >= max_width) break;
+            out += s[i++];
+            ++vis;
+        }
+    }
+    if (had_ansi) out += ansi::RESET;               // avoid colour bleed
+    return out;
+}
+
 // ── Wizard helpers ────────────────────────────────────────────────────────
 
 // Open $VISUAL/$EDITOR/vim to edit a list of shell lines (node preamble).
@@ -968,6 +1021,7 @@ static void wizard_edit_hardware(Registry& reg, const std::string& node_name,
 static std::string wizard_select_hardware(Registry& reg,
                                            const std::string& th_dir,
                                            const std::string& project_root) {
+    flush_input();  // drop keys buffered before the picker opened (e.g. scroll)
     auto rebuild_names = [&]() {
         std::vector<std::string> n;
         if (has_local_gpu()) n.push_back("local");
@@ -1220,6 +1274,8 @@ static bool run_add_wizard(Registry& reg,
                             const std::string& th_dir,
                             const std::string& project_root)
 {
+    flush_input();  // drop keys buffered before the wizard opened (e.g. scroll)
+
     // ── Step 0: destination (only shown when sub-registries are declared) ─
     std::string dest_sub_dir;   // "" = parent, "gunrock" = sub-registry
     std::string eff_th_dir       = th_dir;
@@ -1457,6 +1513,7 @@ static bool run_edit_wizard(Registry& reg, int test_idx,
                              const std::string& th_dir,
                              const std::string& project_root)
 {
+    flush_input();  // drop keys buffered before the wizard opened (e.g. scroll)
     const std::string test_sub_dir = reg.tests[test_idx].sub_dir;
 
     // Resolve which registry to edit and what the un-prefixed test name is
@@ -1637,6 +1694,7 @@ static bool run_clone_wizard(Registry& reg, int test_idx,
                               const std::string& th_dir,
                               const std::string& project_root)
 {
+    flush_input();  // drop keys buffered before the wizard opened (e.g. scroll)
     const TestEntry& src = reg.tests[test_idx];
     const std::string test_sub_dir = src.sub_dir;
 
@@ -1699,6 +1757,7 @@ static bool wizard_confirm_delete(Registry& reg, int test_idx,
                                    const std::string& th_dir,
                                    const std::string& project_root)
 {
+    flush_input();  // drop keys buffered before the prompt opened (e.g. scroll)
     const std::string display_name  = reg.tests[test_idx].name;
     const std::string test_sub_dir  = reg.tests[test_idx].sub_dir;
 
@@ -1747,7 +1806,11 @@ static bool wizard_confirm_delete(Registry& reg, int test_idx,
 int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
               std::shared_ptr<JobLog> job_log,
               std::function<void(const std::string&, const std::string&)> run_fn,
-              std::function<void(const std::string&)> cancel_fn,
+              std::function<void(const std::string&, const std::string&)> cancel_fn,
+              std::function<void(const std::string&,
+                                 const std::vector<std::string>&, int)> batch_fn,
+              std::function<void(const std::string&,
+                                 const std::vector<std::string>&)> clean_build_fn,
               std::string project_root, bool auto_run, int repeat) {
     std::string results_dir = trailhead_dir + "/results";
     fs::mkdir_p(results_dir);
@@ -1781,6 +1844,9 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     int total = 0;
     std::vector<int> filtered; // indices into reg.tests, filtered by selected_hw
     std::string tag_filter;    // empty = show all, else only tests with this tag
+    bool batch_select_mode = false;       // [B]: pick tests for a batch-run
+    std::set<std::string> batch_sel;      // test names marked for the batch
+    int  batch_size = 50;                 // tests per chunk for the batch-run
 
     // Rebuild the filtered list and update total. Call after hardware change or test add/delete.
     auto rebuild_filtered = [&]() {
@@ -1804,7 +1870,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     // Fixed chrome: title(1) + hline(1) + header(1) + hline(1) + hline(1) + keys(variable)
     // keys row is 157 visible cols; wraps on terminals narrower than that.
     static constexpr int FIXED_ROWS_NO_KEYS = 5;
-    static constexpr int FOOTER_VIS_LEN     = 157;
+    static constexpr int FOOTER_VIS_LEN     = 185;  // visible width of the keys row
     // Log panel: blank(1) + up to MAX_LINES rows (only reserved when non-empty)
     static constexpr int LOG_PANEL_MAX = 1 + JobLog::MAX_LINES;
 
@@ -1849,16 +1915,22 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         // partial-frame flicker over high-latency connections (SSH).
         std::ostringstream o;
 
-        // Move to top-left without clearing — old content is overwritten in place
+        // Move to top-left without clearing — old content is overwritten in place.
+        // Build the title separately and truncate it to the terminal width so a
+        // long project path can't wrap the header onto a second row.
         o << CURSOR_HOME;
-        o << BOLD << "TRAILHEAD" << RESET
-          << "  " << DIM << trailhead_dir << RESET
-          << "  " << now_str();
-        if (job_log && job_log->active > 0)
-            o << "  " << color(BYELLOW, std::to_string(job_log->active.load())
-                               + " job(s) running");
-        if (!selected_hw.empty())
-            o << "  " << color(CYAN, "hw:" + selected_hw);
+        {
+            std::ostringstream title;
+            title << BOLD << "TRAILHEAD" << RESET
+                  << "  " << DIM << trailhead_dir << RESET
+                  << "  " << now_str();
+            if (job_log && job_log->active > 0)
+                title << "  " << color(BYELLOW, std::to_string(job_log->active.load())
+                                       + " job(s) running");
+            if (!selected_hw.empty())
+                title << "  " << color(CYAN, "hw:" + selected_hw);
+            o << truncate_display(title.str(), term_cols());
+        }
         o << "\n";
         // Actual non-name visible width: column widths + 7 separator spaces.
         // TOTAL_WIDTH uses +5 (hline), so rows are TOTAL_WIDTH-COL_NAME+2 wide without the name.
@@ -1875,29 +1947,46 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
         int end = std::min(scroll + vis_tests, total);
         for (int i = scroll; i < end; ++i) {
             const auto& t = reg.tests[filtered[i]];
-            const TestResult* r = latest_result(idx, t.name);
-            std::string live = job_log ? job_log->get_live(t.name) : "";
+            const TestResult* r = latest_result(idx, t.name, selected_hw);
+            std::string live = job_log ? job_log->get_live(t.name, selected_hw) : "";
+            int mark = -1, nw = dyn_name_w;
+            if (batch_select_mode) {            // reserve 4 cols for the "[x] " marker
+                mark = batch_sel.count(t.name) ? 1 : 0;
+                nw = std::max(COL_NAME, dyn_name_w - 4);
+            }
             o << test_row(t, r, reg, i == selected, live,
                           i == selected ? name_scroll : 0,
-                          dyn_name_w) << "\n";
+                          nw, mark) << "\n";
         }
 
         if (need_down)
             o << DIM << "  ↓ " << (total - end) << " more below" << RESET << "\n";
 
         o << hline(dyn_total_w) << "\n";
-        o << DIM
-          << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [x] cancel  [R] run all  [a] add  [e] edit  [c] clone  [d] delete  [f] filter  [h] hw"
-          << RESET;
-        if (!tag_filter.empty())
-            o << "  " << BOLD << "tag:" << tag_filter << RESET;
+        if (batch_select_mode) {
+            o << color(BGREEN, "BATCH ")
+              << DIM << std::to_string(batch_sel.size()) << " selected"
+              << "  size " << batch_size << "  "
+              << "[s/space] toggle  [A] all  [b] size  [enter] run selected  [esc] cancel"
+              << RESET;
+        } else {
+            o << DIM
+              << "[q] quit  [↑/k/↓/j] nav  [enter] detail  [s] submit  [x] cancel  [R] run all  [F] rerun fails  [B] batch  [a] add  [e] edit  [c] clone  [d] delete  [f] filter  [h] hw"
+              << RESET;
+            if (!tag_filter.empty())
+                o << "  " << BOLD << "tag:" << tag_filter << RESET;
+        }
         o << "\n";
 
-        // Log panel — fixed at snapshot taken above
+        // Log panel — fixed at snapshot taken above. Truncate each line to the
+        // terminal width (minus the 2-char indent) so a long message can't wrap
+        // onto a second row; otherwise the extra rows push the whole frame past
+        // term_rows() and the terminal scrolls the header off the top.
         if (!snap.empty()) {
             o << "\n";
+            int log_w = std::max(0, term_cols() - 2);
             for (const auto& line : snap)
-                o << DIM << "  " << line << RESET << "\n";
+                o << DIM << "  " << truncate_display(line, log_w) << RESET << "\n";
         }
 
         // Erase everything below the current frame (handles shrinking content)
@@ -1915,6 +2004,21 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
 
     ResultIndex idx = load_all_results(results_dir);
     render_main(idx);
+
+    // Run a batch-run for the given test names on the current hardware: hand the
+    // terminal to batch-run's plain output, then restore the TUI and reload results.
+    auto run_batch = [&](const std::vector<std::string>& names) {
+        if (names.empty() || !batch_fn) return;
+        restore_terminal();
+        std::cout << ansi::ALT_SCREEN_OFF;
+        std::cout.flush();
+        batch_fn(selected_hw, names, batch_size);
+        std::cout << ansi::ALT_SCREEN_ON;
+        std::cout.flush();
+        enter_raw_mode();
+        flush_input();
+        idx = load_all_results(results_dir);
+    };
 
     // auto_run: submit all visible tests immediately, then watch until done
     int rounds_submitted = 0;
@@ -1937,7 +2041,47 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
     while (true) {
         int key = read_key(tick_ms);
 
-        if (!detail_mode && !preview_mode && !output_mode) {
+        if (batch_select_mode) {
+            bool redraw = false;
+            if (key == 27 /*ESC*/ || key == 'q' || key == 3 /*Ctrl-C*/) {
+                batch_select_mode = false; redraw = true;
+            } else if (key == 'j' || key == 1001 /*down*/) {
+                selected = (selected + 1) % std::max(total, 1); name_scroll = 0; redraw = true;
+            } else if (key == 'k' || key == 1000 /*up*/) {
+                selected = (selected - 1 + std::max(total, 1)) % std::max(total, 1); name_scroll = 0; redraw = true;
+            } else if ((key == 's' || key == 'S' || key == ' ') && total > 0) {
+                const std::string& nm = reg.tests[filtered[selected]].name;
+                if (!batch_sel.erase(nm)) batch_sel.insert(nm);  // toggle
+                redraw = true;
+            } else if (key == 'b' || key == 'B') {
+                // Prompt for tests-per-chunk (batch size).
+                restore_terminal();
+                std::cout << ansi::ALT_SCREEN_OFF << ansi::CLEAR
+                          << "Batch size — tests per chunk [" << batch_size << "]: " << std::flush;
+                std::string line; std::getline(std::cin, line);
+                try { int v = std::stoi(line); if (v > 0) batch_size = v; } catch (...) {}
+                std::cout << ansi::ALT_SCREEN_ON; std::cout.flush();
+                enter_raw_mode(); flush_input();
+                redraw = true;
+            } else if (key == 'a' || key == 'A') {
+                std::vector<std::string> names;            // [A]: run every visible test
+                for (int i = 0; i < total; ++i) names.push_back(reg.tests[filtered[i]].name);
+                batch_select_mode = false;
+                run_batch(names);
+                redraw = true;
+            } else if (key == '\r' || key == '\n') {
+                std::vector<std::string> names(batch_sel.begin(), batch_sel.end());
+                batch_select_mode = false;
+                if (!names.empty()) run_batch(names);
+                else if (job_log) job_log->push("batch: nothing selected");
+                redraw = true;
+            }
+            // Keep the board live (clock, marquee, incoming results) while choosing.
+            ++ticks;
+            if (++name_scroll_ticks >= 3) { ++name_scroll; name_scroll_ticks = 0; redraw = true; }
+            if (ticks >= refresh_every) { refresh_results(results_dir, idx); ticks = 0; redraw = true; }
+            if (redraw) render_main(idx);
+        } else if (!detail_mode && !preview_mode && !output_mode) {
             bool redraw = false;
             if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) break;
             if (key == 'j' || key == 1001 /*down*/) { selected = (selected + 1) % std::max(total, 1); name_scroll = 0; name_scroll_ticks = 0; redraw = true; }
@@ -1964,13 +2108,62 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 }
                 redraw = true;
             }
+            if (key == 'B' && batch_fn) {
+                if (selected_hw.empty() || selected_hw == "local") {
+                    job_log->push(selected_hw == "local"
+                        ? "batch-run needs a remote node — press [h] to choose"
+                        : "No hardware selected — press [h] to choose");
+                } else if (total > 0) {
+                    // Enter batch-select mode: toggle tests with [s], [A] runs
+                    // all, [enter] runs the selected set.
+                    batch_select_mode = true;
+                    batch_sel.clear();
+                }
+                redraw = true;
+            }
             if ((key == 'h' || key == 'H') && run_fn) {
                 std::string hw = wizard_select_hardware(reg, trailhead_dir, project_root);
                 if (!hw.empty()) { selected_hw = hw; selected = 0; scroll = 0; }
                 rebuild_filtered();
                 redraw = true;
             }
-            if (key == 'f' || key == 'F') {
+            if (key == 'F' && run_fn && total > 0) {
+                // Re-run the failed tests on this hardware. Tests that BUILD-failed
+                // get their build dir wiped first so the rebuild starts clean.
+                if (selected_hw.empty() && !reg.nodes.empty()) {
+                    job_log->push("No hardware selected — press [h] to choose");
+                } else {
+                    std::vector<std::string> failed, bfail;
+                    for (int i = 0; i < total; ++i) {
+                        const auto& t = reg.tests[filtered[i]];
+                        const TestResult* r = latest_result(idx, t.name, selected_hw);
+                        if (!r) continue;
+                        RunStatus st = result_status(*r);
+                        if (st == RunStatus::BuildFail) { failed.push_back(t.name); bfail.push_back(t.name); }
+                        else if (st == RunStatus::Fail)  failed.push_back(t.name);
+                    }
+                    if (failed.empty()) {
+                        job_log->push("No failed tests to re-run");
+                    } else {
+                        if (!bfail.empty())
+                            job_log->push("Re-running " + std::to_string(failed.size())
+                                + " failed (" + std::to_string(bfail.size())
+                                + " build-fail → wiping build dirs)...");
+                        else
+                            job_log->push("Re-running " + std::to_string(failed.size()) + " failed test(s)...");
+                        // Wipe (possibly slow ssh) + resubmit off the UI thread so
+                        // the board stays responsive; the wipe completes before the
+                        // resubmit so the rebuild sees a clean tree.
+                        std::string hw = selected_hw;
+                        std::thread([clean_build_fn, run_fn, hw, failed, bfail]() {
+                            if (!bfail.empty() && clean_build_fn) clean_build_fn(hw, bfail);
+                            for (const auto& n : failed) run_fn(n, hw);
+                        }).detach();
+                    }
+                }
+                redraw = true;
+            }
+            if (key == 'f') {
                 // Collect all unique tags across tests
                 std::vector<std::string> all_tags;
                 for (const auto& t : reg.tests)
@@ -2001,21 +2194,22 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             }
             if ((key == 'x' || key == 'X') && total > 0) {
                 const auto& t = reg.tests[filtered[selected]];
-                std::string live = job_log ? job_log->get_live(t.name) : "";
+                std::string live = job_log ? job_log->get_live(t.name, selected_hw) : "";
                 if (live.empty()) {
                     if (job_log) job_log->push("[" + t.name + "] not running");
                 } else {
                     std::string tname = t.name;
-                    // Tell the BatchSubmitter to drop it from its queue
-                    if (cancel_fn) cancel_fn(tname);
+                    // Cancel only this test's job on the current page's hardware,
+                    // leaving the same test running on other nodes untouched.
+                    if (cancel_fn) cancel_fn(tname, selected_hw);
                     // Clear queued submission (pre-SLURM: QUEUED/RSYNC)
-                    clear_queued_submission(trailhead_dir, tname);
-                    job_log->set_live(tname, "");
+                    clear_queued_submission(trailhead_dir, tname, selected_hw);
+                    job_log->set_live(tname, "", selected_hw);
                     // scancel SLURM job in background to avoid freezing the TUI
                     auto pending = load_pending_jobs(trailhead_dir);
                     for (auto& p : pending) {
-                        if (p.name != tname) continue;
-                        clear_pending_job(trailhead_dir, tname);
+                        if (p.name != tname || p.node_name != selected_hw) continue;
+                        clear_pending_job(trailhead_dir, tname, selected_hw);
                         std::string remote = p.remote;
                         std::string job_id = p.job_id;
                         std::thread([job_log, tname, remote, job_id]() {
@@ -2173,8 +2367,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                     detail_scroll = 0;
                     detail_ticks  = 0;
                     const auto& t = reg.tests[filtered[selected]];
-                    const TestResult* r = latest_result(idx, t.name);
-                    std::string live = job_log ? job_log->get_live(t.name) : "";
+                    const TestResult* r = latest_result(idx, t.name, selected_hw);
+                    std::string live = job_log ? job_log->get_live(t.name, selected_hw) : "";
                     auto live_out = job_log ? job_log->get_live_output(t.name) : std::vector<std::string>{};
                     render_detail(t, r, detail_scroll, live, live_out);
                     // don't set redraw — detail was just rendered
@@ -2233,8 +2427,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
             if (key == 'b' || key == 'B' || key == 27 /*ESC*/) {
                 output_mode = false;
                 const auto& t = reg.tests[filtered[selected]];
-                const TestResult* r = latest_result(idx, t.name);
-                std::string live = job_log ? job_log->get_live(t.name) : "";
+                const TestResult* r = latest_result(idx, t.name, selected_hw);
+                std::string live = job_log ? job_log->get_live(t.name, selected_hw) : "";
                 auto live_out = job_log ? job_log->get_live_output(t.name) : std::vector<std::string>{};
                 render_detail(t, r, detail_scroll, live, live_out);
             } else if (key == 'q' || key == 'Q' || key == 3 /*Ctrl-C*/) {
@@ -2256,7 +2450,7 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 break;
             } else if ((key == 'o' || key == 'O') && total > 0) {
                 const auto& t = reg.tests[filtered[selected]];
-                const TestResult* r = latest_result(idx, t.name);
+                const TestResult* r = latest_result(idx, t.name, selected_hw);
                 output_lines.clear();
                 if (r) {
                     std::string out_path = result_output_path(*r);
@@ -2282,8 +2476,8 @@ int run_watch(const std::string& trailhead_dir, Registry& reg, int interval_ms,
                 if (detail_redraw) {
                     idx = load_all_results(results_dir);
                     const auto& t = reg.tests[filtered[selected]];
-                    const TestResult* r = latest_result(idx, t.name);
-                    std::string live = job_log ? job_log->get_live(t.name) : "";
+                    const TestResult* r = latest_result(idx, t.name, selected_hw);
+                    std::string live = job_log ? job_log->get_live(t.name, selected_hw) : "";
                     auto live_out = job_log ? job_log->get_live_output(t.name) : std::vector<std::string>{};
                     render_detail(t, r, detail_scroll, live, live_out);
                 }

@@ -1,9 +1,23 @@
 #pragma once
 #include "../core/registry.hpp"
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace trailhead {
+
+// Group setup steps into ordered execution stages. Items within a stage may run
+// concurrently; stages run one after another. Each returned item carries its
+// original index among the non-barrier steps so callers can build stable
+// per-item state (sentinels/locks) across runs. Rules:
+//   • If explicit "---" barriers are present, split there (manual control).
+//   • Otherwise, if every step is a recognised dataset-prep verb, group by
+//     phase — mkdir → download → extract → move → cleanup — so independent
+//     downloads/extractions run in parallel while ordering dependencies hold.
+//   • If any step is unrecognised, fall back to one item per stage (fully
+//     sequential), preserving authoring order.
+std::vector<std::vector<std::pair<int, std::string>>>
+plan_setup_stages(const std::vector<std::string>& setup);
 
 struct SbatchOptions {
     std::string output_path;  // where to write; empty = print to stdout

@@ -12,6 +12,9 @@ add_executable(trailhead
     src/cli/sbatch_gen.cpp
     src/cli/remote_run.cpp
     src/cli/local_run.cpp
+    src/cli/batch_run.cpp
+    src/cli/datasets_runtime.cpp
+    src/cli/matrix.cpp
 )
 
 target_include_directories(trailhead PRIVATE

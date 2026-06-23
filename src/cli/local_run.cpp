@@ -418,6 +418,7 @@ void LocalRunner::run_task(Task& task) {
             res.exit_code  = 1;
             res.run_by     = "local";
             res.host       = "localhost";
+            res.node       = "local";
             res.metadata["_build_fail"]  = "1";
             res.metadata["_output_tail"] = "build failed — see output above";
             std::string results_dir = th_dir_ + "/results";
@@ -456,6 +457,18 @@ void LocalRunner::run_task(Task& task) {
         if (log && !line.empty()) log(line);
     };
 
+    // ── Datasets: ensure each is present before the test runs ────────────
+    // Shell out to the same helpers used by sbatch scripts so behaviour is
+    // identical across local + remote. State files (.trailhead/datasets/<n>/)
+    // are written by init_dataset_state at run start.
+    if (!t.datasets.empty()) {
+        std::string lib = th_dir_ + "/lib/datasets.sh";
+        for (const auto& d : t.datasets) {
+            std::string ec = "bash -c 'source \"" + lib + "\" && th_ds_ensure \"" + d + "\"'";
+            proc::run(ec, {}, {}, 1800, project_root_, on_line, /*use_shell=*/true);
+        }
+    }
+
     auto r = proc::run(run_cmd, {}, {{"TRAILHEAD_ENABLED","1"}}, t.timeout_sec, workdir, on_line, /*use_shell=*/true);
 
     int64_t t_end = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -470,6 +483,7 @@ void LocalRunner::run_task(Task& task) {
     res.exit_code  = r.exit_code;
     res.run_by     = "local";
     res.host       = "localhost";
+    res.node       = "local";
 
     parse_trailhead_output(r.stdout_str, res);
 
@@ -503,6 +517,15 @@ void LocalRunner::run_task(Task& task) {
     fs::mkdir_p(results_dir);
     save_result(results_dir, res);
     save_result_output(results_dir, res, full_output);
+
+    // Datasets: refcount-finish so cleanup fires after the last consumer.
+    if (!t.datasets.empty()) {
+        std::string lib = th_dir_ + "/lib/datasets.sh";
+        for (const auto& d : t.datasets) {
+            std::string fc = "bash -c 'source \"" + lib + "\" && th_ds_finish \"" + d + "\" \"" + t.name + "\"'";
+            proc::run(fc, {}, {}, 60, project_root_, nullptr, /*use_shell=*/true);
+        }
+    }
 
     // Log outcome
     std::string badge = res.metadata.count("_build_fail")

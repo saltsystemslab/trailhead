@@ -17,7 +17,8 @@ struct TimingEntry {
 
 struct TestResult {
     std::string name;
-    std::string host;
+    std::string host;    // compute host / ssh remote the job ran on
+    std::string node;    // node-profile name selected by the user (e.g. "h200", "local")
     std::string run_by;
     int64_t started_at   = 0;  // ms epoch
     int64_t ended_at     = 0;  // ms epoch
@@ -60,6 +61,7 @@ inline std::optional<TestResult> parse_result(const std::string& path) {
         TestResult r;
         r.name        = root.get_str("name");
         r.host        = root.get_str("host");
+        r.node        = root.get_str("node");
         r.run_by      = root.get_str("run_by");
         r.started_at  = root.get_int("started_at");
         r.ended_at    = root.get_int("ended_at");
@@ -179,27 +181,34 @@ inline std::string result_output_path(const TestResult& r) {
 
 // ── Save ──────────────────────────────────────────────────────────────────
 
+// File stem for a result: one per (test, node) so results dedupe — a re-run on
+// the same machine overwrites rather than piling up a timestamped history.
+inline std::string result_key(const TestResult& res) {
+    std::string node = res.node.empty() ? "none" : res.node;
+    for (auto& c : node) if (c == '/') c = '-';
+    return res.name + "__" + node;
+}
+
 // Save the full stdout/stderr output alongside the result JSON as a .out sidecar file.
 inline void save_result_output(const std::string& results_dir,
                                 const TestResult& res,
                                 const std::string& output) {
     if (output.empty()) return;
-    std::string path = results_dir + "/" + res.name + "_"
-                     + std::to_string(res.started_at) + ".out";
+    std::string path = results_dir + "/" + result_key(res) + ".out";
     auto slash = path.rfind('/');
     if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
     fs::write_file_atomic(path, output);
 }
 
 inline void save_result(const std::string& results_dir, const TestResult& res) {
-    std::string path = results_dir + "/" + res.name + "_"
-                     + std::to_string(res.started_at) + ".json";
+    std::string path = results_dir + "/" + result_key(res) + ".json";
     auto slash = path.rfind('/');
     if (slash != std::string::npos) fs::mkdir_p(path.substr(0, slash));
     JsonObject obj;
     obj.push_back({"version",    JsonValue((int64_t)1)});
     obj.push_back({"name",       res.name});
     obj.push_back({"host",       res.host});
+    obj.push_back({"node",       res.node});
     obj.push_back({"run_by",     res.run_by});
     obj.push_back({"started_at", JsonValue(res.started_at)});
     obj.push_back({"ended_at",   JsonValue(res.ended_at)});
@@ -257,19 +266,30 @@ inline void refresh_results(const std::string& results_dir, ResultIndex& idx) {
         auto r = parse_result(path);
         if (!r) continue;
         auto& vec = idx[r->name];
+        // Replace by source file: an overwritten (deduped) result keeps the same
+        // path but a new started_at, so dedupe on path, not timestamp — otherwise
+        // the stale in-memory entry would linger.
         vec.erase(::std::remove_if(vec.begin(), vec.end(),
-            [&](const TestResult& t) { return t.started_at == r->started_at; }), vec.end());
+            [&](const TestResult& t) { return t.result_file == r->result_file; }), vec.end());
         vec.push_back(*r);
         ::std::sort(vec.begin(), vec.end(),
             [](const TestResult& a, const TestResult& b) { return a.started_at < b.started_at; });
     }
 }
 
-// Get the most recent result for a test name
-inline const TestResult* latest_result(const ResultIndex& idx, const std::string& name) {
+// Get the most recent result for a test name. When `node` is non-empty, only
+// results that ran on that node profile are considered, so each hardware shows
+// its own latest result. Returns nullptr if the test has no result on `node`
+// (e.g. it has only ever run on other hardware, or only legacy results with no
+// recorded node exist).
+inline const TestResult* latest_result(const ResultIndex& idx, const std::string& name,
+                                       const std::string& node = "") {
     auto it = idx.find(name);
     if (it == idx.end() || it->second.empty()) return nullptr;
-    return &it->second.back();
+    if (node.empty()) return &it->second.back();
+    for (auto rit = it->second.rbegin(); rit != it->second.rend(); ++rit)
+        if (rit->node == node) return &*rit;
+    return nullptr;
 }
 
 } // namespace trailhead

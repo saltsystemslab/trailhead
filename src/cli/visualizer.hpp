@@ -19,7 +19,10 @@ struct JobLog {
     mutable std::mutex mtx;
     std::deque<std::string> lines;
     std::atomic<int> active{0};
-    std::map<std::string, std::string> live; // test name → in-flight status
+    // (test name, node profile) → in-flight status. Keyed by node too so the
+    // same test can run on two processors at once without one's status clobbering
+    // the other's.
+    std::map<std::pair<std::string, std::string>, std::string> live;
     std::unordered_map<std::string, std::vector<std::string>> live_output; // test name → recent lines
     static constexpr int MAX_LINES = 5;
     static constexpr int MAX_LIVE_OUTPUT = 500; // rolling window per test
@@ -30,10 +33,23 @@ struct JobLog {
         while ((int)lines.size() > MAX_LINES) lines.pop_front();
     }
 
-    void set_live(const std::string& name, const std::string& status) {
+    void set_live(const std::string& name, const std::string& status,
+                  const std::string& node = "") {
         std::lock_guard<std::mutex> g(mtx);
-        if (status.empty()) live.erase(name);
-        else live[name] = status;
+        if (status.empty()) {
+            // Clearing: drop the specific (name,node), or every entry for the
+            // test when no node is given (e.g. a cancel that doesn't know which).
+            if (node.empty()) {
+                for (auto it = live.begin(); it != live.end(); ) {
+                    if (it->first.first == name) it = live.erase(it);
+                    else ++it;
+                }
+            } else {
+                live.erase({name, node});
+            }
+        } else {
+            live[{name, node}] = status;
+        }
     }
 
     // Append a line to the per-test live output buffer (called from log_fn during run).
@@ -57,10 +73,20 @@ struct JobLog {
         return it != live_output.end() ? it->second : std::vector<std::string>{};
     }
 
-    std::string get_live(const std::string& name) const {
+    // In-flight status for `name`. When `node` is non-empty, only return a
+    // status if the job is in flight on that exact node profile, so each
+    // hardware page shows only its own pending/running jobs and a job on one
+    // node never bleeds onto another node's page. When `node` is empty (no
+    // hardware selected) the status is returned regardless.
+    std::string get_live(const std::string& name, const std::string& node = "") const {
         std::lock_guard<std::mutex> g(mtx);
-        auto it = live.find(name);
-        return it != live.end() ? it->second : "";
+        if (!node.empty()) {                       // status on this exact node
+            auto it = live.find({name, node});
+            return it != live.end() ? it->second : "";
+        }
+        for (const auto& [k, v] : live)            // any node (node unspecified)
+            if (k.first == name) return v;
+        return "";
     }
 
     std::vector<std::string> snapshot() const {
@@ -81,7 +107,18 @@ int run_watch(const std::string& trailhead_dir,
               int interval_ms = 1000,
               std::shared_ptr<JobLog> job_log = nullptr,
               std::function<void(const std::string&, const std::string&)> run_fn = nullptr,
-              std::function<void(const std::string&)> cancel_fn = nullptr,
+              std::function<void(const std::string&, const std::string&)> cancel_fn = nullptr,
+              // Launch a blocking batch-run for the given node profile, test
+              // names (empty = all), and batch size (tests per chunk). run_watch
+              // hands the terminal over to its plain output and reloads results
+              // when it returns. Null disables [B].
+              std::function<void(const std::string&,
+                                 const std::vector<std::string>&,
+                                 int)> batch_fn = nullptr,
+              // Wipe the build dirs for the given tests on a node (used by [F]
+              // before re-running build-failed tests). Null disables wiping.
+              std::function<void(const std::string&,
+                                 const std::vector<std::string>&)> clean_build_fn = nullptr,
               std::string project_root = "",
               bool auto_run = false,
               int repeat = 1);

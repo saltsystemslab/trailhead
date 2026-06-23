@@ -4,6 +4,9 @@
 #include "cli/sbatch_gen.hpp"
 #include "cli/remote_run.hpp"
 #include "cli/local_run.hpp"
+#include "cli/batch_run.hpp"
+#include "cli/datasets_runtime.hpp"
+#include "cli/matrix.hpp"
 #include "util/file_util.hpp"
 #include "util/process.hpp"
 #include "util/ansi.hpp"
@@ -220,6 +223,242 @@ static int cmd_node(int argc, char** argv) {
     return 1;
 }
 
+// ── Subcommand: dataset ──────────────────────────────────────────────────
+
+static int cmd_dataset(int argc, char** argv) {
+    if (argc < 3) {
+        std::cout << "Usage:\n"
+                     "  trailhead dataset add  --name <n> --fetch <cmd> --path <p>\n"
+                     "                         [--cache <p>...] [--depends-on <ds>...]\n"
+                     "                         [--requires-target <cmake-tgt>...]\n"
+                     "  trailhead dataset list\n"
+                     "  trailhead dataset remove <name>\n"
+                     "  trailhead dataset clean [--all | <names...>] [--remote-only] [--local-only]\n"
+                     "\n"
+                     "  Datasets bind a fetch command to a directory tests need on disk.\n"
+                     "  Trailhead refcounts how many of the *currently selected* tests still\n"
+                     "  depend on each dataset and removes `path` (+ any --cache paths) when\n"
+                     "  the last consumer finishes — disk usage stays bounded by the in-flight\n"
+                     "  set instead of the full corpus.\n"
+                     "\n"
+                     "  Link a test to a dataset with: trailhead add --dataset <name>[,<name>...]\n";
+        return 0;
+    }
+    std::string action(argv[2]);
+    std::string th_dir = require_trailhead();
+    auto reg = load_reg(th_dir);
+    // Merge sub-registries so list/clean see datasets pulled in from
+    // submodules. add/remove still operate only on the parent registry.
+    if (action == "list" || action == "clean") {
+        auto root = trailhead::fs::find_trailhead_root();
+        if (root) trailhead::merge_sub_registries(reg, *root);
+    }
+
+    if (action == "list") {
+        if (reg.datasets.empty()) {
+            std::cout << trailhead::ansi::DIM << "No datasets defined.\n" << trailhead::ansi::RESET;
+            return 0;
+        }
+        size_t max_name = 4;
+        for (const auto& [n, _] : reg.datasets) max_name = std::max(max_name, n.size());
+
+        // Count consumers per dataset across registered tests
+        std::unordered_map<std::string, int> users;
+        for (const auto& t : reg.tests)
+            for (const auto& d : t.datasets) ++users[d];
+
+        using namespace trailhead::ansi;
+        std::cout << BOLD << pad("NAME", (int)max_name+2)
+                  << " USERS  " << pad("PATH", 32) << " FETCH\n" << RESET;
+        for (const auto& [name, ds] : reg.datasets) {
+            std::cout << pad(name, (int)max_name+2)
+                      << " " << pad(std::to_string(users[name]), 6)
+                      << " " << pad(ds.path, 32)
+                      << " " << ds.fetch_cmd << "\n";
+            if (!ds.cache_paths.empty()) {
+                std::cout << pad("", (int)max_name+2 + 1 + 6 + 1)
+                          << DIM << "caches: ";
+                for (size_t i = 0; i < ds.cache_paths.size(); ++i)
+                    std::cout << (i ? ", " : "") << ds.cache_paths[i];
+                std::cout << RESET << "\n";
+            }
+        }
+        return 0;
+    }
+
+    if (action == "add") {
+        Args args = Args::parse(argc, argv, 3);
+        std::string name  = args.get("name");
+        std::string fetch = args.get("fetch");
+        std::string path  = args.get("path");
+        if (name.empty() || fetch.empty() || path.empty()) {
+            std::cerr << "Error: --name, --fetch, and --path are all required\n";
+            return 1;
+        }
+        if (reg.datasets.count(name)) {
+            std::cerr << "Error: dataset '" << name << "' already exists. Remove it first.\n";
+            return 1;
+        }
+        trailhead::DataSet ds;
+        ds.name      = name;
+        ds.fetch_cmd = fetch;
+        ds.path      = path;
+        // --cache, --depends-on, --requires-target accept comma-separated lists;
+        // Args coalesces repeats to the last value so we don't try to read
+        // multiple invocations.
+        auto split_csv = [](const std::string& v, std::vector<std::string>& out) {
+            std::istringstream ss(v);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                if (!tok.empty()) out.push_back(tok);
+        };
+        split_csv(args.get("cache"),            ds.cache_paths);
+        split_csv(args.get("depends-on"),       ds.depends_on);
+        split_csv(args.get("requires-target"),  ds.requires_targets);
+
+        // Validate dependencies exist.
+        for (const auto& dep : ds.depends_on)
+            if (!reg.datasets.count(dep)) {
+                std::cerr << "Error: depends_on '" << dep
+                          << "' is not a registered dataset.\n";
+                return 1;
+            }
+
+        reg.datasets[name] = ds;
+        trailhead::save_registry(th_dir, reg);
+
+        std::cout << trailhead::ansi::BGREEN << "Added dataset:" << trailhead::ansi::RESET
+                  << " " << name << "\n";
+        std::cout << "  fetch:  " << ds.fetch_cmd << "\n";
+        std::cout << "  path:   " << ds.path      << "\n";
+        if (!ds.cache_paths.empty()) {
+            std::cout << "  caches:";
+            for (const auto& p : ds.cache_paths) std::cout << " " << p;
+            std::cout << "\n";
+        }
+        if (!ds.depends_on.empty()) {
+            std::cout << "  deps:  ";
+            for (const auto& p : ds.depends_on) std::cout << " " << p;
+            std::cout << "\n";
+        }
+        if (!ds.requires_targets.empty()) {
+            std::cout << "  builds:";
+            for (const auto& p : ds.requires_targets) std::cout << " " << p;
+            std::cout << "\n";
+        }
+        return 0;
+    }
+
+    if (action == "remove") {
+        if (argc < 4) { std::cerr << "Error: specify a dataset name\n"; return 1; }
+        std::string name(argv[3]);
+        if (!reg.datasets.count(name)) {
+            std::cerr << "Error: dataset '" << name << "' not found\n";
+            return 1;
+        }
+        // Strip from any tests referencing it so registry stays consistent
+        for (auto& t : reg.tests) {
+            t.datasets.erase(std::remove(t.datasets.begin(), t.datasets.end(), name),
+                             t.datasets.end());
+        }
+        reg.datasets.erase(name);
+        trailhead::save_registry(th_dir, reg);
+        std::cout << trailhead::ansi::YELLOW << "Removed dataset:" << trailhead::ansi::RESET
+                  << " " << name << "\n";
+        return 0;
+    }
+
+    if (action == "clean") {
+        Args args = Args::parse(argc, argv, 3);
+        bool clean_all   = args.flag("all");
+        bool remote_only = args.flag("remote-only");
+        bool local_only  = args.flag("local-only");
+
+        std::vector<std::string> targets;
+        if (clean_all) {
+            for (const auto& [n, _] : reg.datasets) targets.push_back(n);
+        } else {
+            for (const auto& p : args.positional)
+                if (p != "clean") targets.push_back(p);
+        }
+        if (targets.empty()) {
+            std::cerr << "Specify dataset names or pass --all\n";
+            return 1;
+        }
+
+        // Resolve a remote destination from any node profile or build config.
+        std::optional<trailhead::RemoteDest> remote_dest;
+        if (!local_only) {
+            for (const auto& [_, np] : reg.nodes)
+                if (!np.rsync_dest.empty()) {
+                    if (auto d = trailhead::parse_rsync_dest(np.rsync_dest)) { remote_dest = d; break; }
+                }
+            if (!remote_dest) {
+                for (const auto& [_, bc] : reg.builds)
+                    if (!bc.rsync_dest.empty()) {
+                        if (auto d = trailhead::parse_rsync_dest(bc.rsync_dest)) { remote_dest = d; break; }
+                    }
+            }
+        }
+
+        auto root = trailhead::fs::find_trailhead_root();
+        std::string project_root = root ? *root : ".";
+
+        for (const auto& name : targets) {
+            auto it = reg.datasets.find(name);
+            if (it == reg.datasets.end()) {
+                std::cerr << "  skip: dataset '" << name << "' not found\n";
+                continue;
+            }
+            const auto& ds = it->second;
+            std::vector<std::string> paths = {ds.path};
+            for (const auto& p : ds.cache_paths) paths.push_back(p);
+            // Refcount state lives under .trailhead/datasets/<name>/
+            std::string ref_dir = ".trailhead/datasets/" + name;
+
+            std::cout << trailhead::ansi::BOLD << "clean " << name
+                      << trailhead::ansi::RESET << "\n";
+
+            if (!remote_only) {
+                for (const auto& p : paths) {
+                    if (p.empty()) continue;
+                    std::string full = (p[0] == '/') ? p : project_root + "/" + p;
+                    std::string cmd = "rm -rf " + full;
+                    std::cout << "  local: " << cmd << "\n";
+                    trailhead::proc::run(cmd, {}, {}, 60, "", nullptr, true);
+                }
+                std::string cmd = "rm -rf " + project_root + "/" + ref_dir;
+                trailhead::proc::run(cmd, {}, {}, 30, "", nullptr, true);
+            }
+            if (!local_only && remote_dest) {
+                std::string proj_name;
+                {
+                    auto sl = project_root.rfind('/');
+                    proj_name = (sl != std::string::npos && sl + 1 < project_root.size())
+                              ? project_root.substr(sl + 1) : project_root;
+                }
+                std::string remote_proj = remote_dest->remote_path + "/" + proj_name;
+                std::string ssh_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 "
+                                    + remote_dest->remote + " \"cd " + remote_proj + " && rm -rf";
+                for (const auto& p : paths) {
+                    if (p.empty()) continue;
+                    ssh_cmd += " " + p;
+                }
+                ssh_cmd += " " + ref_dir + "\"";
+                std::cout << "  remote: " << remote_dest->remote
+                          << ":" << remote_proj << "  rm -rf " << ds.path;
+                for (const auto& p : ds.cache_paths) std::cout << " " << p;
+                std::cout << "\n";
+                trailhead::proc::run(ssh_cmd, {}, {}, 60, "", nullptr, true);
+            }
+        }
+        return 0;
+    }
+
+    std::cerr << "Unknown dataset action: " << action << "\n";
+    return 1;
+}
+
 // ── Subcommand: build ─────────────────────────────────────────────────────
 
 static int cmd_build(int argc, char** argv) {
@@ -421,12 +660,32 @@ static int cmd_add(int argc, char** argv) {
             if (!tok.empty()) t.tags.push_back(tok);
     }
 
+    std::string ds_str = args.get("dataset");
+    if (!ds_str.empty()) {
+        std::istringstream ss(ds_str);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (tok.empty()) continue;
+            if (!reg.datasets.count(tok)) {
+                std::cerr << "Error: dataset '" << tok << "' not found. "
+                             "Define it with: trailhead dataset add --name " << tok << " ...\n";
+                return 1;
+            }
+            t.datasets.push_back(tok);
+        }
+    }
+
     reg.tests.push_back(t);
     trailhead::save_registry(th_dir, reg);
 
     std::cout << trailhead::ansi::BGREEN << "Added test:" << trailhead::ansi::RESET << " " << name;
     if (!build.empty()) std::cout << "  (build: " << build << ", target: " << t.target << ")";
     if (!requires_hw.empty() && requires_hw != "any") std::cout << "  (requires: " << requires_hw << ")";
+    if (!t.datasets.empty()) {
+        std::cout << "  (datasets:";
+        for (const auto& d : t.datasets) std::cout << " " << d;
+        std::cout << ")";
+    }
     std::cout << "\n";
     return 0;
 }
@@ -564,6 +823,45 @@ static int cmd_run(int argc, char** argv) {
     std::string results_dir = th_dir + "/results";
     trailhead::fs::mkdir_p(results_dir);
 
+    // Datasets: write per-dataset state + helper lib so cmd execution can
+    // ensure/finish around each test. No-op if no selected test uses one.
+    std::vector<std::string> ds_extra_targets;
+    {
+        std::vector<std::string> names_v;
+        for (const auto* t : to_run) names_v.push_back(t->name);
+        auto touched = trailhead::init_dataset_state(reg, names_v, th_dir);
+        if (!touched.empty()) {
+            trailhead::write_dataset_lib(th_dir);
+            ds_extra_targets = trailhead::required_build_targets(reg, names_v);
+            std::cout << trailhead::ansi::DIM << "  datasets in flight: "
+                      << touched.size() << trailhead::ansi::RESET << "\n";
+        }
+    }
+
+    // Build any datasets' required cmake targets up-front so ensure() doesn't
+    // race per-test rebuilds. Best-effort: pick the first build config to
+    // resolve build_dir; skip silently if no build is configured.
+    if (!ds_extra_targets.empty() && !no_build) {
+        std::string ds_build_dir;
+        for (const auto& [_, bc] : reg.builds) {
+            ds_build_dir = bc.dir.empty() ? "build" : bc.dir;
+            break;
+        }
+        if (!ds_build_dir.empty()) {
+            for (const auto& tgt : ds_extra_targets) {
+                std::string cmd = "cmake --build " + ds_build_dir + " --target " + tgt;
+                std::cout << "  " << cmd << "\n";
+                auto r = trailhead::proc::run(cmd, {}, {}, 600, "", nullptr, true);
+                if (r.exit_code != 0) {
+                    if (!r.stderr_str.empty()) std::cerr << r.stderr_str;
+                    std::cerr << trailhead::ansi::color(trailhead::ansi::BRED,
+                        "  Build of dataset target '" + tgt + "' failed\n");
+                    return 1;
+                }
+            }
+        }
+    }
+
     // ── Per-build-group: configure (once) + rsync (once) ──────────────────
     if (!no_build) {
         std::vector<std::string> builds_seen;
@@ -655,6 +953,27 @@ static int cmd_run(int argc, char** argv) {
 
         std::unordered_map<std::string,std::string> env;
         env["TRAILHEAD_RESULTS_DIR"] = results_dir;
+        env["TRAILHEAD_ENABLED"]     = "1";
+        // Resolve a local build dir for dataset fetch_cmds that reference
+        // $TRAILHEAD_BUILD_DIR. Best-effort: first registered build's dir.
+        std::string ds_build_dir;
+        for (const auto& [_, bc] : reg.builds) {
+            ds_build_dir = bc.dir.empty() ? "build" : bc.dir;
+            break;
+        }
+        if (!ds_build_dir.empty()) env["TRAILHEAD_BUILD_DIR"] = ds_build_dir;
+
+        // Datasets: ensure each is present before the test runs (shells out to
+        // the same helpers used by sbatch scripts so behaviour matches).
+        if (!t->datasets.empty()) {
+            std::string lib = th_dir + "/lib/datasets.sh";
+            std::unordered_map<std::string,std::string> ds_env;
+            if (!ds_build_dir.empty()) ds_env["TRAILHEAD_BUILD_DIR"] = ds_build_dir;
+            for (const auto& d : t->datasets) {
+                std::string ec = "bash -c 'source \"" + lib + "\" && th_ds_ensure \"" + d + "\"'";
+                trailhead::proc::run(ec, {}, ds_env, 1800, project_root, nullptr, true);
+            }
+        }
 
         // Run cmd via sh -c so multi-line / && / pipes work
         int64_t t_start = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -665,6 +984,15 @@ static int cmd_run(int argc, char** argv) {
 
         int64_t wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count() - t_start;
+
+        // Datasets: refcount-finish so cleanup fires when the last consumer exits.
+        if (!t->datasets.empty()) {
+            std::string lib = th_dir + "/lib/datasets.sh";
+            for (const auto& d : t->datasets) {
+                std::string fc = "bash -c 'source \"" + lib + "\" && th_ds_finish \"" + d + "\" \"" + t->name + "\"'";
+                trailhead::proc::run(fc, {}, {}, 60, project_root, nullptr, true);
+            }
+        }
 
         // Check stdout for TRAILHEAD: markers (from trailhead.h)
         std::string remaining_stdout;
@@ -780,6 +1108,62 @@ static int cmd_run(int argc, char** argv) {
     return failed_count > 0 ? 1 : 0;
 }
 
+// ── Subcommand: batch-run ─────────────────────────────────────────────────
+
+static int cmd_batch_run(int argc, char** argv) {
+    Args args = Args::parse(argc, argv, 2);
+    std::string th_dir = require_trailhead();
+    auto reg = load_reg(th_dir);
+    auto root_opt = trailhead::fs::find_trailhead_root();
+    std::string project_root = root_opt ? *root_opt : ".";
+    if (root_opt) trailhead::merge_sub_registries(reg, *root_opt);
+
+    trailhead::BatchRunOptions opts;
+    opts.node_name      = args.get("node");
+    opts.batch_size     = args.get_int("batch-size", 50);
+    opts.max_concurrent = args.get_int("max-concurrent", 0);
+    opts.no_build       = args.flag("no-build");
+    opts.run_all        = args.flag("all");
+    opts.filter_tag     = args.get("tag");
+
+    for (const auto& p : args.positional)
+        if (p != "batch-run") opts.test_names.push_back(p);
+
+    if (opts.node_name.empty()) {
+        std::cerr << "Usage: trailhead batch-run --node <profile> "
+                     "[--batch-size N] [--max-concurrent K] [--no-build] "
+                     "[--all | --tag <t> | <names...>]\n";
+        return 1;
+    }
+
+    // Resolve the rsync_dest: node profile takes precedence, then build configs.
+    std::optional<trailhead::RemoteDest> dest;
+    auto nit = reg.nodes.find(opts.node_name);
+    if (nit != reg.nodes.end() && !nit->second.rsync_dest.empty())
+        dest = trailhead::parse_rsync_dest(nit->second.rsync_dest);
+    if (!dest) {
+        for (const auto& [_, np] : reg.nodes)
+            if (!np.rsync_dest.empty()) {
+                if (auto d = trailhead::parse_rsync_dest(np.rsync_dest)) { dest = d; break; }
+            }
+    }
+    if (!dest) {
+        for (const auto& [_, bc] : reg.builds)
+            if (!bc.rsync_dest.empty()) {
+                if (auto d = trailhead::parse_rsync_dest(bc.rsync_dest)) { dest = d; break; }
+            }
+    }
+    if (!dest) {
+        std::cerr << trailhead::ansi::RED << "Error:" << trailhead::ansi::RESET
+                  << " no rsync_dest configured on node profile or any build config.\n"
+                  << "Set one with: trailhead node add --name " << opts.node_name
+                  << " ... --rsync-dest user@host:/path\n";
+        return 1;
+    }
+
+    return trailhead::batch_run(reg, th_dir, project_root, *dest, opts);
+}
+
 // ── Subcommand: gen ───────────────────────────────────────────────────────
 
 static int cmd_gen(int argc, char** argv) {
@@ -851,7 +1235,7 @@ static int cmd_watch(int argc, char** argv) {
     }
 
     std::function<void(const std::string&, const std::string&)> run_fn;
-    std::function<void(const std::string&)> cancel_fn;
+    std::function<void(const std::string&, const std::string&)> cancel_fn;
 
     auto job_log = std::make_shared<trailhead::JobLog>();
 
@@ -876,18 +1260,16 @@ static int cmd_watch(int argc, char** argv) {
     };
 
     if (remote_dest) {
-        // Query SLURM for the per-user job limit on the partitions in use
-        std::vector<std::string> partitions;
-        for (const auto& [nname, node] : reg.nodes)
-            if (!node.partition.empty()) partitions.push_back(node.partition);
-        int max_concurrent = trailhead::query_slurm_job_limit(remote_dest->remote, partitions);
-        job_log->push("[trailhead] SLURM max concurrent jobs: " + std::to_string(max_concurrent));
-
-        // Remote mode: BatchSubmitter batches rapid presses, rsyncs once, sbatches serially
+        // Remote mode: BatchSubmitter batches rapid presses, rsyncs once, sbatches serially.
+        // Boot stays instant (no SLURM query here); the real per-GPU-type job limit is
+        // resolved synchronously the first time each GPU type is submitted to — before
+        // any of that scope's jobs are scheduled — and logged at that point.
         auto submitter = std::make_shared<trailhead::BatchSubmitter>(
-            reg, th_dir, project_root, *remote_dest, job_log, max_concurrent);
+            reg, th_dir, project_root, *remote_dest, job_log);
 
-        cancel_fn = [submitter](const std::string& name) { submitter->cancel(name); };
+        cancel_fn = [submitter](const std::string& name, const std::string& node) {
+            submitter->cancel(name, node);
+        };
 
         run_fn = [&reg = reg, job_log, make_log_fn, submitter, local_runner, th_dir](
                 const std::string& name, const std::string& node_name) {
@@ -904,14 +1286,14 @@ static int cmd_watch(int argc, char** argv) {
                 local_runner->enqueue(*test, reg,
                     make_log_fn(tname),
                     [job_log, tname, th_dir](const std::string& status) {
-                        if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname);
-                        job_log->set_live(tname, status);
+                        if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname, "local");
+                        job_log->set_live(tname, status, "local");
                     });
             } else {
                 submitter->enqueue(*test, node_name,
                     make_log_fn(tname),
-                    [job_log, tname](const std::string& status) {
-                        job_log->set_live(tname, status);
+                    [job_log, tname, node_name](const std::string& status) {
+                        job_log->set_live(tname, status, node_name);
                     });
             }
         };
@@ -920,8 +1302,8 @@ static int cmd_watch(int argc, char** argv) {
         // so that rsync_dest added via the TUI hardware editor is picked up at run time.
         auto lazy_submitter = std::make_shared<std::shared_ptr<trailhead::BatchSubmitter>>();
 
-        cancel_fn = [lazy_submitter](const std::string& name) {
-            if (*lazy_submitter) (*lazy_submitter)->cancel(name);
+        cancel_fn = [lazy_submitter](const std::string& name, const std::string& node) {
+            if (*lazy_submitter) (*lazy_submitter)->cancel(name, node);
         };
 
         run_fn = [&reg = reg, job_log, make_log_fn, local_runner, th_dir, project_root, lazy_submitter](
@@ -939,8 +1321,8 @@ static int cmd_watch(int argc, char** argv) {
                 local_runner->enqueue(*test, reg,
                     make_log_fn(tname),
                     [job_log, tname, th_dir](const std::string& status) {
-                        if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname);
-                        job_log->set_live(tname, status);
+                        if (status == "RUNNING") trailhead::clear_queued_submission(th_dir, tname, "local");
+                        job_log->set_live(tname, status, "local");
                     });
             } else {
                 // Try to initialise a BatchSubmitter now if one hasn't been created yet
@@ -970,8 +1352,8 @@ static int cmd_watch(int argc, char** argv) {
                 if (*lazy_submitter) {
                     (*lazy_submitter)->enqueue(*test, node_name,
                         make_log_fn(tname),
-                        [job_log, tname](const std::string& status) {
-                            job_log->set_live(tname, status);
+                        [job_log, tname, node_name](const std::string& status) {
+                            job_log->set_live(tname, status, node_name);
                         });
                 } else {
                     job_log->push("no remote configured for node: " + node_name);
@@ -989,7 +1371,7 @@ static int cmd_watch(int argc, char** argv) {
             for (const auto& t : reg.tests)
                 if (t.name == pj.name) { test = &t; break; }
             if (!test) {
-                trailhead::clear_pending_job(th_dir, pj.name);
+                trailhead::clear_pending_job(th_dir, pj.name, pj.node_name);
                 continue;
             }
 
@@ -999,10 +1381,11 @@ static int cmd_watch(int argc, char** argv) {
             std::thread([entry, pending_copy, reg, th_dir, job_log, make_log_fn]() {
                 std::string tname = entry->name;
                 job_log->push("[" + tname + "] resuming job " + pending_copy->job_id);
+                std::string rnode = pending_copy->node_name;
                 trailhead::resume_job(*pending_copy, *entry, reg, th_dir,
                     make_log_fn(tname),
-                    [job_log, tname](const std::string& status) {
-                        job_log->set_live(tname, status);
+                    [job_log, tname, rnode](const std::string& status) {
+                        job_log->set_live(tname, status, rnode);
                     });
                 job_log->active--;
             }).detach();
@@ -1019,7 +1402,7 @@ static int cmd_watch(int argc, char** argv) {
         auto queued = trailhead::load_queued_submissions(th_dir);
         for (const auto& qs : queued) {
             if (auto_run) {
-                trailhead::clear_queued_submission(th_dir, qs.name);
+                trailhead::clear_queued_submission(th_dir, qs.name, qs.node_name);
                 continue;
             }
             bool local_only = !remote_dest && qs.node_name != "local";
@@ -1027,7 +1410,7 @@ static int cmd_watch(int argc, char** argv) {
             for (const auto& t : reg.tests)
                 if (t.name == qs.name) { found = true; break; }
             if (!found || local_only) {
-                trailhead::clear_queued_submission(th_dir, qs.name);
+                trailhead::clear_queued_submission(th_dir, qs.name, qs.node_name);
                 continue;
             }
             job_log->push("[" + qs.name + "] re-queuing from previous session");
@@ -1057,12 +1440,104 @@ static int cmd_watch(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    int rc = trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, cancel_fn, project_root, auto_run, repeat);
+    // [B] in the TUI: run a blocking batch-run for the selected node. run_watch
+    // hands the terminal to its plain output, then reloads results on return.
+    auto batch_fn = [&reg = reg, th_dir, project_root](const std::string& node_name,
+                                                       const std::vector<std::string>& names,
+                                                       int batch_size) {
+        // Resolve rsync dest: node profile first, then any node, then build configs.
+        std::optional<trailhead::RemoteDest> dest;
+        auto nit = reg.nodes.find(node_name);
+        if (nit != reg.nodes.end() && !nit->second.rsync_dest.empty())
+            dest = trailhead::parse_rsync_dest(nit->second.rsync_dest);
+        if (!dest)
+            for (const auto& [_, np] : reg.nodes)
+                if (!np.rsync_dest.empty())
+                    if (auto d = trailhead::parse_rsync_dest(np.rsync_dest)) { dest = d; break; }
+        if (!dest)
+            for (const auto& [_, bc] : reg.builds)
+                if (!bc.rsync_dest.empty())
+                    if (auto d = trailhead::parse_rsync_dest(bc.rsync_dest)) { dest = d; break; }
+        if (!dest) {
+            std::cout << trailhead::ansi::RED << "batch-run:" << trailhead::ansi::RESET
+                      << " no rsync_dest configured for node '" << node_name << "'.\n";
+        } else {
+            trailhead::BatchRunOptions opts;
+            opts.node_name = node_name;
+            if (batch_size > 0) opts.batch_size = batch_size;
+            if (names.empty()) opts.run_all = true;
+            else               opts.test_names = names;
+            trailhead::batch_run(reg, th_dir, project_root, *dest, opts);
+        }
+        std::cout << "\nPress Enter to return to trailhead..." << std::flush;
+        std::string _; std::getline(std::cin, _);
+    };
+
+    // [F] re-run failures: before resubmitting a BFAIL test, wipe its build dir
+    // so the next run reconfigures from scratch (a stale/corrupt build tree is
+    // the usual cause of a build failure). Runs on whichever machine builds the
+    // test — local rm or a remote `rm -rf` over ssh.
+    auto clean_build_fn = [&reg = reg, project_root](const std::string& node_name,
+                                                     const std::vector<std::string>& names) {
+        const trailhead::NodeProfile* np = nullptr;
+        auto nit = reg.nodes.find(node_name);
+        if (nit != reg.nodes.end()) np = &nit->second;
+
+        // Resolve each failed test's build dir (relative to the project root).
+        std::vector<std::string> dirs;
+        for (const auto& name : names) {
+            const trailhead::TestEntry* t = nullptr;
+            for (const auto& te : reg.tests) if (te.name == name) { t = &te; break; }
+            if (!t) continue;
+            const trailhead::BuildConfig* bc = nullptr;
+            if (!t->build_name.empty()) {
+                auto b = reg.builds.find(t->build_name);
+                if (b != reg.builds.end()) bc = &b->second;
+            }
+            std::string raw = (bc && !bc->dir.empty()) ? bc->dir : "build";
+            std::string bd  = (np && !np->build_dir.empty()) ? np->build_dir
+                                                             : raw + "_" + node_name;
+            std::string rel = t->sub_dir.empty() ? bd : t->sub_dir + "/" + bd;
+            if (rel.empty() || rel == "/" || rel.find("..") != std::string::npos) continue;
+            if (std::find(dirs.begin(), dirs.end(), rel) == dirs.end()) dirs.push_back(rel);
+        }
+        if (dirs.empty()) return;
+
+        if (node_name == "local") {
+            for (const auto& d : dirs)
+                trailhead::proc::run("rm -rf '" + project_root + "/" + d + "'",
+                                     {}, {}, 60, "", nullptr, true);
+            return;
+        }
+        // Remote: resolve dest the same way batch-run does.
+        std::optional<trailhead::RemoteDest> dest;
+        if (np && !np->rsync_dest.empty()) dest = trailhead::parse_rsync_dest(np->rsync_dest);
+        if (!dest)
+            for (const auto& [_, n] : reg.nodes)
+                if (!n.rsync_dest.empty())
+                    if (auto d = trailhead::parse_rsync_dest(n.rsync_dest)) { dest = d; break; }
+        if (!dest)
+            for (const auto& [_, bc] : reg.builds)
+                if (!bc.rsync_dest.empty())
+                    if (auto d = trailhead::parse_rsync_dest(bc.rsync_dest)) { dest = d; break; }
+        if (!dest) return;
+        std::string proj_name = project_root;
+        if (auto sl = proj_name.rfind('/'); sl != std::string::npos) proj_name = proj_name.substr(sl + 1);
+        std::string remote_proj = dest->remote_path + "/" + proj_name;
+        for (const auto& d : dirs) {
+            std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=10 " + dest->remote
+                            + " 'rm -rf \"" + remote_proj + "/" + d + "\"'";
+            trailhead::proc::run(cmd, {}, {}, 60, "", nullptr, true);
+        }
+    };
+
+    int rc = trailhead::run_watch(th_dir, reg, interval, job_log, run_fn, cancel_fn,
+                                  batch_fn, clean_build_fn, project_root, auto_run, repeat);
 
     // Clear any queued submissions that didn't get to run (e.g. interrupted mid-session).
     if (auto_run) {
         for (const auto& qs : trailhead::load_queued_submissions(th_dir))
-            trailhead::clear_queued_submission(th_dir, qs.name);
+            trailhead::clear_queued_submission(th_dir, qs.name, qs.node_name);
     }
 
     return rc;
@@ -1674,17 +2149,30 @@ static void print_usage() {
     std::cout << "  node  add --name <n> ...      Add a SLURM node profile\n";
     std::cout << "  node  list                    List node profiles\n";
     std::cout << "  node  remove <name>           Remove a node profile\n";
+    std::cout << "  dataset add --name <n> --fetch <c> --path <p>\n";
+    std::cout << "                                Define a fetch+cleanup pair\n";
+    std::cout << "  dataset list                  List datasets and consumer counts\n";
+    std::cout << "  dataset remove <name>         Remove a dataset (also unlinks tests)\n";
+    std::cout << "  dataset clean [--all|<names>] Force-wipe dataset paths (local + remote)\n";
     std::cout << "  add   --name <n> --cmd <c>    Register a test\n";
     std::cout << "        [--build <config>]        link to a build config\n";
+    std::cout << "        [--dataset <n>[,<n>...]]  attach datasets (fetched/cleaned automatically)\n";
     std::cout << "        [--requires gpu|cpu|any]  hardware requirement hint\n";
     std::cout << "        [--label <l>] [--tag <t>] [--timeout <s>] [--workdir <d>]\n";
     std::cout << "  remove <name>  (alias: rm)    Remove a registered test\n";
     std::cout << "  list           (alias: ls)    Show test status table\n";
     std::cout << "  run   [names] [--all] [--tag <t>] [--no-build]\n";
     std::cout << "                                Build then run tests locally\n";
+    std::cout << "  batch-run --node <p> [--batch-size N] [--max-concurrent K]\n";
+    std::cout << "            [--all|--tag <t>|<names...>] [--no-build]\n";
+    std::cout << "                                Pack tests into sbatch chunks (one rsync, many tests/job)\n";
     std::cout << "  gen   [--node <profile>] [--split] [--out <dir>]  Generate sbatch script(s)\n";
     std::cout << "  watch [--interval <ms>] [--run-all]  Live TUI view (--run-all queues all tests)\n";
     std::cout << "  show  [name]                  Print latest result details\n";
+    std::cout << "  matrix [--metric <m>] [--format table|csv|md]\n";
+    std::cout << "         [--row dataset|tag:N|name-suffix] [--col tag:N|name-prefix]\n";
+    std::cout << "         [--tag <t>] [--out <file>]\n";
+    std::cout << "                                Pivot latest results into a row × col matrix\n";
     std::cout << "  clean [--days <n>] [--dry-run] Remove old result files\n";
     std::cout << "  setup add <cmd>               Add a one-time project setup step\n";
     std::cout << "  setup barrier                 Add a parallel barrier between setup steps\n";
@@ -1721,13 +2209,30 @@ int main(int argc, char** argv) {
     if (cmd == "init")         return cmd_init(Args::parse(argc, argv, 2));
     if (cmd == "build")        return cmd_build(argc, argv);
     if (cmd == "node")         return cmd_node(argc, argv);
+    if (cmd == "dataset")      return cmd_dataset(argc, argv);
     if (cmd == "add")          return cmd_add(argc, argv);
     if (cmd == "remove" || cmd == "rm") return cmd_remove(argc, argv);
     if (cmd == "list" || cmd == "ls")   return cmd_list(argc, argv);
     if (cmd == "run")          return cmd_run(argc, argv);
+    if (cmd == "batch-run")    return cmd_batch_run(argc, argv);
     if (cmd == "gen")          return cmd_gen(argc, argv);
     if (cmd == "watch")        return cmd_watch(argc, argv);
     if (cmd == "show")         return cmd_show(argc, argv);
+    if (cmd == "matrix") {
+        Args args = Args::parse(argc, argv, 2);
+        std::string th_dir = require_trailhead();
+        auto reg = load_reg(th_dir);
+        auto root = trailhead::fs::find_trailhead_root();
+        if (root) trailhead::merge_sub_registries(reg, *root);
+        trailhead::MatrixOptions opts;
+        if (args.has("metric")) opts.metric = args.get("metric");
+        if (args.has("format")) opts.format = args.get("format");
+        if (args.has("row"))    opts.row_by = args.get("row");
+        if (args.has("col"))    opts.col_by = args.get("col");
+        if (args.has("out"))    opts.out_path = args.get("out");
+        if (args.has("tag"))    opts.filter_tag = args.get("tag");
+        return trailhead::cmd_matrix(reg, th_dir, opts);
+    }
     if (cmd == "clean")        return cmd_clean(argc, argv);
     if (cmd == "setup")        return cmd_setup(argc, argv);
     if (cmd == "sub")          return cmd_sub(argc, argv);
